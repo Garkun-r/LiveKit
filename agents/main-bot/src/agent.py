@@ -1,4 +1,7 @@
+import asyncio
 import logging
+from datetime import datetime, timezone
+from typing import Any
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -12,39 +15,45 @@ from livekit.agents import (
     inference,
     room_io,
 )
-from livekit.plugins import ai_coustics, noise_cancellation, silero
+from livekit.agents.llm import ChatMessage
+from livekit.plugins import ai_coustics, noise_cancellation, silero, elevenlabs
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+from config import AGENT_NAME
+from prompt_repo import get_active_prompt
+from session_export import send_session_to_n8n
 
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
 
+def safe_dump(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): safe_dump(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [safe_dump(item) for item in value]
+    if hasattr(value, "model_dump"):
+        try:
+            return safe_dump(value.model_dump())
+        except Exception:
+            pass
+    if hasattr(value, "__dict__"):
+        try:
+            return {str(key): safe_dump(item) for key, item in vars(value).items()}
+        except Exception:
+            pass
+    return str(value)
+
+
 class Assistant(Agent):
     def __init__(self) -> None:
-        super().__init__(
-            instructions="""You are a helpful voice AI assistant. The user is interacting with you via voice, even if you perceive the conversation as text.
-            You eagerly assist users with their questions by providing information from your extensive knowledge.
-            Your responses are concise, to the point, and without any complex formatting or punctuation including emojis, asterisks, or other symbols.
-            You are curious, friendly, and have a sense of humor.""",
-        )
-
-    # To add tools, use the @function_tool decorator.
-    # Here's an example that adds a simple weather tool.
-    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
+        prompt = get_active_prompt()
+        super().__init__(instructions=prompt)
 
 
 server = AgentServer()
@@ -57,55 +66,121 @@ def prewarm(proc: JobProcess):
 server.setup_fnc = prewarm
 
 
-@server.rtc_session(agent_name="main-bot")
+@server.rtc_session(agent_name=AGENT_NAME)
 async def my_agent(ctx: JobContext):
-    # Logging setup
-    # Add any other context you want in all log entries here
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
 
-    # Set up a voice AI pipeline using OpenAI, Cartesia, Deepgram, and the LiveKit turn detector
+    session_started_at = datetime.now(timezone.utc)
+
+    transcript_items = []
+    usage_updates = []
+    metrics_events = []
+    close_info = {"reason": None, "error": None}
+    close_event = asyncio.Event()
+    export_started = False
+
     session = AgentSession(
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
-        stt=inference.STT(model="deepgram/nova-3", language="multi"),
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all available models at https://docs.livekit.io/agents/models/llm/
-        llm=inference.LLM(model="openai/gpt-5.3-chat-latest"),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
-        tts=inference.TTS(
-            model="cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+        stt=inference.STT(
+            model="deepgram/nova-3",
+            language="multi",
         ),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
+        llm=inference.LLM(
+            model="google/gemini-3-flash-preview",
+            extra_kwargs={
+                "temperature": 0.2,
+                "max_completion_tokens": 300,
+            },
+        ),
+        tts=elevenlabs.TTS(
+            voice_id="wF58OrxELqJ5nFJxXiva",
+            model="eleven_multilingual_v2",
+        ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
 
-    # To use a realtime model instead of a voice pipeline, use the following session setup instead.
-    # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
-    # 1. Install livekit-agents[openai]
-    # 2. Set OPENAI_API_KEY in .env.local
-    # 3. Add `from livekit.plugins import openai` to the top of this file
-    # 4. Use the following session setup instead of the version above
-    # session = AgentSession(
-    #     llm=openai.realtime.RealtimeModel(voice="marin")
-    # )
+    @session.on("conversation_item_added")
+    def on_conversation_item_added(ev):
+        try:
+            item = ev.item
+            if not isinstance(item, ChatMessage):
+                return
 
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = hedra.AvatarSession(
-    #   avatar_id="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
+            transcript_items.append({
+                "type": "conversation_item",
+                "role": getattr(item, "role", None),
+                "text": getattr(item, "text_content", None),
+                "interrupted": getattr(item, "interrupted", None),
+                "created_at": getattr(item, "created_at", None),
+                "metrics": safe_dump(getattr(item, "metrics", None)),
+            })
+        except Exception as e:
+            logger.exception("conversation_item_added handler failed: %s", e)
 
-    # Start the session, which initializes the voice pipeline and warms up the models
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(ev):
+        try:
+            transcript_items.append({
+                "type": "user_input_transcribed",
+                "transcript": getattr(ev, "transcript", None),
+                "is_final": getattr(ev, "is_final", None),
+                "language": getattr(ev, "language", None),
+                "speaker_id": getattr(ev, "speaker_id", None),
+            })
+        except Exception as e:
+            logger.exception("user_input_transcribed handler failed: %s", e)
+
+    @session.on("session_usage_updated")
+    def on_session_usage_updated(ev):
+        try:
+            usage_updates.append(safe_dump(getattr(ev, "usage", None)))
+        except Exception as e:
+            logger.exception("session_usage_updated handler failed: %s", e)
+
+    @session.on("metrics_collected")
+    def on_metrics_collected(ev):
+        try:
+            metrics_events.append(safe_dump(getattr(ev, "metrics", None)))
+        except Exception as e:
+            logger.exception("metrics_collected handler failed: %s", e)
+
+    async def export_session_data():
+        ended_at = datetime.now(timezone.utc)
+
+        payload = {
+            "agent_name": AGENT_NAME,
+            "room_name": ctx.room.name,
+            "started_at": session_started_at.isoformat(),
+            "ended_at": ended_at.isoformat(),
+            "duration_sec": (ended_at - session_started_at).total_seconds(),
+            "close": close_info,
+            "transcript_items": transcript_items,
+            "usage_updates": usage_updates,
+            "metrics_events": metrics_events,
+            "summary": {
+                "transcript_count": len(transcript_items),
+                "usage_update_count": len(usage_updates),
+                "metrics_count": len(metrics_events),
+            },
+        }
+
+        logger.info("sending session data to n8n")
+        await send_session_to_n8n(payload)
+        logger.info("session data sent to n8n")
+
+    @session.on("close")
+    def on_close(ev):
+        nonlocal export_started
+        if export_started:
+            return
+        close_info["reason"] = str(getattr(ev, "reason", None))
+        err = getattr(ev, "error", None)
+        close_info["error"] = str(err) if err else None
+        close_event.set()
+
     await session.start(
         agent=Assistant(),
         room=ctx.room,
@@ -123,8 +198,46 @@ async def my_agent(ctx: JobContext):
         ),
     )
 
-    # Join the room and connect to the user
-    await ctx.connect()
+    async def export_best_effort(timeout_sec: float) -> None:
+        nonlocal export_started
+        if export_started:
+            return
+        export_started = True
+
+        export_task = asyncio.create_task(export_session_data())
+        try:
+            await asyncio.wait_for(asyncio.shield(export_task), timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            logger.warning("n8n export timed out after %ss", timeout_sec)
+        except BaseException as e:
+            logger.exception("n8n export failed: %s", e)
+
+    try:
+        await ctx.connect()
+        await session.generate_reply(
+            instructions=(
+                "Сразу после подключения поприветствуй клиента одной фразой: "
+                "Здравствуйте! Это компания Кофемастер! Чем могу помочь?"
+            )
+        )
+        await close_event.wait()
+        await export_best_effort(timeout_sec=8.0)
+    except asyncio.CancelledError:
+        # Python 3.13: CancelledError is a BaseException, and LiveKit will cancel the entrypoint
+        # during shutdown. Best-effort export should still complete quickly.
+        asyncio.current_task().uncancel()
+        logger.warning("entrypoint cancelled; exporting session data to n8n before exit")
+        try:
+            await asyncio.wait_for(close_event.wait(), timeout=0.8)
+        except BaseException:
+            pass
+        if close_info["reason"] is None:
+            close_info["reason"] = "entrypoint_cancelled"
+        await export_best_effort(timeout_sec=8.0)
+        try:
+            await asyncio.wait_for(asyncio.shield(session.aclose()), timeout=1.0)
+        except BaseException:
+            pass
 
 
 if __name__ == "__main__":

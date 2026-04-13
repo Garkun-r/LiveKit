@@ -1,28 +1,13 @@
-from .db import get_pool
-from .config import AGENT_NAME
+from pathlib import Path
 
-DEFAULT_PROMPT = """
-Ты полезный голосовой AI-агент.
-Отвечай кратко, вежливо и по делу.
-"""
+PROMPT_FILE = Path(__file__).with_name("prompt.txt")
 
-async def get_active_prompt() -> str:
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                select prompt_text
-                from agent_prompts
-                where agent_name = $1 and is_active = true
-                order by updated_at desc
-                limit 1
-                """,
-                AGENT_NAME,
-            )
-            if row and row["prompt_text"]:
-                return row["prompt_text"]
-    except Exception as e:
-        print(f"[prompt_repo] fallback to default prompt, reason: {e}")
+def get_active_prompt() -> str:
+    if not PROMPT_FILE.exists():
+        raise FileNotFoundError(f"Prompt file not found: {PROMPT_FILE}")
 
-    return DEFAULT_PROMPT
+    content = PROMPT_FILE.read_text(encoding="utf-8").strip()
+    if not content:
+        raise ValueError("Prompt file is empty")
+
+    return content
