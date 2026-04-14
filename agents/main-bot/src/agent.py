@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -11,15 +11,25 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
+    RunContext,
     cli,
+    function_tool,
     inference,
     room_io,
 )
 from livekit.agents.llm import ChatMessage
-from livekit.plugins import ai_coustics, noise_cancellation, silero, elevenlabs
+from livekit.plugins import ai_coustics, noise_cancellation, silero, elevenlabs, google
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-from config import AGENT_NAME
+from config import (
+    AGENT_NAME,
+    GEMINI_MAX_OUTPUT_TOKENS,
+    GEMINI_MODEL,
+    GEMINI_THINKING_LEVEL,
+    GEMINI_TOP_P,
+    GEMINI_TEMPERATURE,
+    GOOGLE_API_KEY,
+)
 from prompt_repo import get_active_prompt
 from session_export import send_session_to_n8n
 
@@ -50,10 +60,48 @@ def safe_dump(value: Any) -> Any:
     return str(value)
 
 
+def build_google_llm() -> google.LLM:
+    if not GOOGLE_API_KEY:
+        raise RuntimeError("GOOGLE_API_KEY is not set. Configure it in .env.local")
+
+    # Direct Gemini API configuration (not LiveKit Inference).
+    return google.LLM(
+        model=GEMINI_MODEL,
+        api_key=GOOGLE_API_KEY,
+        temperature=GEMINI_TEMPERATURE,
+        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+        top_p=GEMINI_TOP_P,
+        thinking_config={"thinking_level": GEMINI_THINKING_LEVEL},
+    )
+
+
 class Assistant(Agent):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        request_end_call: Callable[[RunContext, str], Awaitable[str]],
+    ) -> None:
+        self._request_end_call = request_end_call
         prompt = get_active_prompt()
-        super().__init__(instructions=prompt)
+        super().__init__(
+            instructions=(
+                f"{prompt}\n\n"
+                "Дополнительное правило: когда разговор логически завершен и ты уже "
+                "сказала финальную прощальную фразу, вызови tool end_call.\n"
+                "После вызова end_call не добавляй новых реплик пользователю."
+            )
+        )
+
+    @function_tool
+    async def end_call(self, context: RunContext, reason: str = "conversation_completed") -> str:
+        """Use only when the conversation is logically finished and no more questions are expected.
+
+        Rules:
+        - Call only after a final goodbye phrase.
+        - Never call in the middle of consultation.
+        - If the user asks a new question, continue dialogue and do not call this tool.
+        - After this tool call, do not produce additional user-facing text.
+        """
+        return await self._request_end_call(context, reason)
 
 
 server = AgentServer()
@@ -79,23 +127,22 @@ async def my_agent(ctx: JobContext):
     metrics_events = []
     close_info = {"reason": None, "error": None}
     close_event = asyncio.Event()
-    export_started = False
+    user_activity_event = asyncio.Event()
+    user_activity_count = 0
+    end_call_task: asyncio.Task | None = None
+    end_call_grace_sec = 6.0
+    export_wait_sec = 20.0
+    export_task: asyncio.Task | None = None
 
     session = AgentSession(
         stt=inference.STT(
             model="deepgram/nova-3",
             language="ru",
         ),
-        llm=inference.LLM(
-            model="google/gemini-3-flash-preview",
-            extra_kwargs={
-                "temperature": 0.2,
-                "max_completion_tokens": 300,
-            },
-        ),
+        llm=build_google_llm(),
         tts=elevenlabs.TTS(
             voice_id="wF58OrxELqJ5nFJxXiva",
-            model="eleven_multilingual_v2",
+            model="eleven_flash_v2_5",
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
@@ -122,6 +169,7 @@ async def my_agent(ctx: JobContext):
 
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(ev):
+        nonlocal user_activity_count, end_call_task
         try:
             transcript_items.append({
                 "type": "user_input_transcribed",
@@ -130,6 +178,14 @@ async def my_agent(ctx: JobContext):
                 "language": getattr(ev, "language", None),
                 "speaker_id": getattr(ev, "speaker_id", None),
             })
+            transcript = (getattr(ev, "transcript", None) or "").strip()
+            if transcript:
+                # Any new user speech cancels a pending auto-hangup timer.
+                user_activity_count += 1
+                user_activity_event.set()
+                if end_call_task and not end_call_task.done():
+                    end_call_task.cancel()
+                    end_call_task = None
         except Exception as e:
             logger.exception("user_input_transcribed handler failed: %s", e)
 
@@ -171,10 +227,67 @@ async def my_agent(ctx: JobContext):
         await send_session_to_n8n(payload)
         logger.info("session data sent to n8n")
 
+    async def delete_room_safely(reason: str) -> None:
+        try:
+            close_info["reason"] = f"end_call:{reason}"
+            logger.info("ending call by deleting room", extra={"room": ctx.room.name})
+            await ctx.delete_room(ctx.room.name)
+            # In console mode delete_room is a no-op; explicit shutdown ensures
+            # the job actually exits and export flow can finish.
+            ctx.shutdown(reason=f"end_call:{reason}")
+        except Exception as e:
+            logger.exception("failed to delete room: %s", e)
+            ctx.shutdown(reason=f"end_call_failed:{reason}")
+
+    async def request_end_call(context: RunContext, reason: str) -> str:
+        nonlocal end_call_task
+        if end_call_task and not end_call_task.done():
+            return "END_CALL_ALREADY_SCHEDULED"
+
+        requested_activity = user_activity_count
+        end_call_requested_at = asyncio.get_running_loop().time()
+
+        async def end_after_farewell() -> None:
+            try:
+                # Prevent cutting the final assistant phrase.
+                await context.wait_for_playout()
+            except Exception as e:
+                logger.exception("wait_for_playout failed before end_call: %s", e)
+                return
+
+            if user_activity_count != requested_activity:
+                logger.info("end_call canceled: user spoke during final playout")
+                return
+
+            # Grace timeout is counted from end_call request moment to avoid
+            # stacking "playout duration + full grace period".
+            elapsed = asyncio.get_running_loop().time() - end_call_requested_at
+            remaining_grace = max(0.0, end_call_grace_sec - elapsed)
+            try:
+                # If the grace window has already passed while the final phrase
+                # was playing, end the room immediately.
+                if remaining_grace <= 0:
+                    await delete_room_safely(reason)
+                    return
+
+                user_activity_event.clear()
+                # Fallback grace period: if user resumes talking, keep the call open.
+                await asyncio.wait_for(user_activity_event.wait(), timeout=remaining_grace)
+                logger.info("end_call canceled: user resumed speech")
+                return
+            except asyncio.TimeoutError:
+                await delete_room_safely(reason)
+            except asyncio.CancelledError:
+                logger.info("end_call timer canceled")
+            except Exception as e:
+                logger.exception("end_call timer failed: %s", e)
+
+        end_call_task = asyncio.create_task(end_after_farewell())
+        return "END_CALL_SCHEDULED"
+
     @session.on("close")
     def on_close(ev):
-        nonlocal export_started
-        if export_started:
+        if close_event.is_set():
             return
         close_info["reason"] = str(getattr(ev, "reason", None))
         err = getattr(ev, "error", None)
@@ -182,7 +295,7 @@ async def my_agent(ctx: JobContext):
         close_event.set()
 
     await session.start(
-        agent=Assistant(),
+        agent=Assistant(request_end_call=request_end_call),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -199,16 +312,17 @@ async def my_agent(ctx: JobContext):
     )
 
     async def export_best_effort(timeout_sec: float) -> None:
-        nonlocal export_started
-        if export_started:
-            return
-        export_started = True
-
-        export_task = asyncio.create_task(export_session_data())
+        nonlocal export_task
+        if export_task is None:
+            export_task = asyncio.create_task(export_session_data())
         try:
             await asyncio.wait_for(asyncio.shield(export_task), timeout=timeout_sec)
         except asyncio.TimeoutError:
             logger.warning("n8n export timed out after %ss", timeout_sec)
+        except asyncio.CancelledError:
+            # Preserve cancellation semantics for outer handler, but do not lose
+            # the in-flight export task. It will be awaited again in cancel path.
+            raise
         except BaseException as e:
             logger.exception("n8n export failed: %s", e)
 
@@ -221,7 +335,7 @@ async def my_agent(ctx: JobContext):
             )
         )
         await close_event.wait()
-        await export_best_effort(timeout_sec=8.0)
+        await export_best_effort(timeout_sec=export_wait_sec)
     except asyncio.CancelledError:
         # Python 3.13: CancelledError is a BaseException, and LiveKit will cancel the entrypoint
         # during shutdown. Best-effort export should still complete quickly.
@@ -233,11 +347,21 @@ async def my_agent(ctx: JobContext):
             pass
         if close_info["reason"] is None:
             close_info["reason"] = "entrypoint_cancelled"
-        await export_best_effort(timeout_sec=8.0)
+        await export_best_effort(timeout_sec=export_wait_sec)
         try:
             await asyncio.wait_for(asyncio.shield(session.aclose()), timeout=1.0)
         except BaseException:
             pass
+    finally:
+        if end_call_task and not end_call_task.done():
+            end_call_task.cancel()
+        if export_task and not export_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(export_task), timeout=export_wait_sec)
+            except asyncio.TimeoutError:
+                logger.warning("n8n export timed out after %ss in finalizer", export_wait_sec)
+            except BaseException as e:
+                logger.exception("n8n export finalizer failed: %s", e)
 
 
 if __name__ == "__main__":
