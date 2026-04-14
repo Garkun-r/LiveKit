@@ -84,7 +84,7 @@ async def my_agent(ctx: JobContext):
     session = AgentSession(
         stt=inference.STT(
             model="deepgram/nova-3",
-            language="multi",
+            language="ru",
         ),
         llm=inference.LLM(
             model="google/gemini-3-flash-preview",
