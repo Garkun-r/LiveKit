@@ -154,6 +154,18 @@ Once you've started your own project based on this repo, you should:
 
 This project is production-ready and includes a working `Dockerfile`. To deploy it to LiveKit Cloud or another environment, see the [deploying to production](https://docs.livekit.io/deploy/agents/) guide.
 
+### Sync env to Cloud secrets
+
+If you use direct Gemini and provider keys from `.env.local`, sync them to LiveKit Cloud before deploy:
+
+```console
+cd agents/main-bot
+uv run python scripts/sync_cloud_secrets.py --env-file .env.local
+lk agent deploy
+```
+
+The sync command updates secrets as a full set (`--overwrite`) to keep Cloud env equal to your local env file.
+
 ## Self-hosted LiveKit
 
 You can also self-host LiveKit instead of using LiveKit Cloud. See the [self-hosting](https://docs.livekit.io/transport/self-hosting/local/) guide for more information. If you choose to self-host, you'll need to also use [model plugins](https://docs.livekit.io/agents/models/#plugins) instead of LiveKit Inference and will need to remove the [LiveKit Cloud noise cancellation](https://docs.livekit.io/transport/media/noise-cancellation/) plugin.
