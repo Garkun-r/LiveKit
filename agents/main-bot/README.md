@@ -104,6 +104,125 @@ Next, run this command to speak to your agent directly in your terminal:
 uv run python src/agent.py console
 ```
 
+To switch TTS provider, set `TTS_PROVIDER`:
+
+1. `TTS_PROVIDER=elevenlabs` - ElevenLabs TTS.
+2. `TTS_PROVIDER=google` - `livekit.plugins.google.TTS` (Google Cloud streaming path).
+3. `TTS_PROVIDER=vertex` - Vertex Gemini API streaming path (`google.genai`, `vertexai=True`).
+4. `TTS_PROVIDER=minimax` - official `livekit.plugins.minimax.TTS` path (`speech-2.8-turbo`).
+
+To switch STT provider, set `STT_PROVIDER`:
+
+1. `STT_PROVIDER=deepgram` - Deepgram plugin STT (default, requires `DEEPGRAM_API_KEY`).
+2. `STT_PROVIDER=inference` - LiveKit Agent Gateway STT.
+3. `STT_PROVIDER=google` - Google Cloud STT plugin (uses Google credentials).
+
+If you see `429 Too Many Requests` from `agent-gateway.livekit.cloud` for STT, either:
+
+1. Set `STT_PROVIDER=google` (recommended if Google credentials are already configured), or
+2. Keep `STT_PROVIDER=inference` and enable `STT_INFERENCE_INCLUDE_GOOGLE_FALLBACK=true`.
+
+Note: switching between two inference models (`deepgram/*`, `openai/*`) still uses the same LiveKit
+gateway quota. For real protection from inference 429, use Google STT as fallback/provider.
+
+Google/Vertex example:
+
+```console
+TTS_PROVIDER=google
+GOOGLE_TTS_MODEL=gemini-3.1-flash-tts-preview
+GOOGLE_TTS_USE_STREAMING=true
+GOOGLE_TTS_LOCATION=us-central1
+```
+
+Vertex example:
+
+```console
+TTS_PROVIDER=vertex
+GOOGLE_TTS_MODEL=gemini-3.1-flash-tts-preview
+GOOGLE_TTS_LOCATION=global
+```
+
+MiniMax example:
+
+```console
+TTS_PROVIDER=minimax
+MINIMAX_API_KEY=<your_minimax_api_key>
+MINIMAX_TTS_MODEL=speech-2.8-turbo
+MINIMAX_TTS_VOICE_ID=moss_audio_43d3c43e-3a2d-11f1-b47e-928b88df9451
+MINIMAX_TTS_FORMAT=mp3
+```
+
+STT failover example:
+
+```console
+STT_PROVIDER=inference
+STT_INFERENCE_MODEL=deepgram/nova-3
+STT_INFERENCE_INCLUDE_GOOGLE_FALLBACK=true
+# Optional: keep empty for fastest 429 failover to Google STT.
+STT_INFERENCE_FALLBACK_MODEL=
+```
+
+Deepgram STT example (default):
+
+```console
+STT_PROVIDER=deepgram
+DEEPGRAM_API_KEY=<your_deepgram_api_key>
+STT_DEEPGRAM_MODEL=nova-3
+STT_DEEPGRAM_LANGUAGE=ru
+```
+
+Google STT example:
+
+```console
+STT_PROVIDER=google
+STT_GOOGLE_MODEL=latest_long
+STT_GOOGLE_LANGUAGE=ru-RU
+STT_GOOGLE_LOCATION=global
+```
+
+If this model is rejected by current API in your region/project, the agent auto-falls back to `GOOGLE_TTS_FALLBACK_MODEL` (default: `gemini-2.5-flash-tts`).
+
+If needed, provide Google credentials via `GOOGLE_TTS_CREDENTIALS_FILE` (or `GOOGLE_APPLICATION_CREDENTIALS`).
+
+For LiveKit Cloud, prefer secret-based credentials (no file upload needed):
+
+```console
+GOOGLE_TTS_CREDENTIALS_B64=<base64 of service-account-json>
+```
+
+The agent materializes this into a temporary file at runtime and uses it for Google auth.
+
+For lower first-byte latency in streaming mode, tune chunking:
+
+```console
+GOOGLE_TTS_MIN_SENTENCE_LEN=4
+GOOGLE_TTS_STREAM_CONTEXT_LEN=1
+VERTEX_TTS_MIN_SENTENCE_LEN=6
+VERTEX_TTS_STREAM_CONTEXT_LEN=2
+```
+
+To reduce "hung" turns (long silence after user speech), tune these guards:
+
+```console
+LLM_FIRST_TOKEN_TIMEOUT_SEC=8.0
+LLM_RETRY_DELAY_SEC=0.35
+TURN_MIN_ENDPOINTING_DELAY=0.25
+TURN_MAX_ENDPOINTING_DELAY=1.0
+TURN_DETECTION_MODE=vad
+TURN_ENDPOINTING_MODE=dynamic
+PREEMPTIVE_GENERATION=true
+REPLY_WATCHDOG_SEC=9.0
+```
+
+To make cloud updates seamless, keep secrets sync + deploy in one flow:
+
+```console
+uv run python scripts/sync_cloud_secrets.py --working-dir .
+lk agent deploy
+```
+
+This avoids manual secret edits between deployments.
+
 To run the agent for use with a frontend or telephony, use the `dev` command:
 
 ```console
@@ -165,6 +284,7 @@ lk agent deploy
 ```
 
 The sync command updates secrets as a full set (`--overwrite`) to keep Cloud env equal to your local env file.
+It syncs all non-empty keys from `.env.local` automatically (except `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`).
 
 ## Self-hosted LiveKit
 

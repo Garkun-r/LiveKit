@@ -1,7 +1,16 @@
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv(".env.local")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+
 
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
@@ -10,12 +19,243 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+
+# TTS provider switch:
+# - elevenlabs (default)
+# - google (livekit.plugins.google.TTS)
+# - vertex (google.genai Vertex API path)
+# - minimax (official livekit.plugins.minimax TTS plugin)
+# - cosyvoice (Alibaba Cloud Model Studio WebSocket API)
+_raw_tts_provider = os.getenv("TTS_PROVIDER", "elevenlabs").strip().lower()
+TTS_PROVIDER = {
+    "eleven": "elevenlabs",
+    "elevenlab": "elevenlabs",
+    "elevenlabs": "elevenlabs",
+    "google": "google",
+    "google_tts": "google",
+    "vertex": "vertex",
+    "google_vertex": "vertex",
+    "google-vertex": "vertex",
+    "minimax": "minimax",
+    "mini_max": "minimax",
+    "cosyvoice": "cosyvoice",
+    "cosy_voice": "cosyvoice",
+    "cosy-voice": "cosyvoice",
+}.get(_raw_tts_provider, _raw_tts_provider)
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "wF58OrxELqJ5nFJxXiva")
+ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash")
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "")
 GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.7"))
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "512"))
 GEMINI_TOP_P = float(os.getenv("GEMINI_TOP_P", "1"))
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "minimal")
+# Guard against silent stalls: wait this long for first LLM token before retry/fallback.
+LLM_FIRST_TOKEN_TIMEOUT_SEC = float(os.getenv("LLM_FIRST_TOKEN_TIMEOUT_SEC", "8.0"))
+LLM_RETRY_DELAY_SEC = float(os.getenv("LLM_RETRY_DELAY_SEC", "0.35"))
+
+# Turn endpointing tuning (seconds). Lower values = faster replies.
+TURN_MIN_ENDPOINTING_DELAY = float(os.getenv("TURN_MIN_ENDPOINTING_DELAY", "0.25"))
+TURN_MAX_ENDPOINTING_DELAY = float(os.getenv("TURN_MAX_ENDPOINTING_DELAY", "1.0"))
+# Turn handling stability/latency knobs.
+# TURN_DETECTION_MODE: "vad" (Silero VAD, recommended), "stt" (STT-based), or "multilingual" (EOU model)
+# Use "vad" with Google STT — "stt" requires enable_voice_activity_events which breaks multi-turn
+# sessions with the latest_short model. "multilingual" requires PyTorch.
+TURN_DETECTION_MODE = os.getenv("TURN_DETECTION_MODE", "vad").strip().lower()
+# Endpointing mode: "fixed" or "dynamic"
+TURN_ENDPOINTING_MODE = os.getenv("TURN_ENDPOINTING_MODE", "dynamic").strip().lower()
+# Preemptive generation can reduce latency, but may cause occasional stalled turns
+# depending on provider/turn-detector combination.
+PREEMPTIVE_GENERATION = _env_bool("PREEMPTIVE_GENERATION", default=True)
+# If no assistant reply appears after a final user turn, force one extra reply attempt.
+# Set to 0 to disable.
+REPLY_WATCHDOG_SEC = float(os.getenv("REPLY_WATCHDOG_SEC", "9.0"))
+
+# Google TTS runtime settings.
+# Google Cloud model formats example: gemini-3.1-flash-tts-preview, gemini-2.5-flash-tts
+GOOGLE_TTS_MODEL = os.getenv("GOOGLE_TTS_MODEL", "gemini-3.1-flash-tts-preview")
+GOOGLE_TTS_FALLBACK_MODEL = os.getenv(
+    "GOOGLE_TTS_FALLBACK_MODEL",
+    "gemini-2.5-flash-tts",
+)
+GOOGLE_TTS_LANGUAGE = os.getenv("GOOGLE_TTS_LANGUAGE", "ru-RU")
+GOOGLE_TTS_VOICE_NAME = os.getenv("GOOGLE_TTS_VOICE_NAME", "Zephyr")
+GOOGLE_TTS_SPEAKING_RATE = float(os.getenv("GOOGLE_TTS_SPEAKING_RATE", "1.0"))
+GOOGLE_TTS_PITCH = int(os.getenv("GOOGLE_TTS_PITCH", "0"))
+GOOGLE_TTS_CREDENTIALS_FILE = os.getenv("GOOGLE_TTS_CREDENTIALS_FILE", "")
+# Optional alternatives for cloud deployments where local files are unavailable:
+# - GOOGLE_TTS_CREDENTIALS_JSON: raw service account JSON
+# - GOOGLE_TTS_CREDENTIALS_B64: base64-encoded service account JSON
+GOOGLE_TTS_CREDENTIALS_JSON = os.getenv("GOOGLE_TTS_CREDENTIALS_JSON", "")
+GOOGLE_TTS_CREDENTIALS_B64 = os.getenv("GOOGLE_TTS_CREDENTIALS_B64", "")
+GOOGLE_TTS_LOCATION = os.getenv("GOOGLE_TTS_LOCATION", "us-central1")
+GOOGLE_TTS_USE_STREAMING = _env_bool(
+    "GOOGLE_TTS_USE_STREAMING",
+    default=True,
+)
+GOOGLE_TTS_MIN_SENTENCE_LEN = int(os.getenv("GOOGLE_TTS_MIN_SENTENCE_LEN", "4"))
+GOOGLE_TTS_STREAM_CONTEXT_LEN = int(os.getenv("GOOGLE_TTS_STREAM_CONTEXT_LEN", "1"))
+# Vertex Gemini TTS buffering is configured separately from Google Cloud TTS
+# because Vertex path uses per-segment generate_content_stream calls.
+VERTEX_TTS_MIN_SENTENCE_LEN = int(os.getenv("VERTEX_TTS_MIN_SENTENCE_LEN", "6"))
+VERTEX_TTS_STREAM_CONTEXT_LEN = int(os.getenv("VERTEX_TTS_STREAM_CONTEXT_LEN", "2"))
+GOOGLE_TTS_PROMPT = os.getenv(
+    "GOOGLE_TTS_PROMPT",
+    "Speak only in Russian. "
+    "Use pure standard Russian pronunciation with no foreign accent. "
+    "Sound like a real human receptionist speaking on the phone. "
+    "Be natural, calm, polite, and professional. "
+    "Use short, clear, conversational sentences. "
+    "Keep a medium pace and clear articulation. "
+    "Use subtle human-like intonation variation. "
+    "Avoid sounding robotic, theatrical, salesy, or overly cheerful.",
+)
+
+# MiniMax TTS runtime settings.
+# Docs: https://platform.minimax.io/docs/api-reference/speech-t2a-http
+MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
+MINIMAX_TTS_MODEL = os.getenv("MINIMAX_TTS_MODEL", "speech-2.8-turbo")
+MINIMAX_TTS_VOICE_ID = os.getenv(
+    "MINIMAX_TTS_VOICE_ID",
+    "moss_audio_43d3c43e-3a2d-11f1-b47e-928b88df9451",
+)
+MINIMAX_TTS_BASE_URL = os.getenv("MINIMAX_TTS_BASE_URL", "https://api-uw.minimax.io")
+MINIMAX_TTS_LANGUAGE_BOOST = os.getenv("MINIMAX_TTS_LANGUAGE_BOOST", "Russian")
+MINIMAX_TTS_SPEED = float(os.getenv("MINIMAX_TTS_SPEED", "1.0"))
+MINIMAX_TTS_VOLUME = float(os.getenv("MINIMAX_TTS_VOLUME", "1.0"))
+MINIMAX_TTS_PITCH = int(os.getenv("MINIMAX_TTS_PITCH", "0"))
+MINIMAX_TTS_FORMAT = os.getenv("MINIMAX_TTS_FORMAT", "mp3")
+MINIMAX_TTS_SAMPLE_RATE = int(os.getenv("MINIMAX_TTS_SAMPLE_RATE", "24000"))
+MINIMAX_TTS_BITRATE = int(os.getenv("MINIMAX_TTS_BITRATE", "128000"))
+MINIMAX_TTS_CHANNEL = int(os.getenv("MINIMAX_TTS_CHANNEL", "1"))
+MINIMAX_TTS_MIN_SENTENCE_LEN = int(os.getenv("MINIMAX_TTS_MIN_SENTENCE_LEN", "4"))
+MINIMAX_TTS_STREAM_CONTEXT_LEN = int(os.getenv("MINIMAX_TTS_STREAM_CONTEXT_LEN", "1"))
+
+# CosyVoice (Alibaba DashScope / Model Studio) runtime settings.
+_raw_cosyvoice_profile = os.getenv(
+    "COSYVOICE_PROFILE",
+    "cosyvoice_cn_flash_fast",
+).strip().lower()
+COSYVOICE_PROFILE = {
+    "flash": "cosyvoice_cn_flash_fast",
+    "plus": "cosyvoice_cn_plus_quality",
+    "cosyvoice_cn_flash_fast": "cosyvoice_cn_flash_fast",
+    "cosyvoice_cn_plus_quality": "cosyvoice_cn_plus_quality",
+}.get(_raw_cosyvoice_profile, _raw_cosyvoice_profile)
+
+_COSYVOICE_PROFILE_DEFAULTS = {
+    "cosyvoice_cn_flash_fast": {
+        "model": "cosyvoice-v3.5-flash",
+        "transport": "websocket",
+        "format": "pcm",
+        "sample_rate": "24000",
+        "region": "cn-beijing",
+        "voice_mode": "preset",
+        "connection_reuse": "true",
+        "playback_on_first_chunk": "true",
+        "min_sentence_len": "4",
+        "stream_context_len": "1",
+    },
+    "cosyvoice_cn_plus_quality": {
+        "model": "cosyvoice-v3.5-plus",
+        "transport": "websocket",
+        "format": "pcm",
+        "sample_rate": "24000",
+        "region": "cn-beijing",
+        "voice_mode": "preset",
+        "connection_reuse": "true",
+        "playback_on_first_chunk": "true",
+        "min_sentence_len": "6",
+        "stream_context_len": "2",
+    },
+}
+
+_cosyvoice_defaults = _COSYVOICE_PROFILE_DEFAULTS.get(
+    COSYVOICE_PROFILE,
+    _COSYVOICE_PROFILE_DEFAULTS["cosyvoice_cn_flash_fast"],
+)
+
+COSYVOICE_API_KEY_ENV_NAME = os.getenv(
+    "COSYVOICE_API_KEY_ENV_NAME",
+    "COSYVOICE_API_KEY",
+).strip()
+COSYVOICE_API_KEY = os.getenv(
+    COSYVOICE_API_KEY_ENV_NAME or "COSYVOICE_API_KEY",
+    os.getenv("COSYVOICE_API_KEY", ""),
+)
+COSYVOICE_TTS_MODEL = os.getenv("COSYVOICE_TTS_MODEL", _cosyvoice_defaults["model"])
+COSYVOICE_TTS_TRANSPORT = os.getenv(
+    "COSYVOICE_TTS_TRANSPORT",
+    _cosyvoice_defaults["transport"],
+).strip().lower()
+COSYVOICE_TTS_REGION = os.getenv("COSYVOICE_TTS_REGION", _cosyvoice_defaults["region"])
+COSYVOICE_TTS_WS_URL = os.getenv("COSYVOICE_TTS_WS_URL", "")
+COSYVOICE_TTS_VOICE_MODE = os.getenv(
+    "COSYVOICE_TTS_VOICE_MODE",
+    _cosyvoice_defaults["voice_mode"],
+).strip().lower()
+COSYVOICE_TTS_VOICE_ID = os.getenv("COSYVOICE_TTS_VOICE_ID", "")
+COSYVOICE_TTS_CLONE_VOICE_ID = os.getenv("COSYVOICE_TTS_CLONE_VOICE_ID", "")
+COSYVOICE_TTS_DESIGN_VOICE_ID = os.getenv("COSYVOICE_TTS_DESIGN_VOICE_ID", "")
+COSYVOICE_TTS_FORMAT = os.getenv("COSYVOICE_TTS_FORMAT", _cosyvoice_defaults["format"])
+COSYVOICE_TTS_SAMPLE_RATE = int(
+    os.getenv("COSYVOICE_TTS_SAMPLE_RATE", _cosyvoice_defaults["sample_rate"])
+)
+COSYVOICE_TTS_RATE = float(os.getenv("COSYVOICE_TTS_RATE", "1.0"))
+COSYVOICE_TTS_PITCH = float(os.getenv("COSYVOICE_TTS_PITCH", "1.0"))
+COSYVOICE_TTS_VOLUME = int(os.getenv("COSYVOICE_TTS_VOLUME", "50"))
+COSYVOICE_TTS_CONNECTION_REUSE = _env_bool(
+    "COSYVOICE_TTS_CONNECTION_REUSE",
+    default=_cosyvoice_defaults["connection_reuse"] == "true",
+)
+COSYVOICE_TTS_PLAYBACK_ON_FIRST_CHUNK = _env_bool(
+    "COSYVOICE_TTS_PLAYBACK_ON_FIRST_CHUNK",
+    default=_cosyvoice_defaults["playback_on_first_chunk"] == "true",
+)
+COSYVOICE_TTS_MIN_SENTENCE_LEN = int(
+    os.getenv("COSYVOICE_TTS_MIN_SENTENCE_LEN", _cosyvoice_defaults["min_sentence_len"])
+)
+COSYVOICE_TTS_STREAM_CONTEXT_LEN = int(
+    os.getenv(
+        "COSYVOICE_TTS_STREAM_CONTEXT_LEN",
+        _cosyvoice_defaults["stream_context_len"],
+    )
+)
+
+# STT provider switch:
+# - deepgram (Deepgram plugin, requires DEEPGRAM_API_KEY)
+# - inference (LiveKit Agent Gateway)
+# - google (Google Cloud STT plugin, uses ADC/service-account credentials)
+_raw_stt_provider = os.getenv("STT_PROVIDER", "deepgram").strip().lower()
+STT_PROVIDER = {
+    "deepgram": "deepgram",
+    "inference": "inference",
+    "livekit": "inference",
+    "livekit_inference": "inference",
+    "google": "google",
+    "google_cloud": "google",
+}.get(_raw_stt_provider, _raw_stt_provider)
+
+# Inference STT settings.
+STT_INFERENCE_MODEL = os.getenv("STT_INFERENCE_MODEL", "deepgram/nova-3")
+STT_INFERENCE_FALLBACK_MODEL = os.getenv("STT_INFERENCE_FALLBACK_MODEL", "")
+STT_INFERENCE_LANGUAGE = os.getenv("STT_INFERENCE_LANGUAGE", "ru")
+STT_INFERENCE_INCLUDE_GOOGLE_FALLBACK = _env_bool(
+    "STT_INFERENCE_INCLUDE_GOOGLE_FALLBACK",
+    default=True,
+)
+
+# Deepgram STT settings.
+STT_DEEPGRAM_MODEL = os.getenv("STT_DEEPGRAM_MODEL", "nova-3")
+STT_DEEPGRAM_LANGUAGE = os.getenv("STT_DEEPGRAM_LANGUAGE", "ru")
+
+# Google STT settings.
+STT_GOOGLE_MODEL = os.getenv("STT_GOOGLE_MODEL", "latest_long")
+STT_GOOGLE_LANGUAGE = os.getenv("STT_GOOGLE_LANGUAGE", "ru-RU")
+STT_GOOGLE_LOCATION = os.getenv("STT_GOOGLE_LOCATION", "global")
 
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "")
 AGENT_NAME = os.getenv("AGENT_NAME", "main-bot")

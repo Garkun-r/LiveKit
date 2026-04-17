@@ -11,10 +11,11 @@ requires-python = ">=3.10, <3.15"
 dependencies = [
     "asyncpg>=0.31.0",
     "httpx>=0.28.1",
-    "livekit-agents[elevenlabs,google,silero,turn-detector,xai]~=1.5",
+    "livekit-agents[deepgram,elevenlabs,google,minimax,silero,turn-detector,xai]~=1.5",
     "livekit-plugins-ai-coustics~=0.2",
     "livekit-plugins-noise-cancellation~=0.2",
     "python-dotenv",
+    "websockets>=15.0.1",
 ]
 
 [dependency-groups]
