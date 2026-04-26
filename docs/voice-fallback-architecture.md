@@ -43,6 +43,11 @@ fast/complex routing. The current fast/complex decision logic must remain in
 place. The current manual retry/fallback code may be replaced if the new
 implementation preserves the rest of the business logic.
 
+Implementation note: the first refactor keeps `Assistant.llm_node` as the place
+where routing and provider-specific tool handling live, and moves the actual
+model failover inside branch-local LiveKit `llm.FallbackAdapter` instances. The
+rollback flag is `USE_LIVEKIT_FALLBACK_ADAPTER=false`.
+
 ## Current models and available providers
 
 Current state:
@@ -69,20 +74,38 @@ Exact model IDs must come from the current config, `.env.example`, or
   architecture already disables them.
 - Codex must not enable tool calls on xAI as part of fallback work.
 - Codex must not restructure tools/function calling without a separate task.
+- Terminal tools must not trigger an extra LLM continuation. `end_call` uses
+  LiveKit `StopResponse` after scheduling call closure so the SDK does not
+  create a second tool-reply generation for the same user turn.
+- E2E testing on 2026-04-26 showed a production risk when a fast-branch xAI
+  timeout falls back to Gemini after non-terminal tool-call history exists:
+  Gemini can reject the request with a missing `thought_signature` error. Treat
+  cross-provider fallback after future non-terminal tools as not production-ready
+  until the planned tools refactor defines a safe context strategy.
 
 ## Timeout / retry decisions
 
 Recommended initial defaults, to be exposed through config/env:
 
 ```env
+USE_LIVEKIT_FALLBACK_ADAPTER=true
 LLM_ATTEMPT_TIMEOUT_SEC=2.5
 LLM_MAX_RETRY_PER_LLM=0
 LLM_RETRY_INTERVAL_SEC=0.3
 LLM_RETRY_ON_CHUNK_SENT=false
+GEMINI_HTTP_TIMEOUT_SEC=10.0
+FAST_LLM_BACKUP_PROVIDER=google
+FAST_LLM_BACKUP_MODEL=<from config/env>
+COMPLEX_LLM_BACKUP_PROVIDER=google
+COMPLEX_LLM_BACKUP_MODEL=<from config/env>
 ```
 
 For live voice, do not retry the same model before fallback. On timeout,
 API error, network error, or provider error, move directly to the backup model.
+
+Provider compatibility note: the installed Gemini client rejects HTTP deadlines
+below 10 seconds. Keep `GEMINI_HTTP_TIMEOUT_SEC` at `10.0` or higher even when
+the LiveKit fallback attempt target remains around 2.5 seconds.
 
 If a model already started sending chunks and then failed, do not enable unsafe
 retry with another model without separate verification. Follow LiveKit behavior
@@ -177,3 +200,5 @@ Requirements:
 - Whether a feature flag is needed for quick rollback to the old fallback
   scheme.
 - Whether old env variables must be preserved for backward compatibility.
+- Safe Gemini fallback behavior after tool-call history, especially when the
+  previous model/provider was xAI.

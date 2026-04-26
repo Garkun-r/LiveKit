@@ -7,6 +7,7 @@ import re
 import tempfile
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -18,6 +19,7 @@ from google.auth import (
     load_credentials_from_file as google_auth_load_credentials_from_file,
 )
 from google.cloud import texttospeech_v1 as texttospeech
+from google.genai import types as genai_types
 from livekit import rtc
 from livekit.agents import (
     NOT_GIVEN,
@@ -33,6 +35,9 @@ from livekit.agents import (
     inference,
     room_io,
     tokenize,
+)
+from livekit.agents import (
+    llm as lk_llm,
 )
 from livekit.agents import (
     stt as lk_stt,
@@ -55,6 +60,8 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from config import (
     AGENT_NAME,
+    COMPLEX_LLM_BACKUP_MODEL,
+    COMPLEX_LLM_BACKUP_PROVIDER,
     COMPLEX_LLM_PROVIDER,
     COSYVOICE_API_KEY,
     COSYVOICE_API_KEY_ENV_NAME,
@@ -96,8 +103,11 @@ from config import (
     ELEVENLABS_VOICE_STABILITY,
     ELEVENLABS_VOICE_STYLE,
     ELEVENLABS_VOICE_USE_SPEAKER_BOOST,
+    FAST_LLM_BACKUP_MODEL,
+    FAST_LLM_BACKUP_PROVIDER,
     FAST_LLM_PROVIDER,
     GEMINI_FALLBACK_MODEL,
+    GEMINI_HTTP_TIMEOUT_SEC,
     GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_MODEL,
     GEMINI_TEMPERATURE,
@@ -117,10 +127,14 @@ from config import (
     GOOGLE_TTS_STREAM_CONTEXT_LEN,
     GOOGLE_TTS_USE_STREAMING,
     GOOGLE_TTS_VOICE_NAME,
+    LLM_ATTEMPT_TIMEOUT_SEC,
     LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
     LLM_FIRST_TOKEN_TIMEOUT_SEC,
+    LLM_MAX_RETRY_PER_LLM,
     LLM_PROVIDER,
     LLM_RETRY_DELAY_SEC,
+    LLM_RETRY_INTERVAL_SEC,
+    LLM_RETRY_ON_CHUNK_SENT,
     LLM_ROUTING_ENABLED,
     MINIMAX_API_KEY,
     MINIMAX_TTS_BASE_URL,
@@ -138,6 +152,8 @@ from config import (
     MINIMAX_TTS_TIMBRE,
     MINIMAX_TTS_VOICE_ID,
     MINIMAX_TTS_VOLUME,
+    MODEL_ROUTER_COMPLEX_MODEL,
+    MODEL_ROUTER_FAST_MODEL,
     PREEMPTIVE_GENERATION,
     REPLY_WATCHDOG_SEC,
     STT_DEEPGRAM_ENDPOINTING_MS,
@@ -156,8 +172,12 @@ from config import (
     TURN_ENDPOINTING_MODE,
     TURN_MAX_ENDPOINTING_DELAY,
     TURN_MIN_ENDPOINTING_DELAY,
+    USE_LIVEKIT_FALLBACK_ADAPTER,
     VERTEX_TTS_MIN_SENTENCE_LEN,
     VERTEX_TTS_STREAM_CONTEXT_LEN,
+    VOICE_EMERGENCY_AUDIO_PATH,
+    VOICE_EMERGENCY_PHRASE,
+    VOICE_FILLER_AUDIO_PATH,
     XAI_API_KEY,
     XAI_BASE_URL,
     XAI_ENABLE_TOOLS,
@@ -181,6 +201,8 @@ _minimax_sound_effects_patched = False
 _AUDIO_DIR = Path(__file__).resolve().parent.parent / "audio"
 _INITIAL_GREETING_AUDIO_PATH = _AUDIO_DIR / "1.wav"
 _SHORT_GREETING_AUDIO_PATH = _AUDIO_DIR / "2.wav"
+_FILLER_AUDIO_PATH = None
+_EMERGENCY_AUDIO_PATH = None
 _WARMUP_REQUEST_TIMEOUT_SEC = 4.0
 _PROMPT_CACHE_WARMUP_USER_TEXT = (
     "Служебный запрос прогрева. Ответь строго одним словом: OK."
@@ -197,6 +219,35 @@ _SHORT_GREETING_RE = re.compile(
     r"^(?:алло|алло алло|ало|ало ало|алё|алё алё|але|але але|доброе утро|алло доброе утро|ало доброе утро|алё доброе утро|добрый день|алло добрый день|ало добрый день|алё добрый день|здравствуйте|да здравствуйте|алло здравствуйте|ало здравствуйте|алё здравствуйте|девушка здравствуйте|алло девушка здравствуйте|здрасьте|алло здрасьте|ало здрасьте|алё здрасьте|девушка здрасьте|алло девушка здрасьте)[\.!\?, ]*$",
     re.IGNORECASE,
 )
+
+
+@dataclass(frozen=True)
+class LLMBranchMetadata:
+    branch: str
+    primary_provider: str
+    primary_model: str
+    backup_provider: str | None = None
+    backup_model: str | None = None
+    uses_fallback_adapter: bool = False
+
+    @property
+    def has_backup(self) -> bool:
+        return bool(self.backup_provider and self.backup_model)
+
+
+def resolve_configured_audio_path(raw_path: str) -> Path | None:
+    path_text = (raw_path or "").strip()
+    if not path_text:
+        return None
+
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        path = _AUDIO_DIR / path
+    return path
+
+
+_FILLER_AUDIO_PATH = resolve_configured_audio_path(VOICE_FILLER_AUDIO_PATH)
+_EMERGENCY_AUDIO_PATH = resolve_configured_audio_path(VOICE_EMERGENCY_AUDIO_PATH)
 
 
 def _patch_minimax_sound_effects() -> None:
@@ -406,6 +457,16 @@ async def warmup_xai_llm_transport(
 
 
 async def warmup_llm_transport(llm_client: Any, *, label: str) -> None:
+    child_llms = getattr(llm_client, "_llm_instances", None)
+    if isinstance(child_llms, list):
+        await asyncio.gather(
+            *[
+                warmup_llm_transport(child_llm, label=f"{label}_{index}")
+                for index, child_llm in enumerate(child_llms)
+            ],
+            return_exceptions=True,
+        )
+        return
     if isinstance(llm_client, google.LLM):
         await warmup_google_llm_transport(llm_client, label=label)
         return
@@ -588,6 +649,17 @@ async def warmup_llm_prompt_cache(
         )
 
 
+def _gemini_http_timeout_ms() -> int:
+    timeout_sec = GEMINI_HTTP_TIMEOUT_SEC
+    if timeout_sec < 10.0:
+        logger.warning(
+            "GEMINI_HTTP_TIMEOUT_SEC is below the Gemini API minimum; clamping to 10s",
+            extra={"configured_timeout_sec": timeout_sec},
+        )
+        timeout_sec = 10.0
+    return int(timeout_sec * 1000)
+
+
 def build_google_llm(model_name: str | None = None) -> google.LLM:
     if not GOOGLE_API_KEY:
         raise RuntimeError("GOOGLE_API_KEY is not set. Configure it in .env.local")
@@ -599,6 +671,7 @@ def build_google_llm(model_name: str | None = None) -> google.LLM:
             "provider": "google",
             "model": resolved_model,
             "temperature": GEMINI_TEMPERATURE,
+            "http_timeout_sec": max(GEMINI_HTTP_TIMEOUT_SEC, 10.0),
         },
     )
 
@@ -610,6 +683,7 @@ def build_google_llm(model_name: str | None = None) -> google.LLM:
         max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
         top_p=GEMINI_TOP_P,
         thinking_config={"thinking_level": GEMINI_THINKING_LEVEL},
+        http_options=genai_types.HttpOptions(timeout=_gemini_http_timeout_ms()),
     )
 
 
@@ -654,20 +728,168 @@ def build_llm_for_provider(provider: str, model_name: str | None = None) -> Any:
     return build_google_llm(model_name=model_name)
 
 
-def build_routed_llm_clients() -> tuple[dict[str, Any], dict[str, str]]:
+def _default_llm_model_for_provider(provider: str) -> str:
+    if provider == "google":
+        return GEMINI_MODEL
+    if provider == "xai":
+        return XAI_MODEL
+    return ""
+
+
+def _backup_config_for_branch(branch: str) -> tuple[str, str]:
+    if branch == "fast":
+        return FAST_LLM_BACKUP_PROVIDER, FAST_LLM_BACKUP_MODEL
+    return COMPLEX_LLM_BACKUP_PROVIDER, COMPLEX_LLM_BACKUP_MODEL
+
+
+def _resolve_router_model_names(router: ModelRouter) -> dict[str, str]:
+    return {
+        "fast": MODEL_ROUTER_FAST_MODEL or router.fast_model_name,
+        "complex": MODEL_ROUTER_COMPLEX_MODEL or router.complex_model_name,
+    }
+
+
+def _llm_identity(llm_client: Any) -> tuple[str, str]:
+    return (
+        str(getattr(llm_client, "provider", "unknown")),
+        str(getattr(llm_client, "model", "unknown")),
+    )
+
+
+def build_llm_client_for_branch(
+    *,
+    branch: str,
+    primary_provider: str,
+    primary_model: str | None = None,
+) -> tuple[Any, LLMBranchMetadata]:
+    resolved_primary_model = (
+        primary_model or _default_llm_model_for_provider(primary_provider)
+    ).strip()
+    primary_llm = build_llm_for_provider(
+        primary_provider,
+        model_name=resolved_primary_model or None,
+    )
+    primary_provider_name, primary_model_name = _llm_identity(primary_llm)
+
+    backup_provider, backup_model = _backup_config_for_branch(branch)
+    backup_provider = (backup_provider or "").strip()
+    backup_model = (backup_model or "").strip()
+
+    metadata = LLMBranchMetadata(
+        branch=branch,
+        primary_provider=primary_provider_name,
+        primary_model=primary_model_name,
+        backup_provider=backup_provider or None,
+        backup_model=backup_model or None,
+        uses_fallback_adapter=False,
+    )
+
+    if not USE_LIVEKIT_FALLBACK_ADAPTER:
+        logger.info(
+            "LiveKit LLM fallback adapter disabled; using primary LLM only for branch",
+            extra={
+                "branch": branch,
+                "primary_provider": metadata.primary_provider,
+                "primary_model": metadata.primary_model,
+            },
+        )
+        return primary_llm, metadata
+
+    if not backup_provider or not backup_model:
+        logger.warning(
+            "LLM fallback is enabled but no backup is configured for branch",
+            extra={
+                "branch": branch,
+                "primary_provider": metadata.primary_provider,
+                "primary_model": metadata.primary_model,
+            },
+        )
+        return primary_llm, metadata
+
+    if (
+        backup_provider == metadata.primary_provider
+        and backup_model == metadata.primary_model
+    ):
+        logger.warning(
+            "LLM backup matches primary; using primary LLM only for branch",
+            extra={
+                "branch": branch,
+                "provider": backup_provider,
+                "model": backup_model,
+            },
+        )
+        return primary_llm, metadata
+
+    backup_llm = build_llm_for_provider(backup_provider, model_name=backup_model)
+    backup_provider_name, backup_model_name = _llm_identity(backup_llm)
+    fallback_metadata = LLMBranchMetadata(
+        branch=branch,
+        primary_provider=metadata.primary_provider,
+        primary_model=metadata.primary_model,
+        backup_provider=backup_provider_name,
+        backup_model=backup_model_name,
+        uses_fallback_adapter=True,
+    )
+
+    if backup_provider_name == metadata.primary_provider:
+        logger.warning(
+            "LLM fallback branch uses the same provider for primary and backup; "
+            "this does not protect from provider/account/quota-wide failures",
+            extra={
+                "branch": branch,
+                "provider": backup_provider_name,
+                "primary_model": metadata.primary_model,
+                "backup_model": backup_model_name,
+            },
+        )
+
+    logger.info(
+        "using LiveKit LLM fallback adapter",
+        extra={
+            "branch": branch,
+            "primary_provider": fallback_metadata.primary_provider,
+            "primary_model": fallback_metadata.primary_model,
+            "backup_provider": fallback_metadata.backup_provider,
+            "backup_model": fallback_metadata.backup_model,
+            "attempt_timeout_sec": LLM_ATTEMPT_TIMEOUT_SEC,
+            "max_retry_per_llm": LLM_MAX_RETRY_PER_LLM,
+            "retry_interval_sec": LLM_RETRY_INTERVAL_SEC,
+            "retry_on_chunk_sent": LLM_RETRY_ON_CHUNK_SENT,
+        },
+    )
+    return (
+        lk_llm.FallbackAdapter(
+            llm=[primary_llm, backup_llm],
+            attempt_timeout=LLM_ATTEMPT_TIMEOUT_SEC,
+            max_retry_per_llm=LLM_MAX_RETRY_PER_LLM,
+            retry_interval=LLM_RETRY_INTERVAL_SEC,
+            retry_on_chunk_sent=LLM_RETRY_ON_CHUNK_SENT,
+        ),
+        fallback_metadata,
+    )
+
+
+def build_routed_llm_clients() -> tuple[
+    dict[str, Any],
+    dict[str, str],
+    dict[str, LLMBranchMetadata],
+]:
     route_to_provider = {
         "fast": FAST_LLM_PROVIDER,
         "complex": COMPLEX_LLM_PROVIDER,
     }
-    provider_cache: dict[str, Any] = {}
     routed_llms: dict[str, Any] = {}
+    routed_metadata: dict[str, LLMBranchMetadata] = {}
 
     for route_name, provider in route_to_provider.items():
-        if provider not in provider_cache:
-            provider_cache[provider] = build_llm_for_provider(provider)
-        routed_llms[route_name] = provider_cache[provider]
+        routed_llms[route_name], routed_metadata[route_name] = (
+            build_llm_client_for_branch(
+                branch=route_name,
+                primary_provider=provider,
+            )
+        )
 
-    return routed_llms, route_to_provider
+    return routed_llms, route_to_provider, routed_metadata
 
 
 def build_elevenlabs_tts() -> Any:
@@ -1225,6 +1447,7 @@ class Assistant(Agent):
         model_router: ModelRouter | None = None,
         routed_llms: dict[str, Any] | None = None,
         routed_llm_providers: dict[str, str] | None = None,
+        routed_llm_metadata: dict[str, LLMBranchMetadata] | None = None,
         fallback_llm: google.LLM | None = None,
         first_turn_short_greeting_audio_path: Path = _SHORT_GREETING_AUDIO_PATH,
         prerecorded_audio_sample_rate: int = 24000,
@@ -1234,12 +1457,14 @@ class Assistant(Agent):
         self._model_router = model_router
         self._routed_llms = routed_llms or {}
         self._routed_llm_providers = routed_llm_providers or {}
+        self._routed_llm_metadata = routed_llm_metadata or {}
         self._fallback_llm = fallback_llm
         self._first_turn_short_greeting_audio_path = (
             first_turn_short_greeting_audio_path
         )
         self._prerecorded_audio_sample_rate = prerecorded_audio_sample_rate
         self._awaiting_first_user_turn = True
+        self._llm_branch_started_at: dict[str, float] = {}
         resolved_prompt = prompt if prompt is not None else get_active_prompt()
         super().__init__(
             instructions=(
@@ -1249,6 +1474,7 @@ class Assistant(Agent):
                 "После вызова end_call не добавляй новых реплик пользователю."
             )
         )
+        self._register_llm_availability_listeners()
 
     async def _noop_end_call(self, _: RunContext, __: str) -> str:
         return "END_CALL_DISABLED"
@@ -1310,19 +1536,24 @@ class Assistant(Agent):
         *,
         activity_llm: Any,
         route: ModelRouteResult,
-    ) -> tuple[Any, str]:
+    ) -> tuple[Any, str, LLMBranchMetadata | None]:
         routed_llm = self._routed_llms.get(route.selected_model)
         if routed_llm is not None:
-            provider = self._routed_llm_providers.get(
-                route.selected_model, LLM_PROVIDER
+            metadata = self._routed_llm_metadata.get(route.selected_model)
+            provider = (
+                metadata.primary_provider
+                if metadata is not None
+                else self._routed_llm_providers.get(route.selected_model, LLM_PROVIDER)
             )
-            return routed_llm, provider
+            return routed_llm, provider, metadata
 
         logger.warning(
             "model router selected '%s' but no routed LLM client is configured; using session llm",
             route.selected_model,
         )
-        return activity_llm, LLM_PROVIDER
+        metadata = self._routed_llm_metadata.get("complex")
+        provider = metadata.primary_provider if metadata is not None else LLM_PROVIDER
+        return activity_llm, provider, metadata
 
     def _log_model_route(
         self,
@@ -1331,6 +1562,7 @@ class Assistant(Agent):
         forced_fast: bool,
         route: ModelRouteResult,
         selected_model_name: str,
+        metadata: LLMBranchMetadata | None = None,
     ) -> None:
         logger.info('[MODEL_ROUTER] text="%s"', original_text or "")
         logger.info('[MODEL_ROUTER] normalized_text="%s"', route.normalized_text)
@@ -1342,6 +1574,82 @@ class Assistant(Agent):
             logger.info('[MODEL_ROUTER] matched_value="%s"', route.matched_value)
         logger.info('[MODEL_ROUTER] selected_model="%s"', route.selected_model)
         logger.info('[MODEL_ROUTER] model_name="%s"', selected_model_name)
+        if metadata is not None:
+            logger.info(
+                "llm route resolved",
+                extra={
+                    "branch": metadata.branch,
+                    "primary_provider": metadata.primary_provider,
+                    "primary_model": metadata.primary_model,
+                    "backup_provider": metadata.backup_provider,
+                    "backup_model": metadata.backup_model,
+                    "uses_fallback_adapter": metadata.uses_fallback_adapter,
+                },
+            )
+
+    def _register_llm_availability_listeners(self) -> None:
+        for branch, llm_client in self._routed_llms.items():
+            metadata = self._routed_llm_metadata.get(branch)
+            if metadata is None or not metadata.uses_fallback_adapter:
+                continue
+            if not hasattr(llm_client, "on"):
+                continue
+
+            def _on_availability_changed(ev: Any, *, branch: str = branch) -> None:
+                self._log_llm_availability_changed(branch=branch, ev=ev)
+
+            try:
+                llm_client.on("llm_availability_changed", _on_availability_changed)
+            except Exception as e:
+                logger.warning(
+                    "failed to register llm_availability_changed listener: %s",
+                    e,
+                    extra={"branch": branch},
+                )
+
+    def _log_llm_availability_changed(self, *, branch: str, ev: Any) -> None:
+        metadata = self._routed_llm_metadata.get(branch)
+        changed_llm = getattr(ev, "llm", None)
+        available = bool(getattr(ev, "available", False))
+        changed_provider = str(getattr(changed_llm, "provider", "unknown"))
+        changed_model = str(getattr(changed_llm, "model", "unknown"))
+        started_at = self._llm_branch_started_at.get(branch)
+        elapsed_ms = (
+            round((asyncio.get_running_loop().time() - started_at) * 1000, 1)
+            if started_at is not None
+            else None
+        )
+        final_provider = None
+        final_model = None
+        if metadata is not None and not available:
+            if (
+                changed_provider == metadata.primary_provider
+                and changed_model == metadata.primary_model
+            ):
+                final_provider = metadata.backup_provider
+                final_model = metadata.backup_model
+            else:
+                final_provider = metadata.primary_provider
+                final_model = metadata.primary_model
+
+        log_method = logger.info if available else logger.warning
+        log_method(
+            "llm availability changed",
+            extra={
+                "branch": branch,
+                "available": available,
+                "changed_provider": changed_provider,
+                "changed_model": changed_model,
+                "primary_provider": metadata.primary_provider if metadata else None,
+                "primary_model": metadata.primary_model if metadata else None,
+                "backup_provider": metadata.backup_provider if metadata else None,
+                "backup_model": metadata.backup_model if metadata else None,
+                "elapsed_ms_before_fallback": elapsed_ms,
+                "final_provider": final_provider,
+                "final_model": final_model,
+                "chunk_sent": None,
+            },
+        )
 
     async def _stream_llm(
         self,
@@ -1428,28 +1736,80 @@ class Assistant(Agent):
         self, chat_ctx: Any, tools: list[Any], model_settings: Any
     ) -> AsyncIterator[Any]:
         """
-        Retries one transient 5xx failure before first output token.
-        If configured, fallback model is used as the final attempt.
+        Preserve fast/complex routing and provider-specific tool handling.
+        In the default path, branch-local LiveKit FallbackAdapter instances own
+        timeout/fallback behavior; the legacy manual retry path stays available
+        behind USE_LIVEKIT_FALLBACK_ADAPTER=false.
         """
         activity = self._get_activity_or_raise()
         primary_llm = activity.llm
         primary_provider = LLM_PROVIDER
+        selected_branch = "complex"
+        route_metadata = self._routed_llm_metadata.get(selected_branch)
         if self._model_router is not None and self._routed_llms:
             user_text, fast_model = self._get_last_user_turn(chat_ctx)
             route = self._model_router.route(user_text, fast_model=fast_model)
-            primary_llm, primary_provider = self._resolve_primary_llm(
+            selected_branch = route.selected_model
+            primary_llm, primary_provider, route_metadata = self._resolve_primary_llm(
                 activity_llm=activity.llm,
                 route=route,
             )
-            selected_model_name = str(
-                getattr(primary_llm, "model", route.selected_model)
+            selected_model_name = (
+                route_metadata.primary_model
+                if route_metadata is not None
+                else str(getattr(primary_llm, "model", route.selected_model))
             )
             self._log_model_route(
                 original_text=user_text,
                 forced_fast=fast_model is True,
                 route=route,
                 selected_model_name=selected_model_name,
+                metadata=route_metadata,
             )
+        elif route_metadata is not None:
+            primary_provider = route_metadata.primary_provider
+
+        if USE_LIVEKIT_FALLBACK_ADAPTER:
+            self._llm_branch_started_at[selected_branch] = (
+                asyncio.get_running_loop().time()
+            )
+            yielded_any = False
+            try:
+                async for chunk in self._stream_llm(
+                    primary_llm,
+                    primary_provider,
+                    chat_ctx,
+                    tools,
+                    model_settings,
+                ):
+                    yielded_any = True
+                    yield chunk
+                return
+            except Exception as e:
+                logger.warning(
+                    "llm generation failed",
+                    extra={
+                        "branch": selected_branch,
+                        "primary_provider": route_metadata.primary_provider
+                        if route_metadata
+                        else primary_provider,
+                        "primary_model": route_metadata.primary_model
+                        if route_metadata
+                        else str(getattr(primary_llm, "model", None)),
+                        "backup_provider": route_metadata.backup_provider
+                        if route_metadata
+                        else None,
+                        "backup_model": route_metadata.backup_model
+                        if route_metadata
+                        else None,
+                        "chunk_sent": yielded_any,
+                        "error_type": type(e).__name__,
+                    },
+                )
+                raise
+            finally:
+                self._llm_branch_started_at.pop(selected_branch, None)
+
         yielded_any = False
 
         try:
@@ -1527,7 +1887,7 @@ class Assistant(Agent):
     @function_tool
     async def end_call(
         self, context: RunContext, reason: str = "conversation_completed"
-    ) -> str:
+    ) -> None:
         """Use only when the conversation is logically finished and no more questions are expected.
 
         Rules:
@@ -1536,7 +1896,8 @@ class Assistant(Agent):
         - If the user asks a new question, continue dialogue and do not call this tool.
         - After this tool call, do not produce additional user-facing text.
         """
-        return await self._request_end_call(context, reason)
+        await self._request_end_call(context, reason)
+        raise StopResponse()
 
 
 server = AgentServer()
@@ -1572,6 +1933,8 @@ async def my_agent(ctx: JobContext):
     export_task: asyncio.Task | None = None
     session_close_task: asyncio.Task | None = None
     runtime_warmup_task: asyncio.Task | None = None
+    unrecoverable_error_task: asyncio.Task | None = None
+    unrecoverable_error_response_started = False
     prompt_resolution = PromptResolution(
         prompt="",
         source="file:not_resolved",
@@ -1584,27 +1947,26 @@ async def my_agent(ctx: JobContext):
     model_router: ModelRouter | None = None
     routed_llms: dict[str, Any] = {}
     routed_llm_providers: dict[str, str] = {}
+    routed_llm_metadata: dict[str, LLMBranchMetadata] = {}
     if LLM_ROUTING_ENABLED:
         model_router = ModelRouter.from_default_config()
-        routed_llms, routed_llm_providers = build_routed_llm_clients()
+        router_model_names = _resolve_router_model_names(model_router)
+        routed_llms, routed_llm_providers, routed_llm_metadata = (
+            build_routed_llm_clients()
+        )
         logger.info(
             "model router configured",
             extra={
                 "fast_provider": routed_llm_providers.get("fast"),
                 "complex_provider": routed_llm_providers.get("complex"),
-                "fast_model": str(
-                    getattr(
-                        routed_llms.get("fast"), "model", model_router.fast_model_name
-                    )
-                ),
-                "complex_model": str(
-                    getattr(
-                        routed_llms.get("complex"),
-                        "model",
-                        model_router.complex_model_name,
-                    )
-                ),
+                "fast_model": routed_llm_metadata["fast"].primary_model,
+                "fast_route_label": router_model_names["fast"],
+                "fast_backup_model": routed_llm_metadata["fast"].backup_model,
+                "complex_model": routed_llm_metadata["complex"].primary_model,
+                "complex_route_label": router_model_names["complex"],
+                "complex_backup_model": routed_llm_metadata["complex"].backup_model,
                 "force_fast_flag_field": model_router.force_fast_flag_field,
+                "use_livekit_fallback_adapter": USE_LIVEKIT_FALLBACK_ADAPTER,
             },
         )
     elif FAST_LLM_PROVIDER or COMPLEX_LLM_PROVIDER:
@@ -1615,12 +1977,23 @@ async def my_agent(ctx: JobContext):
         logger.info("model routing is disabled; using single LLM_PROVIDER flow")
 
     fallback_llm = None
-    fallback_provider = (
-        routed_llm_providers.get("complex")
-        if routed_llm_providers.get("complex")
-        else LLM_PROVIDER
-    )
-    if fallback_provider == "google" and GEMINI_FALLBACK_MODEL:
+    if not LLM_ROUTING_ENABLED:
+        session_llm, session_llm_metadata = build_llm_client_for_branch(
+            branch="complex",
+            primary_provider=LLM_PROVIDER,
+        )
+        routed_llms["complex"] = session_llm
+        routed_llm_metadata["complex"] = session_llm_metadata
+    else:
+        session_llm = routed_llms.get("complex")
+
+    fallback_provider = routed_llm_metadata.get("complex")
+    if (
+        not USE_LIVEKIT_FALLBACK_ADAPTER
+        and fallback_provider is not None
+        and fallback_provider.primary_provider == "google"
+        and GEMINI_FALLBACK_MODEL
+    ):
         fallback_llm = build_google_llm(model_name=GEMINI_FALLBACK_MODEL)
 
     min_endpointing_delay = max(0.0, TURN_MIN_ENDPOINTING_DELAY)
@@ -1646,7 +2019,7 @@ async def my_agent(ctx: JobContext):
 
     session = AgentSession(
         stt=build_stt(),
-        llm=routed_llms.get("complex") or build_llm(),
+        llm=session_llm or build_llm(),
         tts=build_tts(),
         turn_handling={
             "turn_detection": turn_detection_mode,
@@ -1664,14 +2037,62 @@ async def my_agent(ctx: JobContext):
         extra={
             "llm_first_token_timeout_sec": LLM_FIRST_TOKEN_TIMEOUT_SEC,
             "llm_fallback_first_token_timeout_sec": LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
+            "llm_attempt_timeout_sec": LLM_ATTEMPT_TIMEOUT_SEC,
+            "llm_max_retry_per_llm": LLM_MAX_RETRY_PER_LLM,
+            "llm_retry_interval_sec": LLM_RETRY_INTERVAL_SEC,
+            "llm_retry_on_chunk_sent": LLM_RETRY_ON_CHUNK_SENT,
+            "use_livekit_fallback_adapter": USE_LIVEKIT_FALLBACK_ADAPTER,
             "preemptive_generation": PREEMPTIVE_GENERATION,
             "turn_detection_mode": TURN_DETECTION_MODE,
             "turn_endpointing_mode": endpointing_mode,
             "turn_min_endpointing_delay": min_endpointing_delay,
             "turn_max_endpointing_delay": max_endpointing_delay,
             "reply_watchdog_sec": REPLY_WATCHDOG_SEC,
+            "voice_filler_audio_path": str(_FILLER_AUDIO_PATH)
+            if _FILLER_AUDIO_PATH
+            else None,
+            "voice_emergency_audio_path": str(_EMERGENCY_AUDIO_PATH)
+            if _EMERGENCY_AUDIO_PATH
+            else None,
         },
     )
+
+    async def handle_unrecoverable_error(ev: Any) -> None:
+        nonlocal unrecoverable_error_response_started
+        if unrecoverable_error_response_started:
+            return
+        unrecoverable_error_response_started = True
+
+        err = getattr(ev, "error", None)
+        err_type = str(getattr(err, "type", type(err).__name__))
+        if _EMERGENCY_AUDIO_PATH is not None:
+            played = await play_prerecorded_audio(
+                session=session,
+                audio_path=_EMERGENCY_AUDIO_PATH,
+                sample_rate=audio_output_sample_rate,
+                allow_interruptions=False,
+                add_to_chat_ctx=False,
+            )
+            if played:
+                return
+
+        # If TTS itself is broken and no emergency audio exists, saying a text
+        # fallback would likely loop back into the same failing TTS path.
+        if err_type == "tts_error":
+            logger.warning(
+                "unrecoverable TTS error has no playable emergency audio fallback"
+            )
+            return
+
+        try:
+            handle = session.say(
+                VOICE_EMERGENCY_PHRASE,
+                allow_interruptions=False,
+                add_to_chat_ctx=False,
+            )
+            await handle.wait_for_playout()
+        except Exception as e:
+            logger.exception("failed to play emergency fallback phrase: %s", e)
 
     async def reply_watchdog(
         *,
@@ -1696,13 +2117,28 @@ async def my_agent(ctx: JobContext):
                 )
                 return
             logger.warning(
-                "reply watchdog fired; forcing generate_reply",
+                "reply watchdog fired",
                 extra={
                     "timeout_sec": REPLY_WATCHDOG_SEC,
                     "user_activity_count": user_activity_count,
                     "assistant_message_count": assistant_message_count,
+                    "filler_audio_path": str(_FILLER_AUDIO_PATH)
+                    if _FILLER_AUDIO_PATH
+                    else None,
                 },
             )
+            if _FILLER_AUDIO_PATH is not None:
+                played = await play_prerecorded_audio(
+                    session=session,
+                    audio_path=_FILLER_AUDIO_PATH,
+                    sample_rate=audio_output_sample_rate,
+                    allow_interruptions=True,
+                    add_to_chat_ctx=False,
+                )
+                if played:
+                    logger.info("reply watchdog played filler audio")
+                    return
+
             # Safety path for stuck scheduling:
             # - disable tools to prevent accidental end_call
             # - nudge model to answer latest user request directly
@@ -1806,6 +2242,37 @@ async def my_agent(ctx: JobContext):
                 reply_watchdog_task = None
         except Exception as e:
             logger.exception("agent_state_changed handler failed: %s", e)
+
+    @session.on("error")
+    def on_error(ev):
+        nonlocal unrecoverable_error_task
+        try:
+            err = getattr(ev, "error", None)
+            source = getattr(ev, "source", None)
+            recoverable = bool(getattr(err, "recoverable", False))
+            log_method = logger.warning if recoverable else logger.error
+            log_method(
+                "agent session error",
+                extra={
+                    "recoverable": recoverable,
+                    "error_type": getattr(err, "type", type(err).__name__),
+                    "error_label": getattr(err, "label", None),
+                    "source_provider": getattr(source, "provider", None),
+                    "source_model": getattr(source, "model", None),
+                    "source_label": getattr(source, "label", None),
+                    "room": ctx.room.name,
+                },
+            )
+            if recoverable:
+                return
+            if unrecoverable_error_task and not unrecoverable_error_task.done():
+                return
+            unrecoverable_error_task = asyncio.create_task(
+                handle_unrecoverable_error(ev),
+                name="handle_unrecoverable_error",
+            )
+        except Exception as e:
+            logger.exception("error handler failed: %s", e)
 
     @session.on("metrics_collected")
     def on_metrics_collected(ev):
@@ -2016,6 +2483,7 @@ async def my_agent(ctx: JobContext):
             model_router=model_router,
             routed_llms=routed_llms,
             routed_llm_providers=routed_llm_providers,
+            routed_llm_metadata=routed_llm_metadata,
             fallback_llm=fallback_llm,
             first_turn_short_greeting_audio_path=_SHORT_GREETING_AUDIO_PATH,
             prerecorded_audio_sample_rate=audio_output_sample_rate,
@@ -2049,7 +2517,6 @@ async def my_agent(ctx: JobContext):
                     ("session", session.llm),
                     ("route_fast", routed_llms.get("fast")),
                     ("route_complex", routed_llms.get("complex")),
-                    ("fallback", fallback_llm),
                 ],
                 tts_client=session.tts,
                 prompt_cache_warmup_llm=session.llm,
@@ -2099,6 +2566,8 @@ async def my_agent(ctx: JobContext):
             end_call_task.cancel()
         if reply_watchdog_task and not reply_watchdog_task.done():
             reply_watchdog_task.cancel()
+        if unrecoverable_error_task and not unrecoverable_error_task.done():
+            unrecoverable_error_task.cancel()
         if runtime_warmup_task and not runtime_warmup_task.done():
             runtime_warmup_task.cancel()
             with suppress(BaseException):

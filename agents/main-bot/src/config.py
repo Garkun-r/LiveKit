@@ -66,6 +66,8 @@ LLM_PROVIDER = _normalize_llm_provider(_raw_llm_provider)
 FAST_LLM_PROVIDER = _normalize_llm_provider(os.getenv("FAST_LLM_PROVIDER", ""))
 COMPLEX_LLM_PROVIDER = _normalize_llm_provider(os.getenv("COMPLEX_LLM_PROVIDER", ""))
 LLM_ROUTING_ENABLED = bool(FAST_LLM_PROVIDER and COMPLEX_LLM_PROVIDER)
+MODEL_ROUTER_FAST_MODEL = os.getenv("MODEL_ROUTER_FAST_MODEL", "").strip()
+MODEL_ROUTER_COMPLEX_MODEL = os.getenv("MODEL_ROUTER_COMPLEX_MODEL", "").strip()
 
 # TTS provider switch:
 # - elevenlabs (default)
@@ -141,6 +143,7 @@ GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.7"))
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "512"))
 GEMINI_TOP_P = float(os.getenv("GEMINI_TOP_P", "1"))
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "minimal")
+GEMINI_HTTP_TIMEOUT_SEC = float(os.getenv("GEMINI_HTTP_TIMEOUT_SEC", "10.0"))
 
 # xAI Grok (Responses API)
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4-1-fast-non-reasoning-latest")
@@ -150,13 +153,66 @@ XAI_BASE_URL = os.getenv("XAI_BASE_URL", "").strip()
 # Keep tools off by default even if the agent defines them.
 XAI_ENABLE_TOOLS = _env_bool("XAI_ENABLE_TOOLS", default=False)
 
-# Guard against silent stalls: wait this long for first LLM token before retry/fallback.
-LLM_FIRST_TOKEN_TIMEOUT_SEC = float(os.getenv("LLM_FIRST_TOKEN_TIMEOUT_SEC", "8.0"))
-# Fallback models can be colder/slower on first token; allow a longer initial timeout.
-LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC = float(
-    os.getenv("LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC", "16.0")
+# LLM fallback settings.
+# USE_LIVEKIT_FALLBACK_ADAPTER=false keeps the legacy manual llm_node retry path
+# available as a quick rollback switch.
+USE_LIVEKIT_FALLBACK_ADAPTER = _env_bool(
+    "USE_LIVEKIT_FALLBACK_ADAPTER",
+    default=True,
 )
-LLM_RETRY_DELAY_SEC = float(os.getenv("LLM_RETRY_DELAY_SEC", "0.35"))
+LLM_ATTEMPT_TIMEOUT_SEC = float(os.getenv("LLM_ATTEMPT_TIMEOUT_SEC", "2.5"))
+LLM_MAX_RETRY_PER_LLM = int(os.getenv("LLM_MAX_RETRY_PER_LLM", "0"))
+LLM_RETRY_INTERVAL_SEC = float(
+    os.getenv(
+        "LLM_RETRY_INTERVAL_SEC",
+        os.getenv("LLM_RETRY_DELAY_SEC", "0.3"),
+    )
+)
+LLM_RETRY_ON_CHUNK_SENT = _env_bool("LLM_RETRY_ON_CHUNK_SENT", default=False)
+
+# Branch-local backup model config. Defaults use the existing Gemini fallback
+# model so current deployments can opt into fallback without inventing IDs.
+FAST_LLM_BACKUP_PROVIDER = _normalize_llm_provider(
+    os.getenv(
+        "FAST_LLM_BACKUP_PROVIDER",
+        "google" if GEMINI_FALLBACK_MODEL.strip() else "",
+    )
+)
+FAST_LLM_BACKUP_MODEL = os.getenv(
+    "FAST_LLM_BACKUP_MODEL",
+    GEMINI_FALLBACK_MODEL,
+).strip()
+COMPLEX_LLM_BACKUP_PROVIDER = _normalize_llm_provider(
+    os.getenv(
+        "COMPLEX_LLM_BACKUP_PROVIDER",
+        "google" if GEMINI_FALLBACK_MODEL.strip() else "",
+    )
+)
+COMPLEX_LLM_BACKUP_MODEL = os.getenv(
+    "COMPLEX_LLM_BACKUP_MODEL",
+    GEMINI_FALLBACK_MODEL,
+).strip()
+
+# Legacy variables kept so old env files still start. The LiveKit fallback
+# adapter path uses LLM_ATTEMPT_TIMEOUT_SEC / LLM_RETRY_INTERVAL_SEC instead.
+LLM_FIRST_TOKEN_TIMEOUT_SEC = float(
+    os.getenv("LLM_FIRST_TOKEN_TIMEOUT_SEC", str(LLM_ATTEMPT_TIMEOUT_SEC))
+)
+LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC = float(
+    os.getenv("LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC", str(LLM_ATTEMPT_TIMEOUT_SEC))
+)
+LLM_RETRY_DELAY_SEC = float(
+    os.getenv("LLM_RETRY_DELAY_SEC", str(LLM_RETRY_INTERVAL_SEC))
+)
+
+# Prerecorded audio hooks. Relative paths resolve under agents/main-bot/audio.
+VOICE_FILLER_AUDIO_PATH = os.getenv("VOICE_FILLER_AUDIO_PATH", "").strip()
+VOICE_EMERGENCY_AUDIO_PATH = os.getenv("VOICE_EMERGENCY_AUDIO_PATH", "").strip()
+VOICE_FILLER_PHRASE = os.getenv("VOICE_FILLER_PHRASE", "Секундочку, проверяю.").strip()
+VOICE_EMERGENCY_PHRASE = os.getenv(
+    "VOICE_EMERGENCY_PHRASE",
+    "Извините, перезвоните ещё раз, вас плохо слышно.",
+).strip()
 
 # Turn endpointing tuning (seconds). Lower values = faster replies.
 TURN_MIN_ENDPOINTING_DELAY = float(os.getenv("TURN_MIN_ENDPOINTING_DELAY", "0.25"))
