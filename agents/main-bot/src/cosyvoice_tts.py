@@ -96,7 +96,9 @@ def _mime_type(audio_format: str) -> str:
     return "audio/pcm"
 
 
-def _split_continue_chunks(text: str, max_chars: int = DEFAULT_MAX_TEXT_CHARS) -> list[str]:
+def _split_continue_chunks(
+    text: str, max_chars: int = DEFAULT_MAX_TEXT_CHARS
+) -> list[str]:
     normalized = " ".join((text or "").split())
     if not normalized:
         return []
@@ -156,9 +158,7 @@ class CosyVoiceTTS(tts.TTS):
 
         resolved_format = (audio_format or DEFAULT_FORMAT).strip().lower()
         if resolved_format not in {"pcm", "wav", "mp3", "opus"}:
-            raise ValueError(
-                "COSYVOICE_TTS_FORMAT must be one of: pcm, wav, mp3, opus"
-            )
+            raise ValueError("COSYVOICE_TTS_FORMAT must be one of: pcm, wav, mp3, opus")
 
         resolved_mode = (voice_mode or DEFAULT_VOICE_MODE).strip().lower()
         if resolved_mode not in {"preset", "clone", "design"}:
@@ -166,7 +166,9 @@ class CosyVoiceTTS(tts.TTS):
                 "COSYVOICE_TTS_VOICE_MODE must be one of: preset, clone, design"
             )
         if resolved_mode == "preset" and not (voice_id or "").strip():
-            raise ValueError("COSYVOICE_TTS_VOICE_ID is required when voice_mode=preset")
+            raise ValueError(
+                "COSYVOICE_TTS_VOICE_ID is required when voice_mode=preset"
+            )
         if resolved_mode == "clone" and not (clone_voice_id or "").strip():
             raise ValueError(
                 "COSYVOICE_TTS_CLONE_VOICE_ID is required when voice_mode=clone"
@@ -269,7 +271,9 @@ class CosyVoiceTTS(tts.TTS):
                 self._websocket_reconnect_count += 1
                 logger.warning(
                     "cosyvoice websocket reconnecting",
-                    extra={"websocket_reconnect_count": self._websocket_reconnect_count},
+                    extra={
+                        "websocket_reconnect_count": self._websocket_reconnect_count
+                    },
                 )
                 await self._close_connection_locked()
 
@@ -475,7 +479,9 @@ class _CosyVoiceSynthesizeStream(tts.SynthesizeStream):
             )
         return resolved_voice
 
-    async def _send_run_task(self, *, ws: ClientConnection, runtime: _TaskRuntime) -> None:
+    async def _send_run_task(
+        self, *, ws: ClientConnection, runtime: _TaskRuntime
+    ) -> None:
         payload = {
             "header": {
                 "action": "run-task",
@@ -537,7 +543,9 @@ class _CosyVoiceSynthesizeStream(tts.SynthesizeStream):
 
         runtime.text_chunks_sent += 1
 
-    async def _send_finish_task(self, *, ws: ClientConnection, runtime: _TaskRuntime) -> None:
+    async def _send_finish_task(
+        self, *, ws: ClientConnection, runtime: _TaskRuntime
+    ) -> None:
         payload = {
             "header": {
                 "action": "finish-task",
@@ -559,7 +567,9 @@ class _CosyVoiceSynthesizeStream(tts.SynthesizeStream):
 
     async def _wait_for_started(self, runtime: _TaskRuntime) -> None:
         try:
-            await asyncio.wait_for(runtime.started_event.wait(), timeout=self._conn_options.timeout)
+            await asyncio.wait_for(
+                runtime.started_event.wait(), timeout=self._conn_options.timeout
+            )
         except asyncio.TimeoutError:
             raise APITimeoutError() from None
 
@@ -569,7 +579,9 @@ class _CosyVoiceSynthesizeStream(tts.SynthesizeStream):
     async def _wait_for_finished(self, runtime: _TaskRuntime) -> None:
         finish_timeout = max(float(self._conn_options.timeout), 60.0)
         try:
-            await asyncio.wait_for(runtime.finished_event.wait(), timeout=finish_timeout)
+            await asyncio.wait_for(
+                runtime.finished_event.wait(), timeout=finish_timeout
+            )
         except asyncio.TimeoutError:
             raise APITimeoutError() from None
 

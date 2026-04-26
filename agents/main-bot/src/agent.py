@@ -3,12 +3,15 @@ import base64
 import json
 import logging
 import os
+import re
 import tempfile
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import suppress
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
+import aiohttp
 from dotenv import load_dotenv
 from google.auth import default as google_auth_default
 from google.auth import (
@@ -34,7 +37,9 @@ from livekit.agents import (
 from livekit.agents import (
     stt as lk_stt,
 )
-from livekit.agents.llm import ChatMessage
+from livekit.agents.llm import ChatContext, ChatMessage
+from livekit.agents.llm.tool_context import StopResponse
+from livekit.agents.utils.audio import audio_frames_from_file
 from livekit.plugins import (
     ai_coustics,
     deepgram,
@@ -43,11 +48,14 @@ from livekit.plugins import (
     minimax,
     noise_cancellation,
     silero,
+    xai,
 )
+from livekit.plugins.minimax import tts as minimax_tts_plugin
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from config import (
     AGENT_NAME,
+    COMPLEX_LLM_PROVIDER,
     COSYVOICE_API_KEY,
     COSYVOICE_API_KEY_ENV_NAME,
     COSYVOICE_PROFILE,
@@ -70,7 +78,25 @@ from config import (
     COSYVOICE_TTS_WS_URL,
     DEEPGRAM_API_KEY,
     ELEVENLABS_MODEL,
+    ELEVENLABS_V3_APPLY_TEXT_NORMALIZATION,
+    ELEVENLABS_V3_ENABLE_LOGGING,
+    ELEVENLABS_V3_LANGUAGE,
+    ELEVENLABS_V3_MAX_MERGED_TEXT_LEN,
+    ELEVENLABS_V3_MERGE_HOLD_MS,
+    ELEVENLABS_V3_MIN_HTTP_TEXT_LEN,
+    ELEVENLABS_V3_MIN_SENTENCE_LEN,
+    ELEVENLABS_V3_OPTIMIZE_STREAMING_LATENCY,
+    ELEVENLABS_V3_OUTPUT_FORMAT,
+    ELEVENLABS_V3_REQUEST_TIMEOUT_SEC,
+    ELEVENLABS_V3_STREAM_CONTEXT_LEN,
+    ELEVENLABS_V3_USE_STREAM_INPUT,
     ELEVENLABS_VOICE_ID,
+    ELEVENLABS_VOICE_SIMILARITY_BOOST,
+    ELEVENLABS_VOICE_SPEED,
+    ELEVENLABS_VOICE_STABILITY,
+    ELEVENLABS_VOICE_STYLE,
+    ELEVENLABS_VOICE_USE_SPEAKER_BOOST,
+    FAST_LLM_PROVIDER,
     GEMINI_FALLBACK_MODEL,
     GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_MODEL,
@@ -91,23 +117,30 @@ from config import (
     GOOGLE_TTS_STREAM_CONTEXT_LEN,
     GOOGLE_TTS_USE_STREAMING,
     GOOGLE_TTS_VOICE_NAME,
+    LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
     LLM_FIRST_TOKEN_TIMEOUT_SEC,
+    LLM_PROVIDER,
     LLM_RETRY_DELAY_SEC,
+    LLM_ROUTING_ENABLED,
     MINIMAX_API_KEY,
     MINIMAX_TTS_BASE_URL,
     MINIMAX_TTS_BITRATE,
     MINIMAX_TTS_FORMAT,
+    MINIMAX_TTS_INTENSITY,
     MINIMAX_TTS_LANGUAGE_BOOST,
     MINIMAX_TTS_MIN_SENTENCE_LEN,
     MINIMAX_TTS_MODEL,
     MINIMAX_TTS_PITCH,
     MINIMAX_TTS_SAMPLE_RATE,
+    MINIMAX_TTS_SOUND_EFFECTS,
     MINIMAX_TTS_SPEED,
     MINIMAX_TTS_STREAM_CONTEXT_LEN,
+    MINIMAX_TTS_TIMBRE,
     MINIMAX_TTS_VOICE_ID,
     MINIMAX_TTS_VOLUME,
     PREEMPTIVE_GENERATION,
     REPLY_WATCHDOG_SEC,
+    STT_DEEPGRAM_ENDPOINTING_MS,
     STT_DEEPGRAM_LANGUAGE,
     STT_DEEPGRAM_MODEL,
     STT_GOOGLE_LANGUAGE,
@@ -125,9 +158,16 @@ from config import (
     TURN_MIN_ENDPOINTING_DELAY,
     VERTEX_TTS_MIN_SENTENCE_LEN,
     VERTEX_TTS_STREAM_CONTEXT_LEN,
+    XAI_API_KEY,
+    XAI_BASE_URL,
+    XAI_ENABLE_TOOLS,
+    XAI_MODEL,
+    XAI_TEMPERATURE,
 )
 from cosyvoice_tts import CosyVoiceTTS
-from prompt_repo import get_active_prompt
+from eleven_v3_tts import ElevenV3TTS
+from prompt_repo import PromptResolution, get_active_prompt, resolve_prompt_for_call
+from routing.model_router import ModelRouter, ModelRouteResult, coerce_optional_bool
 from session_export import send_session_to_n8n
 from vertex_gemini_tts import VertexGeminiTTS
 
@@ -136,6 +176,55 @@ logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
 _materialized_google_credentials_file: str | None = None
+_minimax_sound_effects_patched = False
+
+_AUDIO_DIR = Path(__file__).resolve().parent.parent / "audio"
+_INITIAL_GREETING_AUDIO_PATH = _AUDIO_DIR / "1.wav"
+_SHORT_GREETING_AUDIO_PATH = _AUDIO_DIR / "2.wav"
+_WARMUP_REQUEST_TIMEOUT_SEC = 4.0
+_PROMPT_CACHE_WARMUP_USER_TEXT = (
+    "Служебный запрос прогрева. Ответь строго одним словом: OK."
+)
+_SIP_DID_ATTRIBUTE_KEYS = (
+    "jcall.did",
+    "x-did",
+    "X-DID",
+    "sip.h.X-DID",
+    "sip.trunkPhoneNumber",
+)
+_WHITESPACE_RE = re.compile(r"\s+")
+_SHORT_GREETING_RE = re.compile(
+    r"^(?:алло|алло алло|ало|ало ало|алё|алё алё|але|але але|доброе утро|алло доброе утро|ало доброе утро|алё доброе утро|добрый день|алло добрый день|ало добрый день|алё добрый день|здравствуйте|да здравствуйте|алло здравствуйте|ало здравствуйте|алё здравствуйте|девушка здравствуйте|алло девушка здравствуйте|здрасьте|алло здрасьте|ало здрасьте|алё здрасьте|девушка здрасьте|алло девушка здрасьте)[\.!\?, ]*$",
+    re.IGNORECASE,
+)
+
+
+def _patch_minimax_sound_effects() -> None:
+    """Inject voice_modify.sound_effects into official MiniMax plugin payload."""
+    global _minimax_sound_effects_patched
+
+    if _minimax_sound_effects_patched:
+        return
+    if not MINIMAX_TTS_SOUND_EFFECTS:
+        return
+
+    original_to_minimax_options = minimax_tts_plugin._to_minimax_options
+
+    def _patched_to_minimax_options(opts: Any) -> dict[str, Any]:
+        config = original_to_minimax_options(opts)
+        voice_modify = config.get("voice_modify")
+        if not isinstance(voice_modify, dict):
+            voice_modify = {}
+            config["voice_modify"] = voice_modify
+        voice_modify["sound_effects"] = MINIMAX_TTS_SOUND_EFFECTS
+        return config
+
+    minimax_tts_plugin._to_minimax_options = _patched_to_minimax_options
+    _minimax_sound_effects_patched = True
+    logger.info(
+        "patched MiniMax plugin payload with voice_modify.sound_effects",
+        extra={"sound_effects": MINIMAX_TTS_SOUND_EFFECTS},
+    )
 
 
 def safe_dump(value: Any) -> Any:
@@ -160,13 +249,362 @@ def safe_dump(value: Any) -> Any:
     return str(value)
 
 
-def build_google_llm() -> google.LLM:
+def extract_sip_call_numbers(participant: Any | None) -> dict[str, str | None]:
+    if participant is None:
+        return {"sip_trunk_number": None, "sip_client_number": None}
+    if getattr(participant, "kind", None) != rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+        return {"sip_trunk_number": None, "sip_client_number": None}
+
+    attributes = getattr(participant, "attributes", None)
+    if not isinstance(attributes, dict):
+        attributes = {}
+
+    sip_trunk_number = None
+    for key in _SIP_DID_ATTRIBUTE_KEYS:
+        value = (attributes.get(key) or "").strip()
+        if value:
+            sip_trunk_number = value
+            break
+
+    return {
+        "sip_trunk_number": sip_trunk_number,
+        "sip_client_number": (attributes.get("sip.phoneNumber") or "").strip() or None,
+    }
+
+
+def is_short_greeting_response(text: str | None) -> bool:
+    if text is None:
+        return False
+
+    normalized = _WHITESPACE_RE.sub(" ", text.strip().lower())
+    if not normalized:
+        return False
+
+    return bool(_SHORT_GREETING_RE.fullmatch(normalized))
+
+
+def resolve_audio_output_sample_rate() -> int:
+    if TTS_PROVIDER == "minimax":
+        return MINIMAX_TTS_SAMPLE_RATE
+    if TTS_PROVIDER == "cosyvoice":
+        return COSYVOICE_TTS_SAMPLE_RATE
+    return 24000
+
+
+async def play_prerecorded_audio(
+    *,
+    session: AgentSession,
+    audio_path: Path,
+    sample_rate: int,
+    allow_interruptions: bool,
+    add_to_chat_ctx: bool,
+) -> bool:
+    if not audio_path.exists():
+        logger.warning("prerecorded audio file not found: %s", audio_path)
+        return False
+
+    try:
+        handle = session.say(
+            "",
+            audio=audio_frames_from_file(
+                str(audio_path),
+                sample_rate=sample_rate,
+                num_channels=1,
+            ),
+            allow_interruptions=allow_interruptions,
+            add_to_chat_ctx=add_to_chat_ctx,
+        )
+        await handle.wait_for_playout()
+        return True
+    except Exception as e:
+        logger.exception("failed to play prerecorded audio '%s': %s", audio_path, e)
+        return False
+
+
+async def warmup_google_llm_transport(llm_client: google.LLM, *, label: str) -> None:
+    """Warm up Gemini transport via model metadata call (no generation tokens)."""
+    model_name = str(getattr(llm_client, "model", "")).strip()
+    client = getattr(llm_client, "_client", None)
+    if not model_name or client is None or not hasattr(client, "aio"):
+        return
+
+    started_at = asyncio.get_running_loop().time()
+    try:
+        await asyncio.wait_for(
+            client.aio.models.get(model=model_name),
+            timeout=_WARMUP_REQUEST_TIMEOUT_SEC,
+        )
+        elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000
+        logger.info(
+            "llm transport warmup completed",
+            extra={
+                "provider": "google",
+                "model": model_name,
+                "label": label,
+                "elapsed_ms": round(elapsed_ms, 1),
+            },
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "llm transport warmup timed out",
+            extra={
+                "provider": "google",
+                "model": model_name,
+                "label": label,
+                "timeout_sec": _WARMUP_REQUEST_TIMEOUT_SEC,
+            },
+        )
+    except Exception as e:
+        logger.warning(
+            "llm transport warmup failed: %s",
+            e,
+            extra={"provider": "google", "model": model_name, "label": label},
+        )
+
+
+async def warmup_xai_llm_transport(
+    llm_client: xai.responses.LLM, *, label: str
+) -> None:
+    """Warm up xAI transport via model metadata call (no generation tokens)."""
+    model_name = str(getattr(llm_client, "model", "")).strip()
+    client = getattr(llm_client, "_client", None)
+    if not model_name or client is None or not hasattr(client, "models"):
+        return
+
+    started_at = asyncio.get_running_loop().time()
+    try:
+        await asyncio.wait_for(
+            client.models.retrieve(model_name),
+            timeout=_WARMUP_REQUEST_TIMEOUT_SEC,
+        )
+        elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000
+        logger.info(
+            "llm transport warmup completed",
+            extra={
+                "provider": "xai",
+                "model": model_name,
+                "label": label,
+                "elapsed_ms": round(elapsed_ms, 1),
+            },
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "llm transport warmup timed out",
+            extra={
+                "provider": "xai",
+                "model": model_name,
+                "label": label,
+                "timeout_sec": _WARMUP_REQUEST_TIMEOUT_SEC,
+            },
+        )
+    except Exception as e:
+        logger.warning(
+            "llm transport warmup failed: %s",
+            e,
+            extra={"provider": "xai", "model": model_name, "label": label},
+        )
+
+
+async def warmup_llm_transport(llm_client: Any, *, label: str) -> None:
+    if isinstance(llm_client, google.LLM):
+        await warmup_google_llm_transport(llm_client, label=label)
+        return
+    if isinstance(llm_client, xai.responses.LLM):
+        await warmup_xai_llm_transport(llm_client, label=label)
+        return
+
+
+async def warmup_tts_transport(tts_client: Any) -> None:
+    """Warm up TTS HTTP transport via ElevenLabs metadata call (no synthesis)."""
+    if not isinstance(tts_client, ElevenV3TTS):
+        return
+
+    opts = getattr(tts_client, "_opts", None)
+    if opts is None:
+        return
+
+    base_url = str(getattr(opts, "base_url", "")).strip().rstrip("/")
+    voice_id = str(getattr(opts, "voice_id", "")).strip()
+    api_key = str(getattr(opts, "api_key", "")).strip()
+    if not base_url or not voice_id or not api_key:
+        return
+
+    started_at = asyncio.get_running_loop().time()
+    try:
+        session = tts_client._ensure_session()
+        warmup_url = f"{base_url}/voices/{voice_id}"
+        timeout = aiohttp.ClientTimeout(
+            total=_WARMUP_REQUEST_TIMEOUT_SEC,
+            connect=min(2.5, _WARMUP_REQUEST_TIMEOUT_SEC),
+            sock_read=_WARMUP_REQUEST_TIMEOUT_SEC,
+        )
+        async with session.get(
+            warmup_url,
+            headers={"xi-api-key": api_key, "Accept": "application/json"},
+            timeout=timeout,
+        ) as response:
+            _ = await response.read()
+            if response.status >= 400:
+                raise RuntimeError(f"HTTP {response.status}")
+
+        elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000
+        logger.info(
+            "tts transport warmup completed",
+            extra={
+                "provider": "elevenlabs",
+                "voice_id": voice_id,
+                "elapsed_ms": round(elapsed_ms, 1),
+            },
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "tts transport warmup timed out",
+            extra={
+                "provider": "elevenlabs",
+                "voice_id": voice_id,
+                "timeout_sec": _WARMUP_REQUEST_TIMEOUT_SEC,
+            },
+        )
+    except Exception as e:
+        logger.warning(
+            "tts transport warmup failed: %s",
+            e,
+            extra={"provider": "elevenlabs", "voice_id": voice_id},
+        )
+
+
+async def warmup_runtime_backends(
+    *,
+    llm_candidates: list[tuple[str, Any]],
+    tts_client: Any,
+    prompt_cache_warmup_llm: Any | None = None,
+    prompt_cache_warmup_instructions: str | None = None,
+    prompt_cache_warmup_conn_options: Any | None = None,
+) -> None:
+    tasks: list[asyncio.Task] = []
+    seen_llm_ids: set[int] = set()
+
+    for label, llm_client in llm_candidates:
+        if llm_client is None:
+            continue
+        llm_id = id(llm_client)
+        if llm_id in seen_llm_ids:
+            continue
+        seen_llm_ids.add(llm_id)
+        tasks.append(
+            asyncio.create_task(
+                warmup_llm_transport(llm_client, label=label),
+                name=f"warmup_llm_{label}",
+            )
+        )
+
+    tasks.append(
+        asyncio.create_task(
+            warmup_tts_transport(tts_client),
+            name="warmup_tts",
+        )
+    )
+
+    if prompt_cache_warmup_llm is not None and prompt_cache_warmup_instructions:
+        tasks.append(
+            asyncio.create_task(
+                warmup_llm_prompt_cache(
+                    llm_client=prompt_cache_warmup_llm,
+                    instructions=prompt_cache_warmup_instructions,
+                    conn_options=prompt_cache_warmup_conn_options,
+                ),
+                name="warmup_llm_prompt_cache",
+            )
+        )
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def warmup_llm_prompt_cache(
+    *,
+    llm_client: Any,
+    instructions: str,
+    conn_options: Any | None,
+) -> None:
+    if llm_client is None or not hasattr(llm_client, "chat"):
+        return
+
+    chat_ctx = ChatContext.empty()
+    chat_ctx.add_message(role="system", content=[instructions])
+    chat_ctx.add_message(role="user", content=[_PROMPT_CACHE_WARMUP_USER_TEXT])
+
+    started_at = asyncio.get_running_loop().time()
+    first_chunk_at: float | None = None
+    usage = None
+    provider = str(getattr(llm_client, "provider", "unknown"))
+    model_name = str(getattr(llm_client, "model", "unknown"))
+
+    try:
+        chat_kwargs: dict[str, Any] = {
+            "chat_ctx": chat_ctx,
+            "tools": [],
+            "tool_choice": "none",
+        }
+        if conn_options is not None:
+            chat_kwargs["conn_options"] = conn_options
+
+        stream = llm_client.chat(**chat_kwargs)
+        async with stream:
+            async for chunk in stream:
+                if first_chunk_at is None:
+                    first_chunk_at = asyncio.get_running_loop().time()
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage = chunk_usage
+
+        finished_at = asyncio.get_running_loop().time()
+        ttft_ms = (
+            round((first_chunk_at - started_at) * 1000, 1)
+            if first_chunk_at is not None
+            else None
+        )
+        elapsed_ms = round((finished_at - started_at) * 1000, 1)
+        logger.info(
+            "llm prompt-cache warmup completed",
+            extra={
+                "provider": provider,
+                "model": model_name,
+                "ttft_ms": ttft_ms,
+                "elapsed_ms": elapsed_ms,
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "prompt_cached_tokens": getattr(usage, "prompt_cached_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+            },
+        )
+    except Exception as e:
+        logger.warning(
+            "llm prompt-cache warmup failed: %s",
+            e,
+            extra={
+                "provider": provider,
+                "model": model_name,
+            },
+        )
+
+
+def build_google_llm(model_name: str | None = None) -> google.LLM:
     if not GOOGLE_API_KEY:
         raise RuntimeError("GOOGLE_API_KEY is not set. Configure it in .env.local")
 
+    resolved_model = (model_name or GEMINI_MODEL).strip()
+    logger.info(
+        "using Google LLM provider",
+        extra={
+            "provider": "google",
+            "model": resolved_model,
+            "temperature": GEMINI_TEMPERATURE,
+        },
+    )
+
     # Direct Gemini API configuration (not LiveKit Inference).
     return google.LLM(
-        model=GEMINI_MODEL,
+        model=resolved_model,
         api_key=GOOGLE_API_KEY,
         temperature=GEMINI_TEMPERATURE,
         max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
@@ -175,11 +613,146 @@ def build_google_llm() -> google.LLM:
     )
 
 
+def build_xai_llm(model_name: str | None = None) -> xai.responses.LLM:
+    if not XAI_API_KEY:
+        raise RuntimeError("XAI_API_KEY is not set. Configure it in .env.local")
+
+    resolved_model = (model_name or XAI_MODEL).strip()
+    base_url = XAI_BASE_URL if XAI_BASE_URL else NOT_GIVEN
+    logger.info(
+        "using xAI LLM provider",
+        extra={
+            "provider": "xai",
+            "model": resolved_model,
+            "temperature": XAI_TEMPERATURE,
+            "base_url": XAI_BASE_URL or "https://api.x.ai/v1",
+        },
+    )
+
+    return xai.responses.LLM(
+        model=resolved_model,
+        api_key=XAI_API_KEY,
+        base_url=base_url,
+        temperature=XAI_TEMPERATURE,
+    )
+
+
+def build_llm(model_name: str | None = None) -> Any:
+    return build_llm_for_provider(LLM_PROVIDER, model_name=model_name)
+
+
+def build_llm_for_provider(provider: str, model_name: str | None = None) -> Any:
+    if provider == "google":
+        return build_google_llm(model_name=model_name)
+    if provider == "xai":
+        return build_xai_llm(model_name=model_name)
+
+    logger.warning(
+        "Unknown LLM provider '%s'. Falling back to Google Gemini.",
+        provider,
+    )
+    return build_google_llm(model_name=model_name)
+
+
+def build_routed_llm_clients() -> tuple[dict[str, Any], dict[str, str]]:
+    route_to_provider = {
+        "fast": FAST_LLM_PROVIDER,
+        "complex": COMPLEX_LLM_PROVIDER,
+    }
+    provider_cache: dict[str, Any] = {}
+    routed_llms: dict[str, Any] = {}
+
+    for route_name, provider in route_to_provider.items():
+        if provider not in provider_cache:
+            provider_cache[provider] = build_llm_for_provider(provider)
+        routed_llms[route_name] = provider_cache[provider]
+
+    return routed_llms, route_to_provider
+
+
 def build_elevenlabs_tts() -> Any:
-    logger.info("using ElevenLabs TTS provider", extra={"model": ELEVENLABS_MODEL})
+    resolved_model = ELEVENLABS_MODEL.strip()
+    # Legacy env name kept for backward compatibility; now toggles custom HTTP stream adapter.
+    use_custom_v3 = ELEVENLABS_V3_USE_STREAM_INPUT and resolved_model == "eleven_v3"
+
+    voice_settings: Any = NOT_GIVEN
+    if (
+        ELEVENLABS_VOICE_STABILITY is not None
+        or ELEVENLABS_VOICE_SIMILARITY_BOOST is not None
+    ):
+        if (
+            ELEVENLABS_VOICE_STABILITY is None
+            or ELEVENLABS_VOICE_SIMILARITY_BOOST is None
+        ):
+            logger.warning(
+                "ElevenLabs voice settings ignored: both ELEVENLABS_VOICE_STABILITY and "
+                "ELEVENLABS_VOICE_SIMILARITY_BOOST must be set together."
+            )
+        else:
+            voice_settings = elevenlabs.VoiceSettings(
+                stability=ELEVENLABS_VOICE_STABILITY,
+                similarity_boost=ELEVENLABS_VOICE_SIMILARITY_BOOST,
+                style=(
+                    ELEVENLABS_VOICE_STYLE
+                    if ELEVENLABS_VOICE_STYLE is not None
+                    else NOT_GIVEN
+                ),
+                speed=(
+                    ELEVENLABS_VOICE_SPEED
+                    if ELEVENLABS_VOICE_SPEED is not None
+                    else NOT_GIVEN
+                ),
+                use_speaker_boost=(
+                    ELEVENLABS_VOICE_USE_SPEAKER_BOOST
+                    if ELEVENLABS_VOICE_USE_SPEAKER_BOOST is not None
+                    else NOT_GIVEN
+                ),
+            )
+
+    if use_custom_v3:
+        logger.info(
+            "using ElevenLabs eleven_v3 custom HTTP stream TTS provider",
+            extra={
+                "model": resolved_model,
+                "voice_id": ELEVENLABS_VOICE_ID,
+                "output_format": ELEVENLABS_V3_OUTPUT_FORMAT,
+                "enable_logging": ELEVENLABS_V3_ENABLE_LOGGING,
+                "min_sentence_len": max(2, ELEVENLABS_V3_MIN_SENTENCE_LEN),
+                "stream_context_len": max(1, ELEVENLABS_V3_STREAM_CONTEXT_LEN),
+                "min_http_text_len": max(1, ELEVENLABS_V3_MIN_HTTP_TEXT_LEN),
+                "merge_hold_ms": max(0, ELEVENLABS_V3_MERGE_HOLD_MS),
+                "max_merged_text_len": max(1, ELEVENLABS_V3_MAX_MERGED_TEXT_LEN),
+                "optimize_streaming_latency": ELEVENLABS_V3_OPTIMIZE_STREAMING_LATENCY,
+            },
+        )
+        return ElevenV3TTS(
+            voice_id=ELEVENLABS_VOICE_ID,
+            model_id=resolved_model,
+            voice_settings=voice_settings,
+            output_format=ELEVENLABS_V3_OUTPUT_FORMAT,
+            enable_logging=ELEVENLABS_V3_ENABLE_LOGGING,
+            request_timeout=ELEVENLABS_V3_REQUEST_TIMEOUT_SEC,
+            apply_text_normalization=ELEVENLABS_V3_APPLY_TEXT_NORMALIZATION,
+            language=(ELEVENLABS_V3_LANGUAGE if ELEVENLABS_V3_LANGUAGE else NOT_GIVEN),
+            optimize_streaming_latency=(
+                ELEVENLABS_V3_OPTIMIZE_STREAMING_LATENCY
+                if ELEVENLABS_V3_OPTIMIZE_STREAMING_LATENCY is not None
+                else NOT_GIVEN
+            ),
+            min_http_text_len=max(1, ELEVENLABS_V3_MIN_HTTP_TEXT_LEN),
+            merge_hold_ms=max(0, ELEVENLABS_V3_MERGE_HOLD_MS),
+            max_merged_text_len=max(1, ELEVENLABS_V3_MAX_MERGED_TEXT_LEN),
+            tokenizer=tokenize.blingfire.SentenceTokenizer(
+                min_sentence_len=max(2, ELEVENLABS_V3_MIN_SENTENCE_LEN),
+                stream_context_len=max(1, ELEVENLABS_V3_STREAM_CONTEXT_LEN),
+            ),
+        )
+
+    logger.info("using ElevenLabs TTS provider", extra={"model": resolved_model})
     return elevenlabs.TTS(
         voice_id=ELEVENLABS_VOICE_ID,
-        model=ELEVENLABS_MODEL,
+        model=resolved_model,
+        voice_settings=voice_settings,
     )
 
 
@@ -232,7 +805,9 @@ def _resolve_google_tts_credentials_file() -> str:
         logger.warning("failed to materialize Google credentials file: %s", e)
         return ""
 
-    logger.info("materialized Google credentials JSON to temporary file for runtime auth")
+    logger.info(
+        "materialized Google credentials JSON to temporary file for runtime auth"
+    )
     return _materialized_google_credentials_file
 
 
@@ -389,7 +964,9 @@ def build_tts() -> Any:
 
         # Gemini 3.1 Flash TTS should run in streaming mode for lower TTFB.
         resolved_streaming = (
-            True if resolved_model == "gemini-3.1-flash-tts-preview" else GOOGLE_TTS_USE_STREAMING
+            True
+            if resolved_model == "gemini-3.1-flash-tts-preview"
+            else GOOGLE_TTS_USE_STREAMING
         )
 
         tts_kwargs: dict[str, Any] = {
@@ -433,15 +1010,22 @@ def build_tts() -> Any:
 
     if TTS_PROVIDER == "minimax":
         if not MINIMAX_API_KEY.strip():
-            logger.warning("MINIMAX_API_KEY is not set. Falling back to ElevenLabs TTS.")
+            logger.warning(
+                "MINIMAX_API_KEY is not set. Falling back to ElevenLabs TTS."
+            )
             return build_elevenlabs_tts()
 
+        _patch_minimax_sound_effects()
         logger.info(
             "using MiniMax TTS provider",
             extra={
                 "model": MINIMAX_TTS_MODEL,
                 "voice_id": MINIMAX_TTS_VOICE_ID,
                 "base_url": MINIMAX_TTS_BASE_URL,
+                "pitch": MINIMAX_TTS_PITCH,
+                "intensity": MINIMAX_TTS_INTENSITY,
+                "timbre": MINIMAX_TTS_TIMBRE,
+                "sound_effects": MINIMAX_TTS_SOUND_EFFECTS or None,
                 "streaming": True,
             },
         )
@@ -451,6 +1035,8 @@ def build_tts() -> Any:
             speed=MINIMAX_TTS_SPEED,
             vol=MINIMAX_TTS_VOLUME,
             pitch=MINIMAX_TTS_PITCH,
+            intensity=MINIMAX_TTS_INTENSITY,
+            timbre=MINIMAX_TTS_TIMBRE,
             text_normalization=False,
             audio_format=MINIMAX_TTS_FORMAT,
             sample_rate=MINIMAX_TTS_SAMPLE_RATE,
@@ -506,7 +1092,9 @@ def build_stt() -> Any:
         fallback_descriptions = [STT_INFERENCE_MODEL]
 
         if STT_INFERENCE_INCLUDE_GOOGLE_FALLBACK:
-            google_stt = _build_google_stt_or_none(log_prefix="inference->google fallback")
+            google_stt = _build_google_stt_or_none(
+                log_prefix="inference->google fallback"
+            )
             if google_stt is not None:
                 stt_instances.append(google_stt)
                 fallback_descriptions.append(f"google:{STT_GOOGLE_MODEL}")
@@ -592,7 +1180,9 @@ def build_stt() -> Any:
 
     if STT_PROVIDER == "deepgram":
         if not DEEPGRAM_API_KEY:
-            logger.warning("DEEPGRAM_API_KEY is not set. Falling back to inference STT.")
+            logger.warning(
+                "DEEPGRAM_API_KEY is not set. Falling back to inference STT."
+            )
             return inference.STT(
                 model=STT_INFERENCE_MODEL,
                 language=STT_INFERENCE_LANGUAGE,
@@ -609,6 +1199,13 @@ def build_stt() -> Any:
             api_key=DEEPGRAM_API_KEY,
             model=STT_DEEPGRAM_MODEL,
             language=STT_DEEPGRAM_LANGUAGE,
+            interim_results=True,
+            no_delay=True,
+            endpointing_ms=STT_DEEPGRAM_ENDPOINTING_MS,
+            smart_format=False,
+            punctuate=True,
+            filler_words=False,
+            vad_events=True,
         )
 
     logger.warning(
@@ -620,18 +1217,33 @@ def build_stt() -> Any:
         language=STT_INFERENCE_LANGUAGE,
     )
 
+
 class Assistant(Agent):
     def __init__(
         self,
         request_end_call: Callable[[RunContext, str], Awaitable[str]] | None = None,
+        model_router: ModelRouter | None = None,
+        routed_llms: dict[str, Any] | None = None,
+        routed_llm_providers: dict[str, str] | None = None,
         fallback_llm: google.LLM | None = None,
+        first_turn_short_greeting_audio_path: Path = _SHORT_GREETING_AUDIO_PATH,
+        prerecorded_audio_sample_rate: int = 24000,
+        prompt: str | None = None,
     ) -> None:
         self._request_end_call = request_end_call or self._noop_end_call
+        self._model_router = model_router
+        self._routed_llms = routed_llms or {}
+        self._routed_llm_providers = routed_llm_providers or {}
         self._fallback_llm = fallback_llm
-        prompt = get_active_prompt()
+        self._first_turn_short_greeting_audio_path = (
+            first_turn_short_greeting_audio_path
+        )
+        self._prerecorded_audio_sample_rate = prerecorded_audio_sample_rate
+        self._awaiting_first_user_turn = True
+        resolved_prompt = prompt if prompt is not None else get_active_prompt()
         super().__init__(
             instructions=(
-                f"{prompt}\n\n"
+                f"{resolved_prompt}\n\n"
                 "Дополнительное правило: когда разговор логически завершен и ты уже "
                 "сказала финальную прощальную фразу, вызови tool end_call.\n"
                 "После вызова end_call не добавляй новых реплик пользователю."
@@ -641,35 +1253,160 @@ class Assistant(Agent):
     async def _noop_end_call(self, _: RunContext, __: str) -> str:
         return "END_CALL_DISABLED"
 
+    async def on_user_turn_completed(self, _: Any, new_message: ChatMessage) -> None:
+        if not self._awaiting_first_user_turn:
+            return
+
+        user_text = (getattr(new_message, "text_content", None) or "").strip()
+        if not user_text:
+            return
+
+        self._awaiting_first_user_turn = False
+        if not is_short_greeting_response(user_text):
+            return
+
+        logger.info(
+            "first user turn matched short greeting regex; playing prerecorded follow-up audio"
+        )
+        with suppress(Exception):
+            await self.session.interrupt(force=True)
+
+        played = await play_prerecorded_audio(
+            session=self.session,
+            audio_path=self._first_turn_short_greeting_audio_path,
+            sample_rate=self._prerecorded_audio_sample_rate,
+            allow_interruptions=True,
+            add_to_chat_ctx=False,
+        )
+        if played:
+            raise StopResponse()
+
+    def _get_last_user_turn(self, chat_ctx: Any) -> tuple[str | None, bool | None]:
+        if self._model_router is None:
+            return None, None
+
+        items = getattr(chat_ctx, "items", None)
+        if not isinstance(items, list):
+            return None, None
+
+        for item in reversed(items):
+            if not isinstance(item, ChatMessage):
+                continue
+            role_str = str(getattr(item, "role", "")).lower()
+            if role_str != "user" and not role_str.endswith(".user"):
+                continue
+
+            fast_model: bool | None = None
+            extra = getattr(item, "extra", None)
+            if isinstance(extra, dict):
+                flag_field = self._model_router.force_fast_flag_field
+                fast_model = coerce_optional_bool(extra.get(flag_field))
+            return getattr(item, "text_content", None), fast_model
+
+        return None, None
+
+    def _resolve_primary_llm(
+        self,
+        *,
+        activity_llm: Any,
+        route: ModelRouteResult,
+    ) -> tuple[Any, str]:
+        routed_llm = self._routed_llms.get(route.selected_model)
+        if routed_llm is not None:
+            provider = self._routed_llm_providers.get(
+                route.selected_model, LLM_PROVIDER
+            )
+            return routed_llm, provider
+
+        logger.warning(
+            "model router selected '%s' but no routed LLM client is configured; using session llm",
+            route.selected_model,
+        )
+        return activity_llm, LLM_PROVIDER
+
+    def _log_model_route(
+        self,
+        *,
+        original_text: str | None,
+        forced_fast: bool,
+        route: ModelRouteResult,
+        selected_model_name: str,
+    ) -> None:
+        logger.info('[MODEL_ROUTER] text="%s"', original_text or "")
+        logger.info('[MODEL_ROUTER] normalized_text="%s"', route.normalized_text)
+        logger.info("[MODEL_ROUTER] forced_fast=%s", forced_fast)
+        logger.info('[MODEL_ROUTER] matched_rule="%s"', route.reason)
+        if route.matched_value is None:
+            logger.info("[MODEL_ROUTER] matched_value=null")
+        else:
+            logger.info('[MODEL_ROUTER] matched_value="%s"', route.matched_value)
+        logger.info('[MODEL_ROUTER] selected_model="%s"', route.selected_model)
+        logger.info('[MODEL_ROUTER] model_name="%s"', selected_model_name)
+
     async def _stream_llm(
         self,
         llm_client: Any,
+        llm_provider: str,
         chat_ctx: Any,
         tools: list[Any],
         model_settings: Any,
     ) -> AsyncIterator[Any]:
-        tool_choice = model_settings.tool_choice if model_settings else NOT_GIVEN
+        resolved_tools, tool_choice = self._resolve_tools_for_llm_call(
+            tools=tools,
+            model_settings=model_settings,
+            llm_provider=llm_provider,
+        )
         activity = self._get_activity_or_raise()
         conn_options = activity.session.conn_options.llm_conn_options
         async with llm_client.chat(
             chat_ctx=chat_ctx,
-            tools=tools,
+            tools=resolved_tools,
             tool_choice=tool_choice,
             conn_options=conn_options,
         ) as stream:
             async for chunk in stream:
                 yield chunk
 
+    def _resolve_tools_for_llm_call(
+        self,
+        *,
+        tools: list[Any],
+        model_settings: Any,
+        llm_provider: str | None = None,
+    ) -> tuple[list[Any], Any]:
+        tool_choice = model_settings.tool_choice if model_settings else NOT_GIVEN
+        resolved_tools = tools
+        provider = llm_provider or LLM_PROVIDER
+        # For xAI provider we keep tools disabled by default, even if declared in the agent.
+        # This avoids Responses API 400 errors around tool_choice/tools coupling
+        # and keeps lower TTFT for voice turns.
+        if provider == "xai" and not XAI_ENABLE_TOOLS:
+            if resolved_tools:
+                logger.info(
+                    "xAI tools are disabled by default; ignoring %d configured tool(s)",
+                    len(resolved_tools),
+                )
+            resolved_tools = []
+            tool_choice = NOT_GIVEN
+        return resolved_tools, tool_choice
+
     async def _stream_llm_with_ttft_timeout(
         self,
         llm_client: Any,
+        llm_provider: str,
         chat_ctx: Any,
         tools: list[Any],
         model_settings: Any,
         *,
         first_token_timeout: float,
     ) -> AsyncIterator[Any]:
-        stream = self._stream_llm(llm_client, chat_ctx, tools, model_settings)
+        stream = self._stream_llm(
+            llm_client,
+            llm_provider,
+            chat_ctx,
+            tools,
+            model_settings,
+        )
         stream_iter = stream.__aiter__()
         try:
             first_chunk = await asyncio.wait_for(
@@ -687,18 +1424,38 @@ class Assistant(Agent):
         async for chunk in stream_iter:
             yield chunk
 
-    async def llm_node(self, chat_ctx: Any, tools: list[Any], model_settings: Any) -> AsyncIterator[Any]:
+    async def llm_node(
+        self, chat_ctx: Any, tools: list[Any], model_settings: Any
+    ) -> AsyncIterator[Any]:
         """
-        Retries one transient 5xx Gemini failure before first output token.
+        Retries one transient 5xx failure before first output token.
         If configured, fallback model is used as the final attempt.
         """
         activity = self._get_activity_or_raise()
         primary_llm = activity.llm
+        primary_provider = LLM_PROVIDER
+        if self._model_router is not None and self._routed_llms:
+            user_text, fast_model = self._get_last_user_turn(chat_ctx)
+            route = self._model_router.route(user_text, fast_model=fast_model)
+            primary_llm, primary_provider = self._resolve_primary_llm(
+                activity_llm=activity.llm,
+                route=route,
+            )
+            selected_model_name = str(
+                getattr(primary_llm, "model", route.selected_model)
+            )
+            self._log_model_route(
+                original_text=user_text,
+                forced_fast=fast_model is True,
+                route=route,
+                selected_model_name=selected_model_name,
+            )
         yielded_any = False
 
         try:
             async for chunk in self._stream_llm_with_ttft_timeout(
                 primary_llm,
+                primary_provider,
                 chat_ctx,
                 tools,
                 model_settings,
@@ -709,23 +1466,29 @@ class Assistant(Agent):
             return
         except asyncio.TimeoutError:
             logger.warning(
-                "primary Gemini first token timeout after %.1fs; retrying once",
+                "primary LLM first token timeout after %.1fs; retrying once",
                 LLM_FIRST_TOKEN_TIMEOUT_SEC,
             )
         except APIStatusError as e:
             if yielded_any or e.status_code < 500:
                 raise
-            logger.warning("primary Gemini returned %s before first token; retrying once", e.status_code)
+            logger.warning(
+                "primary LLM returned %s before first token; retrying once",
+                e.status_code,
+            )
         except Exception as e:
             if yielded_any:
                 raise
-            logger.warning("primary Gemini failed before first token; retrying once: %s", e)
+            logger.warning(
+                "primary LLM failed before first token; retrying once: %s", e
+            )
 
         await asyncio.sleep(max(0.0, LLM_RETRY_DELAY_SEC))
 
         try:
             async for chunk in self._stream_llm_with_ttft_timeout(
                 primary_llm,
+                primary_provider,
                 chat_ctx,
                 tools,
                 model_settings,
@@ -737,29 +1500,34 @@ class Assistant(Agent):
             if self._fallback_llm is None:
                 raise
             logger.warning(
-                "retry first token timeout after %.1fs; switching to fallback Gemini model",
+                "retry first token timeout after %.1fs; switching to fallback model",
                 LLM_FIRST_TOKEN_TIMEOUT_SEC,
             )
         except APIStatusError as e:
             if e.status_code < 500 or self._fallback_llm is None:
                 raise
-            logger.warning("retry failed with %s; switching to fallback Gemini model", e.status_code)
+            logger.warning(
+                "retry failed with %s; switching to fallback model", e.status_code
+            )
         except Exception:
             if self._fallback_llm is None:
                 raise
-            logger.warning("retry failed; switching to fallback Gemini model")
+            logger.warning("retry failed; switching to fallback model")
 
         async for chunk in self._stream_llm_with_ttft_timeout(
             self._fallback_llm,
+            "google",
             chat_ctx,
             tools,
             model_settings,
-            first_token_timeout=LLM_FIRST_TOKEN_TIMEOUT_SEC,
+            first_token_timeout=LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
         ):
             yield chunk
 
     @function_tool
-    async def end_call(self, context: RunContext, reason: str = "conversation_completed") -> str:
+    async def end_call(
+        self, context: RunContext, reason: str = "conversation_completed"
+    ) -> str:
         """Use only when the conversation is logically finished and no more questions are expected.
 
         Rules:
@@ -803,18 +1571,57 @@ async def my_agent(ctx: JobContext):
     export_wait_sec = 20.0
     export_task: asyncio.Task | None = None
     session_close_task: asyncio.Task | None = None
+    runtime_warmup_task: asyncio.Task | None = None
+    prompt_resolution = PromptResolution(
+        prompt="",
+        source="file:not_resolved",
+    )
+    sip_call_numbers = {
+        "sip_trunk_number": None,
+        "sip_client_number": None,
+    }
+
+    model_router: ModelRouter | None = None
+    routed_llms: dict[str, Any] = {}
+    routed_llm_providers: dict[str, str] = {}
+    if LLM_ROUTING_ENABLED:
+        model_router = ModelRouter.from_default_config()
+        routed_llms, routed_llm_providers = build_routed_llm_clients()
+        logger.info(
+            "model router configured",
+            extra={
+                "fast_provider": routed_llm_providers.get("fast"),
+                "complex_provider": routed_llm_providers.get("complex"),
+                "fast_model": str(
+                    getattr(
+                        routed_llms.get("fast"), "model", model_router.fast_model_name
+                    )
+                ),
+                "complex_model": str(
+                    getattr(
+                        routed_llms.get("complex"),
+                        "model",
+                        model_router.complex_model_name,
+                    )
+                ),
+                "force_fast_flag_field": model_router.force_fast_flag_field,
+            },
+        )
+    elif FAST_LLM_PROVIDER or COMPLEX_LLM_PROVIDER:
+        logger.warning(
+            "model routing is disabled because FAST_LLM_PROVIDER and COMPLEX_LLM_PROVIDER must both be set"
+        )
+    else:
+        logger.info("model routing is disabled; using single LLM_PROVIDER flow")
 
     fallback_llm = None
-    if GEMINI_FALLBACK_MODEL:
-        # Keep all settings identical; only model name differs for transient fallback.
-        fallback_llm = google.LLM(
-            model=GEMINI_FALLBACK_MODEL,
-            api_key=GOOGLE_API_KEY,
-            temperature=GEMINI_TEMPERATURE,
-            max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-            top_p=GEMINI_TOP_P,
-            thinking_config={"thinking_level": GEMINI_THINKING_LEVEL},
-        )
+    fallback_provider = (
+        routed_llm_providers.get("complex")
+        if routed_llm_providers.get("complex")
+        else LLM_PROVIDER
+    )
+    if fallback_provider == "google" and GEMINI_FALLBACK_MODEL:
+        fallback_llm = build_google_llm(model_name=GEMINI_FALLBACK_MODEL)
 
     min_endpointing_delay = max(0.0, TURN_MIN_ENDPOINTING_DELAY)
     max_endpointing_delay = max(min_endpointing_delay, TURN_MAX_ENDPOINTING_DELAY)
@@ -835,9 +1642,11 @@ async def my_agent(ctx: JobContext):
     else:
         turn_detection_mode = "vad"
 
+    audio_output_sample_rate = resolve_audio_output_sample_rate()
+
     session = AgentSession(
         stt=build_stt(),
-        llm=build_google_llm(),
+        llm=routed_llms.get("complex") or build_llm(),
         tts=build_tts(),
         turn_handling={
             "turn_detection": turn_detection_mode,
@@ -854,6 +1663,7 @@ async def my_agent(ctx: JobContext):
         "session latency guards configured",
         extra={
             "llm_first_token_timeout_sec": LLM_FIRST_TOKEN_TIMEOUT_SEC,
+            "llm_fallback_first_token_timeout_sec": LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
             "preemptive_generation": PREEMPTIVE_GENERATION,
             "turn_detection_mode": TURN_DETECTION_MODE,
             "turn_endpointing_mode": endpointing_mode,
@@ -916,14 +1726,16 @@ async def my_agent(ctx: JobContext):
             if not isinstance(item, ChatMessage):
                 return
 
-            transcript_items.append({
-                "type": "conversation_item",
-                "role": getattr(item, "role", None),
-                "text": getattr(item, "text_content", None),
-                "interrupted": getattr(item, "interrupted", None),
-                "created_at": getattr(item, "created_at", None),
-                "metrics": safe_dump(getattr(item, "metrics", None)),
-            })
+            transcript_items.append(
+                {
+                    "type": "conversation_item",
+                    "role": getattr(item, "role", None),
+                    "text": getattr(item, "text_content", None),
+                    "interrupted": getattr(item, "interrupted", None),
+                    "created_at": getattr(item, "created_at", None),
+                    "metrics": safe_dump(getattr(item, "metrics", None)),
+                }
+            )
             role_str = str(getattr(item, "role", "")).lower()
             if role_str == "assistant" or role_str.endswith(".assistant"):
                 assistant_message_count += 1
@@ -937,13 +1749,15 @@ async def my_agent(ctx: JobContext):
     def on_user_input_transcribed(ev):
         nonlocal user_activity_count, end_call_task, reply_watchdog_task
         try:
-            transcript_items.append({
-                "type": "user_input_transcribed",
-                "transcript": getattr(ev, "transcript", None),
-                "is_final": getattr(ev, "is_final", None),
-                "language": getattr(ev, "language", None),
-                "speaker_id": getattr(ev, "speaker_id", None),
-            })
+            transcript_items.append(
+                {
+                    "type": "user_input_transcribed",
+                    "transcript": getattr(ev, "transcript", None),
+                    "is_final": getattr(ev, "is_final", None),
+                    "language": getattr(ev, "language", None),
+                    "speaker_id": getattr(ev, "speaker_id", None),
+                }
+            )
             transcript = (getattr(ev, "transcript", None) or "").strip()
             if transcript:
                 # Any new user speech cancels a pending auto-hangup timer.
@@ -952,10 +1766,7 @@ async def my_agent(ctx: JobContext):
                 if end_call_task and not end_call_task.done():
                     end_call_task.cancel()
                     end_call_task = None
-                if (
-                    bool(getattr(ev, "is_final", False))
-                    and REPLY_WATCHDOG_SEC > 0
-                ):
+                if bool(getattr(ev, "is_final", False)) and REPLY_WATCHDOG_SEC > 0:
                     if reply_watchdog_task and not reply_watchdog_task.done():
                         reply_watchdog_task.cancel()
                     reply_watchdog_task = asyncio.create_task(
@@ -999,7 +1810,35 @@ async def my_agent(ctx: JobContext):
     @session.on("metrics_collected")
     def on_metrics_collected(ev):
         try:
-            metrics_events.append(safe_dump(getattr(ev, "metrics", None)))
+            metrics = getattr(ev, "metrics", None)
+            metrics_events.append(safe_dump(metrics))
+            if getattr(metrics, "type", None) == "llm_metrics":
+                metadata = getattr(metrics, "metadata", None)
+                logger.info(
+                    "llm metrics",
+                    extra={
+                        "request_id": getattr(metrics, "request_id", None),
+                        "ttft_ms": round(
+                            float(getattr(metrics, "ttft", 0.0)) * 1000, 1
+                        ),
+                        "duration_ms": round(
+                            float(getattr(metrics, "duration", 0.0)) * 1000, 1
+                        ),
+                        "prompt_tokens": getattr(metrics, "prompt_tokens", None),
+                        "prompt_cached_tokens": getattr(
+                            metrics, "prompt_cached_tokens", None
+                        ),
+                        "completion_tokens": getattr(
+                            metrics, "completion_tokens", None
+                        ),
+                        "provider": getattr(metadata, "model_provider", None)
+                        if metadata
+                        else None,
+                        "model": getattr(metadata, "model_name", None)
+                        if metadata
+                        else None,
+                    },
+                )
         except Exception as e:
             logger.exception("metrics_collected handler failed: %s", e)
 
@@ -1013,6 +1852,11 @@ async def my_agent(ctx: JobContext):
             "ended_at": ended_at.isoformat(),
             "duration_sec": (ended_at - session_started_at).total_seconds(),
             "close": close_info,
+            "sip": {
+                **sip_call_numbers,
+                "prompt_source": prompt_resolution.source,
+                "prompt_lookup_error": prompt_resolution.error,
+            },
             "transcript_items": transcript_items,
             "usage_updates": usage_updates,
             "metrics_events": metrics_events,
@@ -1032,7 +1876,9 @@ async def my_agent(ctx: JobContext):
         if session_close_task is None:
             session_close_task = asyncio.create_task(session.aclose())
         try:
-            await asyncio.wait_for(asyncio.shield(session_close_task), timeout=timeout_sec)
+            await asyncio.wait_for(
+                asyncio.shield(session_close_task), timeout=timeout_sec
+            )
         except asyncio.CancelledError:
             # During shutdown LiveKit may cancel pending tasks aggressively.
             # This is expected and should not be treated as an error.
@@ -1048,7 +1894,9 @@ async def my_agent(ctx: JobContext):
             close_info["reason"] = close_reason
             logger.info("ending call by deleting room", extra={"room": ctx.room.name})
             # Bound delete_room call to avoid waiting indefinitely on API edge cases.
-            await asyncio.wait_for(asyncio.shield(ctx.delete_room(ctx.room.name)), timeout=3.0)
+            await asyncio.wait_for(
+                asyncio.shield(ctx.delete_room(ctx.room.name)), timeout=3.0
+            )
         except asyncio.TimeoutError:
             logger.warning("delete_room timed out; forcing local shutdown")
         except Exception as e:
@@ -1097,7 +1945,9 @@ async def my_agent(ctx: JobContext):
 
                 user_activity_event.clear()
                 # Fallback grace period: if user resumes talking, keep the call open.
-                await asyncio.wait_for(user_activity_event.wait(), timeout=remaining_grace)
+                await asyncio.wait_for(
+                    user_activity_event.wait(), timeout=remaining_grace
+                )
                 logger.info("end_call canceled: user resumed speech")
                 return
             except asyncio.TimeoutError:
@@ -1123,33 +1973,6 @@ async def my_agent(ctx: JobContext):
             reply_watchdog_task = None
         close_event.set()
 
-    await session.start(
-        agent=Assistant(request_end_call=request_end_call, fallback_llm=fallback_llm),
-        room=ctx.room,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=lambda params: (
-                    noise_cancellation.BVCTelephony()
-                    if params.participant.kind
-                    == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                    else ai_coustics.audio_enhancement(
-                        model=ai_coustics.EnhancerModel.QUAIL_VF_L
-                    )
-                ),
-            ),
-            audio_output=room_io.AudioOutputOptions(
-                sample_rate=(
-                    MINIMAX_TTS_SAMPLE_RATE
-                    if TTS_PROVIDER == "minimax"
-                    else COSYVOICE_TTS_SAMPLE_RATE
-                    if TTS_PROVIDER == "cosyvoice"
-                    else 24000
-                ),
-                num_channels=1,
-            ),
-        ),
-    )
-
     async def export_best_effort(timeout_sec: float) -> None:
         nonlocal export_task
         if export_task is None:
@@ -1167,19 +1990,104 @@ async def my_agent(ctx: JobContext):
 
     try:
         await ctx.connect()
-        await session.generate_reply(
-            instructions=(
-                "Сразу после подключения поприветствуй клиента одной фразой: "
-                "Здравствуйте! Это компания Кофемастер! Чем могу помочь?"
+        participant = None
+        try:
+            participant = await asyncio.wait_for(
+                ctx.wait_for_participant(), timeout=3.0
             )
+        except asyncio.TimeoutError:
+            logger.info(
+                "no participant available before prompt lookup; using file prompt"
+            )
+
+        sip_call_numbers = extract_sip_call_numbers(participant)
+        prompt_resolution = await resolve_prompt_for_call(**sip_call_numbers)
+        logger.info(
+            "prompt resolved",
+            extra={
+                "source": prompt_resolution.source,
+                "sip_trunk_number": prompt_resolution.sip_trunk_number,
+                "sip_client_number": prompt_resolution.sip_client_number,
+            },
         )
+
+        assistant = Assistant(
+            request_end_call=request_end_call,
+            model_router=model_router,
+            routed_llms=routed_llms,
+            routed_llm_providers=routed_llm_providers,
+            fallback_llm=fallback_llm,
+            first_turn_short_greeting_audio_path=_SHORT_GREETING_AUDIO_PATH,
+            prerecorded_audio_sample_rate=audio_output_sample_rate,
+            prompt=prompt_resolution.prompt,
+        )
+
+        await session.start(
+            agent=assistant,
+            room=ctx.room,
+            room_options=room_io.RoomOptions(
+                audio_input=room_io.AudioInputOptions(
+                    noise_cancellation=lambda params: (
+                        noise_cancellation.BVCTelephony()
+                        if params.participant.kind
+                        == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                        else ai_coustics.audio_enhancement(
+                            model=ai_coustics.EnhancerModel.QUAIL_VF_L
+                        )
+                    ),
+                ),
+                audio_output=room_io.AudioOutputOptions(
+                    sample_rate=audio_output_sample_rate,
+                    num_channels=1,
+                ),
+            ),
+        )
+
+        runtime_warmup_task = asyncio.create_task(
+            warmup_runtime_backends(
+                llm_candidates=[
+                    ("session", session.llm),
+                    ("route_fast", routed_llms.get("fast")),
+                    ("route_complex", routed_llms.get("complex")),
+                    ("fallback", fallback_llm),
+                ],
+                tts_client=session.tts,
+                prompt_cache_warmup_llm=session.llm,
+                prompt_cache_warmup_instructions=str(assistant.instructions),
+                prompt_cache_warmup_conn_options=session.conn_options.llm_conn_options,
+            ),
+            name="runtime_warmup_backends",
+        )
+        played_initial_greeting = await play_prerecorded_audio(
+            session=session,
+            audio_path=_INITIAL_GREETING_AUDIO_PATH,
+            sample_rate=audio_output_sample_rate,
+            allow_interruptions=False,
+            add_to_chat_ctx=False,
+        )
+        # Do not block call flow if warmup is still in progress.
+        if runtime_warmup_task and not runtime_warmup_task.done():
+            with suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.shield(runtime_warmup_task),
+                    timeout=0.25,
+                )
+        if not played_initial_greeting:
+            await session.generate_reply(
+                instructions=(
+                    "Сразу после подключения поприветствуй клиента одной фразой: "
+                    "Здравствуйте! Это компания Кофемастер! Чем могу помочь?"
+                )
+            )
         await close_event.wait()
         await export_best_effort(timeout_sec=export_wait_sec)
     except asyncio.CancelledError:
         # Python 3.13: CancelledError is a BaseException, and LiveKit will cancel the entrypoint
         # during shutdown. Best-effort export should still complete quickly.
         asyncio.current_task().uncancel()
-        logger.warning("entrypoint cancelled; exporting session data to n8n before exit")
+        logger.warning(
+            "entrypoint cancelled; exporting session data to n8n before exit"
+        )
         with suppress(BaseException):
             await asyncio.wait_for(close_event.wait(), timeout=0.8)
         if close_info["reason"] is None:
@@ -1191,12 +2099,20 @@ async def my_agent(ctx: JobContext):
             end_call_task.cancel()
         if reply_watchdog_task and not reply_watchdog_task.done():
             reply_watchdog_task.cancel()
+        if runtime_warmup_task and not runtime_warmup_task.done():
+            runtime_warmup_task.cancel()
+            with suppress(BaseException):
+                await runtime_warmup_task
         await ensure_session_closed(timeout_sec=2.0)
         if export_task and not export_task.done():
             try:
-                await asyncio.wait_for(asyncio.shield(export_task), timeout=export_wait_sec)
+                await asyncio.wait_for(
+                    asyncio.shield(export_task), timeout=export_wait_sec
+                )
             except asyncio.TimeoutError:
-                logger.warning("n8n export timed out after %ss in finalizer", export_wait_sec)
+                logger.warning(
+                    "n8n export timed out after %ss in finalizer", export_wait_sec
+                )
             except BaseException as e:
                 logger.exception("n8n export finalizer failed: %s", e)
 

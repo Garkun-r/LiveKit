@@ -12,6 +12,27 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
 
 
+def _env_optional_bool(name: str) -> bool | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    return raw.strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+
+
+def _env_optional_float(name: str) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    return float(raw)
+
+
+def _env_optional_int(name: str) -> int | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    return int(raw)
+
+
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
@@ -20,6 +41,31 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+
+
+# LLM provider switch:
+# - google (default, direct Gemini API)
+# - xai (xAI Grok via livekit.plugins.xai.responses.LLM)
+def _normalize_llm_provider(raw_provider: str) -> str:
+    return {
+        "google": "google",
+        "gemini": "google",
+        "xai": "xai",
+        "grok": "xai",
+    }.get(raw_provider.strip().lower(), raw_provider.strip().lower())
+
+
+_raw_llm_provider = os.getenv("LLM_PROVIDER", "google")
+LLM_PROVIDER = _normalize_llm_provider(_raw_llm_provider)
+
+# Optional rule-based routing providers.
+# If both are set, routing is enabled:
+# - FAST_LLM_PROVIDER: provider used for "fast" route
+# - COMPLEX_LLM_PROVIDER: provider used for "complex" route
+# If either is empty, routing stays disabled and LLM_PROVIDER is used as before.
+FAST_LLM_PROVIDER = _normalize_llm_provider(os.getenv("FAST_LLM_PROVIDER", ""))
+COMPLEX_LLM_PROVIDER = _normalize_llm_provider(os.getenv("COMPLEX_LLM_PROVIDER", ""))
+LLM_ROUTING_ENABLED = bool(FAST_LLM_PROVIDER and COMPLEX_LLM_PROVIDER)
 
 # TTS provider switch:
 # - elevenlabs (default)
@@ -45,6 +91,48 @@ TTS_PROVIDER = {
 }.get(_raw_tts_provider, _raw_tts_provider)
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "wF58OrxELqJ5nFJxXiva")
 ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")
+# Legacy switch name retained for backward compatibility.
+# true  -> use custom eleven_v3 HTTP streaming adapter
+# false -> use official livekit.plugins.elevenlabs.TTS path
+ELEVENLABS_V3_USE_STREAM_INPUT = _env_bool(
+    "ELEVENLABS_V3_USE_STREAM_INPUT", default=True
+)
+ELEVENLABS_V3_OUTPUT_FORMAT = os.getenv("ELEVENLABS_V3_OUTPUT_FORMAT", "mp3_22050_32")
+ELEVENLABS_V3_ENABLE_LOGGING = _env_bool("ELEVENLABS_V3_ENABLE_LOGGING", default=True)
+ELEVENLABS_V3_APPLY_TEXT_NORMALIZATION = os.getenv(
+    "ELEVENLABS_V3_APPLY_TEXT_NORMALIZATION",
+    "auto",
+).strip()
+ELEVENLABS_V3_LANGUAGE = os.getenv("ELEVENLABS_V3_LANGUAGE", "").strip()
+ELEVENLABS_V3_OPTIMIZE_STREAMING_LATENCY = _env_optional_int(
+    "ELEVENLABS_V3_OPTIMIZE_STREAMING_LATENCY"
+)
+ELEVENLABS_V3_REQUEST_TIMEOUT_SEC = float(
+    os.getenv("ELEVENLABS_V3_REQUEST_TIMEOUT_SEC", "30.0")
+)
+ELEVENLABS_V3_MIN_SENTENCE_LEN = int(os.getenv("ELEVENLABS_V3_MIN_SENTENCE_LEN", "6"))
+ELEVENLABS_V3_STREAM_CONTEXT_LEN = int(
+    os.getenv("ELEVENLABS_V3_STREAM_CONTEXT_LEN", "2")
+)
+ELEVENLABS_V3_MIN_HTTP_TEXT_LEN = int(
+    os.getenv("ELEVENLABS_V3_MIN_HTTP_TEXT_LEN", "18")
+)
+ELEVENLABS_V3_MERGE_HOLD_MS = int(os.getenv("ELEVENLABS_V3_MERGE_HOLD_MS", "140"))
+ELEVENLABS_V3_MAX_MERGED_TEXT_LEN = int(
+    os.getenv("ELEVENLABS_V3_MAX_MERGED_TEXT_LEN", "80")
+)
+
+# Optional ElevenLabs voice settings.
+# Note: stability + similarity_boost must be set together for VoiceSettings.
+ELEVENLABS_VOICE_STABILITY = _env_optional_float("ELEVENLABS_VOICE_STABILITY")
+ELEVENLABS_VOICE_SIMILARITY_BOOST = _env_optional_float(
+    "ELEVENLABS_VOICE_SIMILARITY_BOOST"
+)
+ELEVENLABS_VOICE_STYLE = _env_optional_float("ELEVENLABS_VOICE_STYLE")
+ELEVENLABS_VOICE_SPEED = _env_optional_float("ELEVENLABS_VOICE_SPEED")
+ELEVENLABS_VOICE_USE_SPEAKER_BOOST = _env_optional_bool(
+    "ELEVENLABS_VOICE_USE_SPEAKER_BOOST"
+)
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash")
@@ -53,8 +141,21 @@ GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.7"))
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "512"))
 GEMINI_TOP_P = float(os.getenv("GEMINI_TOP_P", "1"))
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "minimal")
+
+# xAI Grok (Responses API)
+XAI_MODEL = os.getenv("XAI_MODEL", "grok-4-1-fast-non-reasoning-latest")
+XAI_TEMPERATURE = float(os.getenv("XAI_TEMPERATURE", "0.3"))
+XAI_BASE_URL = os.getenv("XAI_BASE_URL", "").strip()
+# xAI Responses API is more stable/fast for plain chat without function tools in this project.
+# Keep tools off by default even if the agent defines them.
+XAI_ENABLE_TOOLS = _env_bool("XAI_ENABLE_TOOLS", default=False)
+
 # Guard against silent stalls: wait this long for first LLM token before retry/fallback.
 LLM_FIRST_TOKEN_TIMEOUT_SEC = float(os.getenv("LLM_FIRST_TOKEN_TIMEOUT_SEC", "8.0"))
+# Fallback models can be colder/slower on first token; allow a longer initial timeout.
+LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC = float(
+    os.getenv("LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC", "16.0")
+)
 LLM_RETRY_DELAY_SEC = float(os.getenv("LLM_RETRY_DELAY_SEC", "0.35"))
 
 # Turn endpointing tuning (seconds). Lower values = faster replies.
@@ -127,6 +228,13 @@ MINIMAX_TTS_LANGUAGE_BOOST = os.getenv("MINIMAX_TTS_LANGUAGE_BOOST", "Russian")
 MINIMAX_TTS_SPEED = float(os.getenv("MINIMAX_TTS_SPEED", "1.0"))
 MINIMAX_TTS_VOLUME = float(os.getenv("MINIMAX_TTS_VOLUME", "1.0"))
 MINIMAX_TTS_PITCH = int(os.getenv("MINIMAX_TTS_PITCH", "0"))
+_raw_minimax_tts_intensity = os.getenv("MINIMAX_TTS_INTENSITY", "").strip()
+MINIMAX_TTS_INTENSITY = (
+    int(_raw_minimax_tts_intensity) if _raw_minimax_tts_intensity else None
+)
+_raw_minimax_tts_timbre = os.getenv("MINIMAX_TTS_TIMBRE", "").strip()
+MINIMAX_TTS_TIMBRE = int(_raw_minimax_tts_timbre) if _raw_minimax_tts_timbre else None
+MINIMAX_TTS_SOUND_EFFECTS = os.getenv("MINIMAX_TTS_SOUND_EFFECTS", "").strip()
 MINIMAX_TTS_FORMAT = os.getenv("MINIMAX_TTS_FORMAT", "mp3")
 MINIMAX_TTS_SAMPLE_RATE = int(os.getenv("MINIMAX_TTS_SAMPLE_RATE", "24000"))
 MINIMAX_TTS_BITRATE = int(os.getenv("MINIMAX_TTS_BITRATE", "128000"))
@@ -135,10 +243,14 @@ MINIMAX_TTS_MIN_SENTENCE_LEN = int(os.getenv("MINIMAX_TTS_MIN_SENTENCE_LEN", "4"
 MINIMAX_TTS_STREAM_CONTEXT_LEN = int(os.getenv("MINIMAX_TTS_STREAM_CONTEXT_LEN", "1"))
 
 # CosyVoice (Alibaba DashScope / Model Studio) runtime settings.
-_raw_cosyvoice_profile = os.getenv(
-    "COSYVOICE_PROFILE",
-    "cosyvoice_cn_flash_fast",
-).strip().lower()
+_raw_cosyvoice_profile = (
+    os.getenv(
+        "COSYVOICE_PROFILE",
+        "cosyvoice_cn_flash_fast",
+    )
+    .strip()
+    .lower()
+)
 COSYVOICE_PROFILE = {
     "flash": "cosyvoice_cn_flash_fast",
     "plus": "cosyvoice_cn_plus_quality",
@@ -187,16 +299,24 @@ COSYVOICE_API_KEY = os.getenv(
     os.getenv("COSYVOICE_API_KEY", ""),
 )
 COSYVOICE_TTS_MODEL = os.getenv("COSYVOICE_TTS_MODEL", _cosyvoice_defaults["model"])
-COSYVOICE_TTS_TRANSPORT = os.getenv(
-    "COSYVOICE_TTS_TRANSPORT",
-    _cosyvoice_defaults["transport"],
-).strip().lower()
+COSYVOICE_TTS_TRANSPORT = (
+    os.getenv(
+        "COSYVOICE_TTS_TRANSPORT",
+        _cosyvoice_defaults["transport"],
+    )
+    .strip()
+    .lower()
+)
 COSYVOICE_TTS_REGION = os.getenv("COSYVOICE_TTS_REGION", _cosyvoice_defaults["region"])
 COSYVOICE_TTS_WS_URL = os.getenv("COSYVOICE_TTS_WS_URL", "")
-COSYVOICE_TTS_VOICE_MODE = os.getenv(
-    "COSYVOICE_TTS_VOICE_MODE",
-    _cosyvoice_defaults["voice_mode"],
-).strip().lower()
+COSYVOICE_TTS_VOICE_MODE = (
+    os.getenv(
+        "COSYVOICE_TTS_VOICE_MODE",
+        _cosyvoice_defaults["voice_mode"],
+    )
+    .strip()
+    .lower()
+)
 COSYVOICE_TTS_VOICE_ID = os.getenv("COSYVOICE_TTS_VOICE_ID", "")
 COSYVOICE_TTS_CLONE_VOICE_ID = os.getenv("COSYVOICE_TTS_CLONE_VOICE_ID", "")
 COSYVOICE_TTS_DESIGN_VOICE_ID = os.getenv("COSYVOICE_TTS_DESIGN_VOICE_ID", "")
@@ -251,6 +371,9 @@ STT_INFERENCE_INCLUDE_GOOGLE_FALLBACK = _env_bool(
 # Deepgram STT settings.
 STT_DEEPGRAM_MODEL = os.getenv("STT_DEEPGRAM_MODEL", "nova-3")
 STT_DEEPGRAM_LANGUAGE = os.getenv("STT_DEEPGRAM_LANGUAGE", "ru")
+# How long Deepgram waits after silence before finalizing an utterance (ms).
+# 25ms is Deepgram's minimum and gives the fastest end-of-turn signal.
+STT_DEEPGRAM_ENDPOINTING_MS = int(os.getenv("STT_DEEPGRAM_ENDPOINTING_MS", "25"))
 
 # Google STT settings.
 STT_GOOGLE_MODEL = os.getenv("STT_GOOGLE_MODEL", "latest_long")
@@ -258,6 +381,8 @@ STT_GOOGLE_LANGUAGE = os.getenv("STT_GOOGLE_LANGUAGE", "ru-RU")
 STT_GOOGLE_LOCATION = os.getenv("STT_GOOGLE_LOCATION", "global")
 
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "")
+PROMPT_LOOKUP_SQL = os.getenv("PROMPT_LOOKUP_SQL", "").strip()
+PROMPT_LOOKUP_TIMEOUT_SEC = float(os.getenv("PROMPT_LOOKUP_TIMEOUT_SEC", "2.0"))
 AGENT_NAME = os.getenv("AGENT_NAME", "main-bot")
 
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")

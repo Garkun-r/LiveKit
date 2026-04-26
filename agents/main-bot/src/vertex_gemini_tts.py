@@ -88,7 +88,10 @@ class VertexGeminiTTS(tts.TTS):
         resolved_project = (
             project
             if is_given(project)
-            else (os.environ.get("GOOGLE_CLOUD_PROJECT") or _project_from_credentials_file())
+            else (
+                os.environ.get("GOOGLE_CLOUD_PROJECT")
+                or _project_from_credentials_file()
+            )
         )
         if not resolved_project:
             raise ValueError(

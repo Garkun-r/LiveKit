@@ -104,12 +104,66 @@ Next, run this command to speak to your agent directly in your terminal:
 uv run python src/agent.py console
 ```
 
+To switch LLM provider, set `LLM_PROVIDER`:
+
+1. `LLM_PROVIDER=google` - direct Gemini API path (default).
+2. `LLM_PROVIDER=xai` - xAI Grok via `livekit.plugins.xai.responses.LLM`.
+
+xAI Grok example:
+
+```console
+LLM_PROVIDER=xai
+XAI_API_KEY=<your_xai_api_key>
+XAI_MODEL=grok-4-1-fast-non-reasoning-latest
+XAI_TEMPERATURE=0.3
+# Optional: force Europe region endpoint
+XAI_BASE_URL=https://eu-west-1.api.x.ai/v1
+# Tools are disabled by default for xAI in this project.
+XAI_ENABLE_TOOLS=false
+```
+
 To switch TTS provider, set `TTS_PROVIDER`:
 
 1. `TTS_PROVIDER=elevenlabs` - ElevenLabs TTS.
 2. `TTS_PROVIDER=google` - `livekit.plugins.google.TTS` (Google Cloud streaming path).
 3. `TTS_PROVIDER=vertex` - Vertex Gemini API streaming path (`google.genai`, `vertexai=True`).
 4. `TTS_PROVIDER=minimax` - official `livekit.plugins.minimax.TTS` path (`speech-2.8-turbo`).
+5. `TTS_PROVIDER=cosyvoice` - custom Alibaba CosyVoice WebSocket path.
+
+ElevenLabs `eleven_v3` custom HTTP streaming path:
+
+```console
+TTS_PROVIDER=elevenlabs
+ELEVENLABS_MODEL=eleven_v3
+ELEVENLABS_V3_USE_STREAM_INPUT=true
+ELEVENLABS_V3_OUTPUT_FORMAT=mp3_22050_32
+ELEVENLABS_V3_ENABLE_LOGGING=true
+ELEVENLABS_V3_REQUEST_TIMEOUT_SEC=30.0
+```
+
+Optional tuning for `eleven_v3`:
+
+```console
+# leave empty for eleven_v3: this parameter is not supported by eleven_v3
+ELEVENLABS_V3_OPTIMIZE_STREAMING_LATENCY=
+
+# sentence buffering for per-request HTTP chunks
+ELEVENLABS_V3_MIN_SENTENCE_LEN=6
+ELEVENLABS_V3_STREAM_CONTEXT_LEN=2
+
+# optional voice settings
+ELEVENLABS_VOICE_STABILITY=0.45
+ELEVENLABS_VOICE_SIMILARITY_BOOST=0.75
+ELEVENLABS_VOICE_STYLE=0.0
+ELEVENLABS_VOICE_SPEED=1.0
+ELEVENLABS_VOICE_USE_SPEAKER_BOOST=true
+```
+
+Notes for `eleven_v3`:
+
+1. This path uses HTTP `POST /v1/text-to-speech/{voice_id}/stream` only (no WebSocket path).
+2. It is built for low practical latency, but `eleven_v3` is still not a Flash-class realtime model.
+3. Deploy near ElevenLabs edge region and your LiveKit workers to reduce RTT.
 
 To switch STT provider, set `STT_PROVIDER`:
 

@@ -1,0 +1,27 @@
+force_fast_flag_field: "fast_model"
+
+models:
+  # Optional informational labels for route results/log fallback.
+  # Runtime LLM model selection is provider-driven via env vars.
+  fast: "FAST_MODEL_NAME"
+  complex: "COMPLEX_MODEL_NAME"
+
+full_equals:
+  - "да"
+  - "алло"
+  - "здравствуйте"
+  - "здрасте"
+  - "кто вы"
+  - "да да"
+  - "соединить"
+  - "да спасибо"
+
+whole_word:
+  - "оператор"
+
+partial:
+  - "операт"
+  - "да соед"
+  - "спасиб"
+  - "менедж"
+  - "специалистом"

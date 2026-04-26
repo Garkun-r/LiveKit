@@ -92,6 +92,7 @@ After changes:
 
 This repository is a LiveKit agent project. Treat it as a realtime system.
 
+- Before LiveKit Cloud operations, read `docs/cloud/README.md` and the referenced cloud runbooks.
 - LiveKit is a fast-evolving project. Always refer to the latest documentation.
 - Run `lk docs --help` to see available commands.
 - Key commands: `lk docs overview`, `lk docs search`, `lk docs get-page`, `lk docs code-search`, `lk docs changelog`, `lk docs pricing-info`.

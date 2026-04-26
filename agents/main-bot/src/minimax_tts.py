@@ -119,7 +119,9 @@ class MiniMaxTTS(tts.TTS):
 
         self._opts = _MiniMaxTTSOptions(
             api_key=api_key.strip(),
-            base_url=((base_url or DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL),
+            base_url=(
+                (base_url or DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
+            ),
             model=(model or DEFAULT_MODEL).strip(),
             voice_id=(voice_id or DEFAULT_VOICE_ID).strip(),
             language_boost=(language_boost or DEFAULT_LANGUAGE_BOOST).strip(),
@@ -178,7 +180,9 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         segments_ch = utils.aio.Chan[tokenize.SentenceStream]()
-        stream_format = self._opts.audio_format if self._opts.audio_format == "mp3" else "mp3"
+        stream_format = (
+            self._opts.audio_format if self._opts.audio_format == "mp3" else "mp3"
+        )
 
         output_emitter.initialize(
             request_id=utils.shortuuid(),
@@ -304,7 +308,8 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                         raise APIStatusError(
                             message=f"minimax tts http error {response.status_code}",
                             status_code=response.status_code,
-                            retryable=response.status_code in {408, 429, 500, 502, 503, 504},
+                            retryable=response.status_code
+                            in {408, 429, 500, 502, 503, 504},
                             body=body.decode("utf-8", errors="ignore")[:500],
                         )
 
@@ -325,7 +330,10 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
                         base_status = int(base_resp.get("status_code", 0) or 0)
                         if base_status != 0:
                             raise APIStatusError(
-                                message=str(base_resp.get("status_msg") or "minimax tts api error"),
+                                message=str(
+                                    base_resp.get("status_msg")
+                                    or "minimax tts api error"
+                                ),
                                 status_code=400,
                                 retryable=False,
                                 body=str(event_obj)[:500],
@@ -360,4 +368,6 @@ class _MiniMaxSynthesizeStream(tts.SynthesizeStream):
         except httpx.TimeoutException:
             raise APITimeoutError() from None
         except httpx.HTTPError as e:
-            raise APIConnectionError(f"minimax tts connection error: {e}", retryable=True) from e
+            raise APIConnectionError(
+                f"minimax tts connection error: {e}", retryable=True
+            ) from e

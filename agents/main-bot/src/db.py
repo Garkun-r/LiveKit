@@ -1,7 +1,9 @@
 import asyncpg
-from .config import POSTGRES_DSN
+
+from config import POSTGRES_DSN
 
 _pool = None
+
 
 async def get_pool():
     global _pool
