@@ -117,21 +117,27 @@ the implementation cleaner.
 
 ## Filler/emergency phrases
 
-Allowed phrases:
+Voice prompt catalog:
 
-- "Секундочку, проверяю."
-- "Уточняю информацию."
-- "Извините, перезвоните ещё раз, вас плохо слышно."
+- `response_delay`: "Секундочку." Plays if the caller finished speaking and the
+  assistant stays silent past `VOICE_RESPONSE_DELAY_SEC`.
+- `client_silence`: "Алло." Plays if the assistant is listening and the caller
+  stays silent past `VOICE_CLIENT_SILENCE_SEC`.
+- `emergency`: "Извините, перезвоните ещё раз." Plays for unrecoverable runtime
+  errors.
+- Future prompts: `tool_wait`, `transfer`, and `farewell` are reserved for
+  explicit business triggers, but must not be wired until those flows exist.
 
 Requirements:
 
-- Provide a mechanism for pre-synthesized/prerecorded audio for filler and
-  emergency phrases.
-- The user will add the audio files later.
-- Future code must support paths to these files through config/env.
-- TBD: whether filler phrases should be added to chat context.
-- If filler is used only to cover technical delay, prefer not adding it to LLM
-  context, but this is not final without separate confirmation.
+- Voice prompts must use pre-synthesized/prerecorded audio files from
+  `agents/main-bot/audio`, with paths configurable through env.
+- Technical prompts must not be added to LLM chat context.
+- Only one technical prompt may play at a time. New user speech cancels pending
+  prompt timers and stops active short prompts.
+- Do not blindly start a parallel `generate_reply` to cover silence; use audio
+  prompts for perceived latency and keep `REPLY_WATCHDOG_SEC` as a later recovery
+  path for stuck scheduling.
 
 ## TTS fallback
 
@@ -154,13 +160,25 @@ Requirements:
 
 ## Watchdog / latency guard
 
-- The exact watchdog implementation is not fixed yet.
-- A guard is needed to prevent long silence after the caller speaks.
-- The current watchdog must be studied before changes.
-- Do not blindly start a parallel `generate_reply` if it can create duplicate
-  answers.
-- Preferred future approach: on delay, play filler/pre-synthesized audio without
-  creating a second competing LLM reply.
+- The response-delay prompt timer starts when the caller stops speaking, using
+  `user_state_changed: speaking -> listening`.
+- If the assistant starts speaking before the timer fires, the prompt is skipped.
+- If the timer fires while the assistant is still silent/thinking, play
+  `response_delay` through LiveKit `BackgroundAudioPlayer` on-demand playback.
+- The assistant TTS pipeline must wait for an active technical prompt to finish
+  before releasing the normal answer, so prompt audio and assistant audio do not
+  overlap.
+- The client-silence prompt starts only while the assistant is listening and no
+  `end_call` is scheduled.
+
+## Future tool prompts
+
+- Tool prompts must be explicit business triggers, not a blanket rule for every
+  function call.
+- A future long-running tool should call the shared voice-prompt manager before
+  the slow operation if the business flow requires "Проверяю информацию."
+- If an LLM-generated pre-tool phrase already played, the tool path should use
+  `ctx.wait_for_playout()` and avoid a duplicate prerecorded prompt.
 
 ## Future implementation plan
 
@@ -193,7 +211,6 @@ Requirements:
 - Exact model IDs for Gemini primary and Gemini Lite backup.
 - Whether fast and complex branches need one shared backup or different backup
   models.
-- Whether filler phrases should be added to chat context.
 - Which STT to use as backup for Deepgram Nova 3.
 - Whether to connect MiniMax TTS fallback in the first refactor or as a separate
   stage.

@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import tempfile
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,6 +27,7 @@ from livekit.agents import (
     AgentServer,
     AgentSession,
     APIStatusError,
+    BackgroundAudioPlayer,
     JobContext,
     JobProcess,
     RunContext,
@@ -175,9 +176,14 @@ from config import (
     USE_LIVEKIT_FALLBACK_ADAPTER,
     VERTEX_TTS_MIN_SENTENCE_LEN,
     VERTEX_TTS_STREAM_CONTEXT_LEN,
+    VOICE_CLIENT_SILENCE_AUDIO_PATH,
+    VOICE_CLIENT_SILENCE_PHRASE,
+    VOICE_CLIENT_SILENCE_SEC,
     VOICE_EMERGENCY_AUDIO_PATH,
     VOICE_EMERGENCY_PHRASE,
-    VOICE_FILLER_AUDIO_PATH,
+    VOICE_RESPONSE_DELAY_AUDIO_PATH,
+    VOICE_RESPONSE_DELAY_PHRASE,
+    VOICE_RESPONSE_DELAY_SEC,
     XAI_API_KEY,
     XAI_BASE_URL,
     XAI_ENABLE_TOOLS,
@@ -201,7 +207,8 @@ _minimax_sound_effects_patched = False
 _AUDIO_DIR = Path(__file__).resolve().parent.parent / "audio"
 _INITIAL_GREETING_AUDIO_PATH = _AUDIO_DIR / "1.wav"
 _SHORT_GREETING_AUDIO_PATH = _AUDIO_DIR / "2.wav"
-_FILLER_AUDIO_PATH = None
+_RESPONSE_DELAY_AUDIO_PATH = None
+_CLIENT_SILENCE_AUDIO_PATH = None
 _EMERGENCY_AUDIO_PATH = None
 _WARMUP_REQUEST_TIMEOUT_SEC = 4.0
 _PROMPT_CACHE_WARMUP_USER_TEXT = (
@@ -246,7 +253,12 @@ def resolve_configured_audio_path(raw_path: str) -> Path | None:
     return path
 
 
-_FILLER_AUDIO_PATH = resolve_configured_audio_path(VOICE_FILLER_AUDIO_PATH)
+_RESPONSE_DELAY_AUDIO_PATH = resolve_configured_audio_path(
+    VOICE_RESPONSE_DELAY_AUDIO_PATH
+)
+_CLIENT_SILENCE_AUDIO_PATH = resolve_configured_audio_path(
+    VOICE_CLIENT_SILENCE_AUDIO_PATH
+)
 _EMERGENCY_AUDIO_PATH = resolve_configured_audio_path(VOICE_EMERGENCY_AUDIO_PATH)
 
 
@@ -369,6 +381,280 @@ async def play_prerecorded_audio(
         return True
     except Exception as e:
         logger.exception("failed to play prerecorded audio '%s': %s", audio_path, e)
+        return False
+
+
+@dataclass(frozen=True)
+class VoicePromptSpec:
+    kind: str
+    audio_path: Path | None
+    phrase: str
+
+
+class VoicePromptManager:
+    def __init__(
+        self,
+        *,
+        session: AgentSession,
+        background_audio: BackgroundAudioPlayer,
+        sample_rate: int,
+        response_delay_prompt: VoicePromptSpec,
+        client_silence_prompt: VoicePromptSpec,
+        response_delay_sec: float,
+        client_silence_sec: float,
+        is_closed: Callable[[], bool],
+        is_end_call_scheduled: Callable[[], bool],
+    ) -> None:
+        self._session = session
+        self._background_audio = background_audio
+        self._sample_rate = sample_rate
+        self._response_delay_prompt = response_delay_prompt
+        self._client_silence_prompt = client_silence_prompt
+        self._response_delay_sec = max(0.0, response_delay_sec)
+        self._client_silence_sec = max(0.0, client_silence_sec)
+        self._is_closed = is_closed
+        self._is_end_call_scheduled = is_end_call_scheduled
+
+        self._response_delay_task: asyncio.Task | None = None
+        self._client_silence_task: asyncio.Task | None = None
+        self._stop_active_prompt_task: asyncio.Task | None = None
+        self._active_prompt_kind: str | None = None
+        self._active_prompt_handle: Any | None = None
+        self._active_lock = asyncio.Lock()
+        self._response_delay_played = False
+        self._client_silence_played = False
+
+    def start_response_delay_timer(self) -> None:
+        if self._response_delay_sec <= 0 or self._is_closed():
+            return
+        self.cancel_response_delay_timer()
+        self._response_delay_played = False
+        self._response_delay_task = asyncio.create_task(
+            self._run_response_delay_timer(),
+            name="voice_prompt_response_delay",
+        )
+
+    def start_client_silence_timer(self) -> None:
+        if (
+            self._client_silence_sec <= 0
+            or self._is_closed()
+            or self._is_end_call_scheduled()
+            or self._client_silence_played
+        ):
+            return
+        self.cancel_client_silence_timer()
+        self._client_silence_task = asyncio.create_task(
+            self._run_client_silence_timer(),
+            name="voice_prompt_client_silence",
+        )
+
+    def cancel_response_delay_timer(self) -> None:
+        if self._response_delay_task and not self._response_delay_task.done():
+            self._response_delay_task.cancel()
+        self._response_delay_task = None
+
+    def cancel_client_silence_timer(self) -> None:
+        if self._client_silence_task and not self._client_silence_task.done():
+            self._client_silence_task.cancel()
+        self._client_silence_task = None
+
+    def on_user_started_speaking(self) -> None:
+        self.cancel_response_delay_timer()
+        self.cancel_client_silence_timer()
+        self._response_delay_played = False
+        self._client_silence_played = False
+        self._stop_active_prompt_task = asyncio.create_task(
+            self.stop_active_prompt(),
+            name="voice_prompt_stop_on_user_speech",
+        )
+
+    def on_agent_started_speaking(self) -> None:
+        self.cancel_response_delay_timer()
+        self.cancel_client_silence_timer()
+        if self._active_prompt_kind != "client_silence":
+            self._client_silence_played = False
+
+    async def wait_for_active_prompt(self) -> None:
+        handle = self._active_prompt_handle
+        if handle is None or self._handle_done(handle):
+            return
+        with suppress(Exception):
+            await handle.wait_for_playout()
+
+    async def stop_active_prompt(self) -> None:
+        async with self._active_lock:
+            handle = self._active_prompt_handle
+            self._active_prompt_kind = None
+            self._active_prompt_handle = None
+        if handle is None or self._handle_done(handle):
+            return
+        with suppress(Exception):
+            if hasattr(handle, "stop"):
+                handle.stop()
+            elif hasattr(handle, "interrupt"):
+                handle.interrupt(force=True)
+
+    async def aclose(self) -> None:
+        self.cancel_response_delay_timer()
+        self.cancel_client_silence_timer()
+        if self._stop_active_prompt_task and not self._stop_active_prompt_task.done():
+            self._stop_active_prompt_task.cancel()
+        await self.stop_active_prompt()
+
+    async def _run_response_delay_timer(self) -> None:
+        try:
+            await asyncio.sleep(self._response_delay_sec)
+            if self._is_closed() or self._response_delay_played:
+                return
+            if self._session.agent_state == "speaking":
+                return
+            played = await self._play_background_prompt(self._response_delay_prompt)
+            if played:
+                self._response_delay_played = True
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.exception("response delay voice prompt failed: %s", e)
+
+    async def _run_client_silence_timer(self) -> None:
+        try:
+            await asyncio.sleep(self._client_silence_sec)
+            if (
+                self._is_closed()
+                or self._is_end_call_scheduled()
+                or self._client_silence_played
+            ):
+                return
+            if self._session.agent_state != "listening":
+                return
+            current_speech = self._session.current_speech
+            if current_speech is not None and not current_speech.done():
+                return
+            played = await self._play_session_prompt(self._client_silence_prompt)
+            if played:
+                self._client_silence_played = True
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.exception("client silence voice prompt failed: %s", e)
+
+    async def _play_background_prompt(self, prompt: VoicePromptSpec) -> bool:
+        audio_path = prompt.audio_path
+        if audio_path is None:
+            return False
+        if not audio_path.exists():
+            logger.warning(
+                "voice prompt audio file not found",
+                extra={"kind": prompt.kind, "audio_path": str(audio_path)},
+            )
+            return False
+        if not await self._reserve_active_prompt(prompt.kind):
+            return False
+
+        handle = None
+        try:
+            handle = self._background_audio.play(str(audio_path))
+            await self._set_active_prompt(prompt.kind, handle)
+            logger.info(
+                "voice prompt started",
+                extra={"kind": prompt.kind, "audio_path": str(audio_path)},
+            )
+            await handle.wait_for_playout()
+            logger.info("voice prompt finished", extra={"kind": prompt.kind})
+            return True
+        except Exception as e:
+            logger.exception(
+                "failed to play background voice prompt '%s': %s",
+                prompt.kind,
+                e,
+            )
+            if handle is not None and hasattr(handle, "stop"):
+                with suppress(Exception):
+                    handle.stop()
+            return False
+        finally:
+            await self._clear_active_prompt(prompt.kind)
+
+    async def _play_session_prompt(self, prompt: VoicePromptSpec) -> bool:
+        audio_path = prompt.audio_path
+        if audio_path is None:
+            return False
+        if not audio_path.exists():
+            logger.warning(
+                "voice prompt audio file not found",
+                extra={"kind": prompt.kind, "audio_path": str(audio_path)},
+            )
+            return False
+        if not await self._reserve_active_prompt(prompt.kind):
+            return False
+
+        handle = None
+        try:
+            handle = self._session.say(
+                prompt.phrase,
+                audio=audio_frames_from_file(
+                    str(audio_path),
+                    sample_rate=self._sample_rate,
+                    num_channels=1,
+                ),
+                allow_interruptions=True,
+                add_to_chat_ctx=False,
+            )
+            await self._set_active_prompt(prompt.kind, handle)
+            logger.info(
+                "voice prompt started",
+                extra={"kind": prompt.kind, "audio_path": str(audio_path)},
+            )
+            await handle.wait_for_playout()
+            logger.info("voice prompt finished", extra={"kind": prompt.kind})
+            return True
+        except Exception as e:
+            logger.exception(
+                "failed to play session voice prompt '%s': %s",
+                prompt.kind,
+                e,
+            )
+            if handle is not None and hasattr(handle, "interrupt"):
+                with suppress(Exception):
+                    handle.interrupt(force=True)
+            return False
+        finally:
+            await self._clear_active_prompt(prompt.kind)
+
+    async def _reserve_active_prompt(self, kind: str) -> bool:
+        async with self._active_lock:
+            handle = self._active_prompt_handle
+            if self._active_prompt_kind is not None and (
+                handle is None or not self._handle_done(handle)
+            ):
+                logger.debug(
+                    "voice prompt skipped because another prompt is active",
+                    extra={
+                        "kind": kind,
+                        "active_kind": self._active_prompt_kind,
+                    },
+                )
+                return False
+            self._active_prompt_kind = kind
+            self._active_prompt_handle = None
+            return True
+
+    async def _set_active_prompt(self, kind: str, handle: Any) -> None:
+        async with self._active_lock:
+            self._active_prompt_kind = kind
+            self._active_prompt_handle = handle
+
+    async def _clear_active_prompt(self, kind: str) -> None:
+        async with self._active_lock:
+            if self._active_prompt_kind == kind:
+                self._active_prompt_kind = None
+                self._active_prompt_handle = None
+
+    @staticmethod
+    def _handle_done(handle: Any) -> bool:
+        done = getattr(handle, "done", None)
+        if callable(done):
+            return bool(done())
         return False
 
 
@@ -1451,6 +1737,7 @@ class Assistant(Agent):
         fallback_llm: google.LLM | None = None,
         first_turn_short_greeting_audio_path: Path = _SHORT_GREETING_AUDIO_PATH,
         prerecorded_audio_sample_rate: int = 24000,
+        voice_prompts: VoicePromptManager | None = None,
         prompt: str | None = None,
     ) -> None:
         self._request_end_call = request_end_call or self._noop_end_call
@@ -1463,6 +1750,7 @@ class Assistant(Agent):
             first_turn_short_greeting_audio_path
         )
         self._prerecorded_audio_sample_rate = prerecorded_audio_sample_rate
+        self._voice_prompts = voice_prompts
         self._awaiting_first_user_turn = True
         self._llm_branch_started_at: dict[str, float] = {}
         resolved_prompt = prompt if prompt is not None else get_active_prompt()
@@ -1506,6 +1794,18 @@ class Assistant(Agent):
         )
         if played:
             raise StopResponse()
+
+    async def tts_node(
+        self, text: AsyncIterable[str], model_settings: Any
+    ) -> AsyncIterator[rtc.AudioFrame]:
+        audio_stream = Agent.default.tts_node(self, text, model_settings)
+        waited_for_prompt = False
+        async for frame in audio_stream:
+            if not waited_for_prompt:
+                if self._voice_prompts is not None:
+                    await self._voice_prompts.wait_for_active_prompt()
+                waited_for_prompt = True
+            yield frame
 
     def _get_last_user_turn(self, chat_ctx: Any) -> tuple[str | None, bool | None]:
         if self._model_router is None:
@@ -2032,6 +2332,26 @@ async def my_agent(ctx: JobContext):
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=PREEMPTIVE_GENERATION,
     )
+    background_audio = BackgroundAudioPlayer()
+    voice_prompts = VoicePromptManager(
+        session=session,
+        background_audio=background_audio,
+        sample_rate=audio_output_sample_rate,
+        response_delay_prompt=VoicePromptSpec(
+            kind="response_delay",
+            audio_path=_RESPONSE_DELAY_AUDIO_PATH,
+            phrase=VOICE_RESPONSE_DELAY_PHRASE,
+        ),
+        client_silence_prompt=VoicePromptSpec(
+            kind="client_silence",
+            audio_path=_CLIENT_SILENCE_AUDIO_PATH,
+            phrase=VOICE_CLIENT_SILENCE_PHRASE,
+        ),
+        response_delay_sec=VOICE_RESPONSE_DELAY_SEC,
+        client_silence_sec=VOICE_CLIENT_SILENCE_SEC,
+        is_closed=close_event.is_set,
+        is_end_call_scheduled=lambda: bool(end_call_task and not end_call_task.done()),
+    )
     logger.info(
         "session latency guards configured",
         extra={
@@ -2048,8 +2368,13 @@ async def my_agent(ctx: JobContext):
             "turn_min_endpointing_delay": min_endpointing_delay,
             "turn_max_endpointing_delay": max_endpointing_delay,
             "reply_watchdog_sec": REPLY_WATCHDOG_SEC,
-            "voice_filler_audio_path": str(_FILLER_AUDIO_PATH)
-            if _FILLER_AUDIO_PATH
+            "voice_response_delay_sec": VOICE_RESPONSE_DELAY_SEC,
+            "voice_response_delay_audio_path": str(_RESPONSE_DELAY_AUDIO_PATH)
+            if _RESPONSE_DELAY_AUDIO_PATH
+            else None,
+            "voice_client_silence_sec": VOICE_CLIENT_SILENCE_SEC,
+            "voice_client_silence_audio_path": str(_CLIENT_SILENCE_AUDIO_PATH)
+            if _CLIENT_SILENCE_AUDIO_PATH
             else None,
             "voice_emergency_audio_path": str(_EMERGENCY_AUDIO_PATH)
             if _EMERGENCY_AUDIO_PATH
@@ -2062,6 +2387,7 @@ async def my_agent(ctx: JobContext):
         if unrecoverable_error_response_started:
             return
         unrecoverable_error_response_started = True
+        await voice_prompts.stop_active_prompt()
 
         err = getattr(ev, "error", None)
         err_type = str(getattr(err, "type", type(err).__name__))
@@ -2122,23 +2448,8 @@ async def my_agent(ctx: JobContext):
                     "timeout_sec": REPLY_WATCHDOG_SEC,
                     "user_activity_count": user_activity_count,
                     "assistant_message_count": assistant_message_count,
-                    "filler_audio_path": str(_FILLER_AUDIO_PATH)
-                    if _FILLER_AUDIO_PATH
-                    else None,
                 },
             )
-            if _FILLER_AUDIO_PATH is not None:
-                played = await play_prerecorded_audio(
-                    session=session,
-                    audio_path=_FILLER_AUDIO_PATH,
-                    sample_rate=audio_output_sample_rate,
-                    allow_interruptions=True,
-                    add_to_chat_ctx=False,
-                )
-                if played:
-                    logger.info("reply watchdog played filler audio")
-                    return
-
             # Safety path for stuck scheduling:
             # - disable tools to prevent accidental end_call
             # - nudge model to answer latest user request directly
@@ -2214,6 +2525,23 @@ async def my_agent(ctx: JobContext):
         except Exception as e:
             logger.exception("user_input_transcribed handler failed: %s", e)
 
+    @session.on("user_state_changed")
+    def on_user_state_changed(ev):
+        try:
+            old_state = getattr(ev, "old_state", None)
+            new_state = getattr(ev, "new_state", None)
+            logger.debug(
+                "user state changed",
+                extra={"old_state": old_state, "new_state": new_state},
+            )
+            if new_state == "speaking":
+                voice_prompts.on_user_started_speaking()
+                return
+            if old_state == "speaking" and new_state == "listening":
+                voice_prompts.start_response_delay_timer()
+        except Exception as e:
+            logger.exception("user_state_changed handler failed: %s", e)
+
     @session.on("session_usage_updated")
     def on_session_usage_updated(ev):
         try:
@@ -2225,21 +2553,28 @@ async def my_agent(ctx: JobContext):
     def on_agent_state_changed(ev):
         nonlocal reply_watchdog_task
         try:
+            new_state = getattr(ev, "new_state", None)
             logger.debug(
                 "agent state changed",
                 extra={
                     "old_state": getattr(ev, "old_state", None),
-                    "new_state": getattr(ev, "new_state", None),
+                    "new_state": new_state,
                 },
             )
             # If generation has started, watchdog fallback is no longer needed.
             if (
-                getattr(ev, "new_state", None) in {"thinking", "speaking"}
+                new_state in {"thinking", "speaking"}
                 and reply_watchdog_task
                 and not reply_watchdog_task.done()
             ):
                 reply_watchdog_task.cancel()
                 reply_watchdog_task = None
+            if new_state in {"thinking", "speaking"}:
+                voice_prompts.cancel_client_silence_timer()
+            if new_state == "speaking":
+                voice_prompts.on_agent_started_speaking()
+            elif new_state == "listening":
+                voice_prompts.start_client_silence_timer()
         except Exception as e:
             logger.exception("agent_state_changed handler failed: %s", e)
 
@@ -2386,6 +2721,8 @@ async def my_agent(ctx: JobContext):
 
         requested_activity = user_activity_count
         end_call_requested_at = asyncio.get_running_loop().time()
+        voice_prompts.cancel_client_silence_timer()
+        voice_prompts.cancel_response_delay_timer()
 
         async def end_after_farewell() -> None:
             try:
@@ -2438,6 +2775,8 @@ async def my_agent(ctx: JobContext):
         if reply_watchdog_task and not reply_watchdog_task.done():
             reply_watchdog_task.cancel()
             reply_watchdog_task = None
+        voice_prompts.cancel_response_delay_timer()
+        voice_prompts.cancel_client_silence_timer()
         close_event.set()
 
     async def export_best_effort(timeout_sec: float) -> None:
@@ -2487,6 +2826,7 @@ async def my_agent(ctx: JobContext):
             fallback_llm=fallback_llm,
             first_turn_short_greeting_audio_path=_SHORT_GREETING_AUDIO_PATH,
             prerecorded_audio_sample_rate=audio_output_sample_rate,
+            voice_prompts=voice_prompts,
             prompt=prompt_resolution.prompt,
         )
 
@@ -2510,6 +2850,7 @@ async def my_agent(ctx: JobContext):
                 ),
             ),
         )
+        await background_audio.start(room=ctx.room, agent_session=session)
 
         runtime_warmup_task = asyncio.create_task(
             warmup_runtime_backends(
@@ -2572,6 +2913,9 @@ async def my_agent(ctx: JobContext):
             runtime_warmup_task.cancel()
             with suppress(BaseException):
                 await runtime_warmup_task
+        await voice_prompts.aclose()
+        with suppress(Exception):
+            await background_audio.aclose()
         await ensure_session_closed(timeout_sec=2.0)
         if export_task and not export_task.done():
             try:

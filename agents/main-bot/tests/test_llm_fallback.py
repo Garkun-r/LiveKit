@@ -93,6 +93,106 @@ class _FakeLLMStream(llm.LLMStream):
         )
 
 
+class _FakePromptHandle:
+    def __init__(self, *, done: bool = True) -> None:
+        self._done = asyncio.Event()
+        if done:
+            self._done.set()
+        self.stopped = False
+        self.interrupted = False
+
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    def finish(self) -> None:
+        self._done.set()
+
+    def stop(self) -> None:
+        self.stopped = True
+        self.finish()
+
+    def interrupt(self, *, force: bool = False) -> None:
+        self.interrupted = force
+        self.finish()
+
+    async def wait_for_playout(self) -> None:
+        await self._done.wait()
+
+
+class _FakeBackgroundAudio:
+    def __init__(self, handle: _FakePromptHandle | None = None) -> None:
+        self.handle = handle or _FakePromptHandle()
+        self.played: list[str] = []
+
+    def play(self, audio: str, *, loop: bool = False) -> _FakePromptHandle:
+        self.played.append(audio)
+        return self.handle
+
+
+class _FakePromptSession:
+    def __init__(self) -> None:
+        self.agent_state = "listening"
+        self.current_speech = None
+        self.say_calls: list[dict[str, object]] = []
+        self.handle = _FakePromptHandle()
+
+    def say(
+        self,
+        text: str,
+        *,
+        audio,
+        allow_interruptions: bool,
+        add_to_chat_ctx: bool,
+    ) -> _FakePromptHandle:
+        self.say_calls.append(
+            {
+                "text": text,
+                "audio": audio,
+                "allow_interruptions": allow_interruptions,
+                "add_to_chat_ctx": add_to_chat_ctx,
+            }
+        )
+        return self.handle
+
+
+def _voice_prompt_manager(
+    *,
+    tmp_path,
+    session: _FakePromptSession | None = None,
+    background_audio: _FakeBackgroundAudio | None = None,
+    response_delay_sec: float = 0.01,
+    client_silence_sec: float = 0.01,
+    is_closed=lambda: False,
+    is_end_call_scheduled=lambda: False,
+) -> tuple[agent.VoicePromptManager, _FakePromptSession, _FakeBackgroundAudio]:
+    response_delay_audio = tmp_path / "response_delay.wav"
+    client_silence_audio = tmp_path / "client_silence.wav"
+    response_delay_audio.write_bytes(b"fake")
+    client_silence_audio.write_bytes(b"fake")
+    session = session or _FakePromptSession()
+    background_audio = background_audio or _FakeBackgroundAudio()
+    manager = agent.VoicePromptManager(
+        session=session,
+        background_audio=background_audio,
+        sample_rate=24000,
+        response_delay_prompt=agent.VoicePromptSpec(
+            kind="response_delay",
+            audio_path=response_delay_audio,
+            phrase="Секундочку.",
+        ),
+        client_silence_prompt=agent.VoicePromptSpec(
+            kind="client_silence",
+            audio_path=client_silence_audio,
+            phrase="Алло.",
+        ),
+        response_delay_sec=response_delay_sec,
+        client_silence_sec=client_silence_sec,
+        is_closed=is_closed,
+        is_end_call_scheduled=is_end_call_scheduled,
+    )
+    return manager, session, background_audio
+
+
 async def _collect_text(adapter: llm.LLM) -> str:
     parts: list[str] = []
     async with adapter.chat(chat_ctx=llm.ChatContext.empty(), tools=[]) as stream:
@@ -294,6 +394,106 @@ async def test_missing_prerecorded_audio_does_not_crash(tmp_path) -> None:
     )
 
     assert played is False
+
+
+@pytest.mark.asyncio
+async def test_response_delay_prompt_fires_after_timer(tmp_path) -> None:
+    manager, _, background_audio = _voice_prompt_manager(tmp_path=tmp_path)
+
+    manager.start_response_delay_timer()
+    await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    assert background_audio.played == [str(tmp_path / "response_delay.wav")]
+
+
+@pytest.mark.asyncio
+async def test_response_delay_prompt_skips_if_agent_is_speaking(tmp_path) -> None:
+    session = _FakePromptSession()
+    session.agent_state = "speaking"
+    manager, _, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        session=session,
+    )
+
+    manager.start_response_delay_timer()
+    await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    assert background_audio.played == []
+
+
+@pytest.mark.asyncio
+async def test_user_speech_cancels_pending_response_delay_prompt(tmp_path) -> None:
+    manager, _, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        response_delay_sec=0.05,
+    )
+
+    manager.start_response_delay_timer()
+    manager.on_user_started_speaking()
+    await asyncio.sleep(0.08)
+    await manager.aclose()
+
+    assert background_audio.played == []
+
+
+@pytest.mark.asyncio
+async def test_client_silence_prompt_uses_session_speech_queue(tmp_path) -> None:
+    manager, session, _ = _voice_prompt_manager(tmp_path=tmp_path)
+
+    manager.start_client_silence_timer()
+    await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    assert len(session.say_calls) == 1
+    assert session.say_calls[0]["text"] == "Алло."
+    assert session.say_calls[0]["allow_interruptions"] is True
+    assert session.say_calls[0]["add_to_chat_ctx"] is False
+
+
+@pytest.mark.asyncio
+async def test_client_silence_prompt_does_not_repeat_without_user_activity(
+    tmp_path,
+) -> None:
+    manager, session, _ = _voice_prompt_manager(tmp_path=tmp_path)
+
+    manager.start_client_silence_timer()
+    await asyncio.sleep(0.05)
+    manager.start_client_silence_timer()
+    await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    assert len(session.say_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_client_silence_prompt_does_not_start_during_end_call(tmp_path) -> None:
+    manager, session, _ = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        is_end_call_scheduled=lambda: True,
+    )
+
+    manager.start_client_silence_timer()
+    await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    assert session.say_calls == []
+
+
+@pytest.mark.asyncio
+async def test_wait_for_active_prompt_blocks_until_prompt_finishes(tmp_path) -> None:
+    handle = _FakePromptHandle(done=False)
+    manager, _, _ = _voice_prompt_manager(tmp_path=tmp_path)
+    await manager._set_active_prompt("response_delay", handle)
+
+    wait_task = asyncio.create_task(manager.wait_for_active_prompt())
+    await asyncio.sleep(0)
+    assert wait_task.done() is False
+
+    handle.finish()
+    await wait_task
+    await manager.aclose()
 
 
 @pytest.mark.asyncio

@@ -205,14 +205,38 @@ LLM_RETRY_DELAY_SEC = float(
     os.getenv("LLM_RETRY_DELAY_SEC", str(LLM_RETRY_INTERVAL_SEC))
 )
 
-# Prerecorded audio hooks. Relative paths resolve under agents/main-bot/audio.
-VOICE_FILLER_AUDIO_PATH = os.getenv("VOICE_FILLER_AUDIO_PATH", "").strip()
-VOICE_EMERGENCY_AUDIO_PATH = os.getenv("VOICE_EMERGENCY_AUDIO_PATH", "").strip()
-VOICE_FILLER_PHRASE = os.getenv("VOICE_FILLER_PHRASE", "Секундочку, проверяю.").strip()
+# Prerecorded voice prompts. Relative paths resolve under agents/main-bot/audio.
+# Legacy VOICE_FILLER_* names remain as fallback env keys for existing deploys.
+_legacy_voice_filler_audio_path = os.getenv("VOICE_FILLER_AUDIO_PATH", "").strip()
+_legacy_voice_filler_phrase = os.getenv("VOICE_FILLER_PHRASE", "").strip()
+VOICE_RESPONSE_DELAY_AUDIO_PATH = os.getenv(
+    "VOICE_RESPONSE_DELAY_AUDIO_PATH",
+    _legacy_voice_filler_audio_path or "response_delay.wav",
+).strip() or "response_delay.wav"
+VOICE_RESPONSE_DELAY_PHRASE = os.getenv(
+    "VOICE_RESPONSE_DELAY_PHRASE",
+    _legacy_voice_filler_phrase or "Секундочку.",
+).strip() or "Секундочку."
+VOICE_RESPONSE_DELAY_SEC = float(os.getenv("VOICE_RESPONSE_DELAY_SEC", "3.0"))
+VOICE_CLIENT_SILENCE_AUDIO_PATH = os.getenv(
+    "VOICE_CLIENT_SILENCE_AUDIO_PATH",
+    "client_silence.wav",
+).strip() or "client_silence.wav"
+VOICE_CLIENT_SILENCE_PHRASE = os.getenv(
+    "VOICE_CLIENT_SILENCE_PHRASE",
+    "Алло.",
+).strip() or "Алло."
+VOICE_CLIENT_SILENCE_SEC = float(os.getenv("VOICE_CLIENT_SILENCE_SEC", "8.0"))
+VOICE_EMERGENCY_AUDIO_PATH = os.getenv(
+    "VOICE_EMERGENCY_AUDIO_PATH",
+    "emergency.wav",
+).strip() or "emergency.wav"
 VOICE_EMERGENCY_PHRASE = os.getenv(
     "VOICE_EMERGENCY_PHRASE",
-    "Извините, перезвоните ещё раз, вас плохо слышно.",
-).strip()
+    "Извините, перезвоните ещё раз.",
+).strip() or "Извините, перезвоните ещё раз."
+VOICE_FILLER_AUDIO_PATH = VOICE_RESPONSE_DELAY_AUDIO_PATH
+VOICE_FILLER_PHRASE = VOICE_RESPONSE_DELAY_PHRASE
 
 # Turn endpointing tuning (seconds). Lower values = faster replies.
 TURN_MIN_ENDPOINTING_DELAY = float(os.getenv("TURN_MIN_ENDPOINTING_DELAY", "0.25"))
