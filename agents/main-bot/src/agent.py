@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import tempfile
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable
@@ -166,6 +167,8 @@ from config import (
     STT_DEEPGRAM_ENDPOINTING_MS,
     STT_DEEPGRAM_LANGUAGE,
     STT_DEEPGRAM_MODEL,
+    STT_EARLY_INTERIM_FINAL_DELAY_SEC,
+    STT_EARLY_INTERIM_FINAL_ENABLED,
     STT_GOOGLE_LANGUAGE,
     STT_GOOGLE_LOCATION,
     STT_GOOGLE_MODEL,
@@ -174,6 +177,12 @@ from config import (
     STT_INFERENCE_LANGUAGE,
     STT_INFERENCE_MODEL,
     STT_PROVIDER,
+    STT_YANDEX_CHUNK_MS,
+    STT_YANDEX_EOU_SENSITIVITY,
+    STT_YANDEX_LANGUAGE,
+    STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS,
+    STT_YANDEX_MODEL,
+    STT_YANDEX_SAMPLE_RATE,
     TTS_PROVIDER,
     TURN_DETECTION_MODE,
     TURN_ENDPOINTING_MODE,
@@ -188,15 +197,19 @@ from config import (
     VOICE_EMERGENCY_AUDIO_PATH,
     VOICE_EMERGENCY_PHRASE,
     VOICE_RESPONSE_DELAY_AUDIO_PATH,
+    VOICE_RESPONSE_DELAY_AUDIO_PATHS,
     VOICE_RESPONSE_DELAY_PHRASE,
+    VOICE_RESPONSE_DELAY_POST_GAP_SEC,
     VOICE_RESPONSE_DELAY_SEC,
     XAI_API_KEY,
     XAI_BASE_URL,
     XAI_ENABLE_TOOLS,
     XAI_MODEL,
     XAI_TEMPERATURE,
+    YANDEX_SPEECHKIT_API_KEY,
 )
 from cosyvoice_tts import CosyVoiceTTS
+from early_interim_final_stt import wrap_stt_if_enabled
 from egress import (
     aiohttp_proxy,
     httpx_client_args,
@@ -209,6 +222,7 @@ from prompt_repo import PromptResolution, get_active_prompt, resolve_prompt_for_
 from routing.model_router import ModelRouter, ModelRouteResult, coerce_optional_bool
 from session_export import send_session_to_n8n
 from vertex_gemini_tts import VertexGeminiTTS
+from yandex_stt import YandexSpeechKitSTT
 
 logger = logging.getLogger("agent")
 
@@ -266,9 +280,24 @@ def resolve_configured_audio_path(raw_path: str) -> Path | None:
     return path
 
 
+def resolve_configured_audio_paths(raw_paths: str) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for raw_path in (raw_paths or "").split(","):
+        path = resolve_configured_audio_path(raw_path)
+        if path is None or path in seen:
+            continue
+        paths.append(path)
+        seen.add(path)
+    return tuple(paths)
+
+
 _RESPONSE_DELAY_AUDIO_PATH = resolve_configured_audio_path(
     VOICE_RESPONSE_DELAY_AUDIO_PATH
 )
+_RESPONSE_DELAY_AUDIO_PATHS = resolve_configured_audio_paths(
+    VOICE_RESPONSE_DELAY_AUDIO_PATHS
+) or ((_RESPONSE_DELAY_AUDIO_PATH,) if _RESPONSE_DELAY_AUDIO_PATH else ())
 _CLIENT_SILENCE_AUDIO_PATH = resolve_configured_audio_path(
     VOICE_CLIENT_SILENCE_AUDIO_PATH
 )
@@ -400,7 +429,7 @@ async def play_prerecorded_audio(
 @dataclass(frozen=True)
 class VoicePromptSpec:
     kind: str
-    audio_path: Path | None
+    audio_paths: tuple[Path, ...]
     phrase: str
 
 
@@ -414,6 +443,7 @@ class VoicePromptManager:
         response_delay_prompt: VoicePromptSpec,
         client_silence_prompt: VoicePromptSpec,
         response_delay_sec: float,
+        response_delay_post_gap_sec: float,
         client_silence_sec: float,
         is_closed: Callable[[], bool],
         is_end_call_scheduled: Callable[[], bool],
@@ -424,6 +454,7 @@ class VoicePromptManager:
         self._response_delay_prompt = response_delay_prompt
         self._client_silence_prompt = client_silence_prompt
         self._response_delay_sec = max(0.0, response_delay_sec)
+        self._response_delay_post_gap_sec = max(0.0, response_delay_post_gap_sec)
         self._client_silence_sec = max(0.0, client_silence_sec)
         self._is_closed = is_closed
         self._is_end_call_scheduled = is_end_call_scheduled
@@ -436,12 +467,17 @@ class VoicePromptManager:
         self._active_lock = asyncio.Lock()
         self._response_delay_played = False
         self._client_silence_played = False
+        self._waiting_for_client_response = False
+        self._last_response_delay_finished_at: float | None = None
 
     def start_response_delay_timer(self) -> None:
-        if self._response_delay_sec <= 0 or self._is_closed():
+        if (
+            self._response_delay_sec <= 0
+            or self._is_closed()
+            or self._response_delay_played
+        ):
             return
         self.cancel_response_delay_timer()
-        self._response_delay_played = False
         self._response_delay_task = asyncio.create_task(
             self._run_response_delay_timer(),
             name="voice_prompt_response_delay",
@@ -452,6 +488,7 @@ class VoicePromptManager:
             self._client_silence_sec <= 0
             or self._is_closed()
             or self._is_end_call_scheduled()
+            or not self._waiting_for_client_response
             or self._client_silence_played
         ):
             return
@@ -476,6 +513,7 @@ class VoicePromptManager:
         self.cancel_client_silence_timer()
         self._response_delay_played = False
         self._client_silence_played = False
+        self._waiting_for_client_response = False
         self._stop_active_prompt_task = asyncio.create_task(
             self.stop_active_prompt(),
             name="voice_prompt_stop_on_user_speech",
@@ -484,15 +522,30 @@ class VoicePromptManager:
     def on_agent_started_speaking(self) -> None:
         self.cancel_response_delay_timer()
         self.cancel_client_silence_timer()
+        self._waiting_for_client_response = False
+        if self._active_prompt_kind == "response_delay":
+            self._stop_active_prompt_task = asyncio.create_task(
+                self.stop_active_prompt(),
+                name="voice_prompt_stop_on_agent_speech",
+            )
         if self._active_prompt_kind != "client_silence":
             self._client_silence_played = False
 
+    def on_agent_finished_speaking(self) -> None:
+        self._waiting_for_client_response = True
+        self.start_client_silence_timer()
+
     async def wait_for_active_prompt(self) -> None:
-        handle = self._active_prompt_handle
-        if handle is None or self._handle_done(handle):
+        kind, handle = await self._wait_for_reserved_prompt_handle()
+        if kind is None:
+            await self._sleep_response_delay_gap_if_needed()
             return
-        with suppress(Exception):
-            await handle.wait_for_playout()
+        if kind == "response_delay":
+            await self.stop_active_prompt()
+            return
+        if handle is not None and not self._handle_done(handle):
+            with suppress(Exception):
+                await handle.wait_for_playout()
 
     async def stop_active_prompt(self) -> None:
         async with self._active_lock:
@@ -552,7 +605,7 @@ class VoicePromptManager:
             logger.exception("client silence voice prompt failed: %s", e)
 
     async def _play_background_prompt(self, prompt: VoicePromptSpec) -> bool:
-        audio_path = prompt.audio_path
+        audio_path = self._select_audio_path(prompt)
         if audio_path is None:
             return False
         if not audio_path.exists():
@@ -573,6 +626,8 @@ class VoicePromptManager:
                 extra={"kind": prompt.kind, "audio_path": str(audio_path)},
             )
             await handle.wait_for_playout()
+            if prompt.kind == "response_delay":
+                self._last_response_delay_finished_at = asyncio.get_running_loop().time()
             logger.info("voice prompt finished", extra={"kind": prompt.kind})
             return True
         except Exception as e:
@@ -589,7 +644,7 @@ class VoicePromptManager:
             await self._clear_active_prompt(prompt.kind)
 
     async def _play_session_prompt(self, prompt: VoicePromptSpec) -> bool:
-        audio_path = prompt.audio_path
+        audio_path = self._select_audio_path(prompt)
         if audio_path is None:
             return False
         if not audio_path.exists():
@@ -662,6 +717,38 @@ class VoicePromptManager:
             if self._active_prompt_kind == kind:
                 self._active_prompt_kind = None
                 self._active_prompt_handle = None
+
+    async def _wait_for_reserved_prompt_handle(self) -> tuple[str | None, Any | None]:
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while True:
+            async with self._active_lock:
+                kind = self._active_prompt_kind
+                handle = self._active_prompt_handle
+            if kind is None or handle is not None:
+                return kind, handle
+            if asyncio.get_running_loop().time() >= deadline:
+                return kind, None
+            await asyncio.sleep(0.01)
+
+    async def _sleep_response_delay_gap_if_needed(self) -> None:
+        if self._response_delay_post_gap_sec <= 0 or self._is_closed():
+            return
+        finished_at = self._last_response_delay_finished_at
+        if finished_at is None:
+            return
+        elapsed = asyncio.get_running_loop().time() - finished_at
+        remaining = self._response_delay_post_gap_sec - elapsed
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+    @staticmethod
+    def _select_audio_path(prompt: VoicePromptSpec) -> Path | None:
+        if not prompt.audio_paths:
+            return None
+        existing_paths = [path for path in prompt.audio_paths if path.exists()]
+        if not existing_paths:
+            return random.choice(prompt.audio_paths)
+        return random.choice(existing_paths)
 
     @staticmethod
     def _handle_done(handle: Any) -> bool:
@@ -1662,6 +1749,16 @@ def build_tts(
     return build_elevenlabs_tts()
 
 
+def _wrap_stt_for_early_interim_final(stt_client: lk_stt.STT) -> lk_stt.STT:
+    return wrap_stt_if_enabled(
+        stt_client,
+        enabled=STT_EARLY_INTERIM_FINAL_ENABLED,
+        delay_sec=STT_EARLY_INTERIM_FINAL_DELAY_SEC,
+        turn_detection_mode=TURN_DETECTION_MODE,
+        logger_=logger,
+    )
+
+
 def build_stt(
     external_http_sessions: list[aiohttp.ClientSession] | None = None,
 ) -> Any:
@@ -1725,7 +1822,7 @@ def build_stt(
             fallback_descriptions.append(fallback_model)
 
         if len(stt_instances) == 1:
-            return stt_instances[0]
+            return _wrap_stt_for_early_interim_final(stt_instances[0])
 
         logger.info(
             "using STT fallback adapter",
@@ -1734,12 +1831,14 @@ def build_stt(
                 "chain": fallback_descriptions,
             },
         )
-        return lk_stt.FallbackAdapter(
-            stt=stt_instances,
-            # Keep failover quick to avoid long silence when primary is rate-limited.
-            attempt_timeout=8.0,
-            max_retry_per_stt=0,
-            retry_interval=0.7,
+        return _wrap_stt_for_early_interim_final(
+            lk_stt.FallbackAdapter(
+                stt=stt_instances,
+                # Keep failover quick to avoid long silence when primary is rate-limited.
+                attempt_timeout=8.0,
+                max_retry_per_stt=0,
+                retry_interval=0.7,
+            )
         )
 
     if STT_PROVIDER == "google":
@@ -1748,9 +1847,11 @@ def build_stt(
             logger.warning(
                 "Google STT credentials are not available; falling back to inference STT."
             )
-            return inference.STT(
-                model=STT_INFERENCE_MODEL,
-                language=STT_INFERENCE_LANGUAGE,
+            return _wrap_stt_for_early_interim_final(
+                inference.STT(
+                    model=STT_INFERENCE_MODEL,
+                    language=STT_INFERENCE_LANGUAGE,
+                )
             )
 
         stt_instances: list[Any] = [google_stt]
@@ -1775,7 +1876,7 @@ def build_stt(
             },
         )
         if len(stt_instances) == 1:
-            return google_stt
+            return _wrap_stt_for_early_interim_final(google_stt)
 
         logger.info(
             "using STT fallback adapter",
@@ -1784,21 +1885,66 @@ def build_stt(
                 "chain": fallback_descriptions,
             },
         )
-        return lk_stt.FallbackAdapter(
-            stt=stt_instances,
-            attempt_timeout=8.0,
-            max_retry_per_stt=0,
-            retry_interval=0.7,
+        return _wrap_stt_for_early_interim_final(
+            lk_stt.FallbackAdapter(
+                stt=stt_instances,
+                attempt_timeout=8.0,
+                max_retry_per_stt=0,
+                retry_interval=0.7,
+            )
         )
+
+    if STT_PROVIDER == "yandex":
+        if not YANDEX_SPEECHKIT_API_KEY.strip():
+            logger.warning(
+                "YANDEX_SPEECHKIT_API_KEY is not set. Falling back to inference STT."
+            )
+            return _wrap_stt_for_early_interim_final(
+                inference.STT(
+                    model=STT_INFERENCE_MODEL,
+                    language=STT_INFERENCE_LANGUAGE,
+                )
+            )
+
+        logger.info(
+            "using Yandex SpeechKit STT provider",
+            extra={
+                "model": STT_YANDEX_MODEL,
+                "language": STT_YANDEX_LANGUAGE,
+                "sample_rate": STT_YANDEX_SAMPLE_RATE,
+                "chunk_ms": STT_YANDEX_CHUNK_MS,
+                "eou_sensitivity": STT_YANDEX_EOU_SENSITIVITY,
+                "max_pause_between_words_hint_ms": (
+                    STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS
+                ),
+                "egress": provider_egress("yandex_stt"),
+            },
+        )
+        with provider_egress_env("yandex_stt"):
+            return _wrap_stt_for_early_interim_final(
+                YandexSpeechKitSTT(
+                    api_key=YANDEX_SPEECHKIT_API_KEY,
+                    model=STT_YANDEX_MODEL,
+                    language=STT_YANDEX_LANGUAGE,
+                    sample_rate=STT_YANDEX_SAMPLE_RATE,
+                    chunk_ms=STT_YANDEX_CHUNK_MS,
+                    eou_sensitivity=STT_YANDEX_EOU_SENSITIVITY,
+                    max_pause_between_words_hint_ms=(
+                        STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS
+                    ),
+                )
+            )
 
     if STT_PROVIDER == "deepgram":
         if not DEEPGRAM_API_KEY:
             logger.warning(
                 "DEEPGRAM_API_KEY is not set. Falling back to inference STT."
             )
-            return inference.STT(
-                model=STT_INFERENCE_MODEL,
-                language=STT_INFERENCE_LANGUAGE,
+            return _wrap_stt_for_early_interim_final(
+                inference.STT(
+                    model=STT_INFERENCE_MODEL,
+                    language=STT_INFERENCE_LANGUAGE,
+                )
             )
 
         logger.info(
@@ -1809,30 +1955,34 @@ def build_stt(
                 "egress": provider_egress("deepgram"),
             },
         )
-        return deepgram.STT(
-            api_key=DEEPGRAM_API_KEY,
-            model=STT_DEEPGRAM_MODEL,
-            language=STT_DEEPGRAM_LANGUAGE,
-            http_session=create_external_aiohttp_session(
-                "deepgram",
-                external_http_sessions,
-            ),
-            interim_results=True,
-            no_delay=True,
-            endpointing_ms=STT_DEEPGRAM_ENDPOINTING_MS,
-            smart_format=False,
-            punctuate=True,
-            filler_words=False,
-            vad_events=True,
+        return _wrap_stt_for_early_interim_final(
+            deepgram.STT(
+                api_key=DEEPGRAM_API_KEY,
+                model=STT_DEEPGRAM_MODEL,
+                language=STT_DEEPGRAM_LANGUAGE,
+                http_session=create_external_aiohttp_session(
+                    "deepgram",
+                    external_http_sessions,
+                ),
+                interim_results=True,
+                no_delay=True,
+                endpointing_ms=STT_DEEPGRAM_ENDPOINTING_MS,
+                smart_format=False,
+                punctuate=True,
+                filler_words=False,
+                vad_events=True,
+            )
         )
 
     logger.warning(
         "Unknown STT_PROVIDER='%s'. Falling back to inference STT.",
         STT_PROVIDER,
     )
-    return inference.STT(
-        model=STT_INFERENCE_MODEL,
-        language=STT_INFERENCE_LANGUAGE,
+    return _wrap_stt_for_early_interim_final(
+        inference.STT(
+            model=STT_INFERENCE_MODEL,
+            language=STT_INFERENCE_LANGUAGE,
+        )
     )
 
 
@@ -2507,15 +2657,18 @@ async def my_agent(ctx: JobContext):
         sample_rate=audio_output_sample_rate,
         response_delay_prompt=VoicePromptSpec(
             kind="response_delay",
-            audio_path=_RESPONSE_DELAY_AUDIO_PATH,
+            audio_paths=_RESPONSE_DELAY_AUDIO_PATHS,
             phrase=VOICE_RESPONSE_DELAY_PHRASE,
         ),
         client_silence_prompt=VoicePromptSpec(
             kind="client_silence",
-            audio_path=_CLIENT_SILENCE_AUDIO_PATH,
+            audio_paths=(
+                (_CLIENT_SILENCE_AUDIO_PATH,) if _CLIENT_SILENCE_AUDIO_PATH else ()
+            ),
             phrase=VOICE_CLIENT_SILENCE_PHRASE,
         ),
         response_delay_sec=VOICE_RESPONSE_DELAY_SEC,
+        response_delay_post_gap_sec=VOICE_RESPONSE_DELAY_POST_GAP_SEC,
         client_silence_sec=VOICE_CLIENT_SILENCE_SEC,
         is_closed=close_event.is_set,
         is_end_call_scheduled=lambda: bool(end_call_task and not end_call_task.done()),
@@ -2536,10 +2689,13 @@ async def my_agent(ctx: JobContext):
             "turn_min_endpointing_delay": min_endpointing_delay,
             "turn_max_endpointing_delay": max_endpointing_delay,
             "reply_watchdog_sec": REPLY_WATCHDOG_SEC,
+            "stt_early_interim_final_enabled": STT_EARLY_INTERIM_FINAL_ENABLED,
+            "stt_early_interim_final_delay_sec": STT_EARLY_INTERIM_FINAL_DELAY_SEC,
             "voice_response_delay_sec": VOICE_RESPONSE_DELAY_SEC,
-            "voice_response_delay_audio_path": str(_RESPONSE_DELAY_AUDIO_PATH)
-            if _RESPONSE_DELAY_AUDIO_PATH
-            else None,
+            "voice_response_delay_post_gap_sec": VOICE_RESPONSE_DELAY_POST_GAP_SEC,
+            "voice_response_delay_audio_paths": [
+                str(path) for path in _RESPONSE_DELAY_AUDIO_PATHS
+            ],
             "voice_client_silence_sec": VOICE_CLIENT_SILENCE_SEC,
             "voice_client_silence_audio_path": str(_CLIENT_SILENCE_AUDIO_PATH)
             if _CLIENT_SILENCE_AUDIO_PATH
@@ -2729,11 +2885,12 @@ async def my_agent(ctx: JobContext):
     def on_agent_state_changed(ev):
         nonlocal reply_watchdog_task
         try:
+            old_state = getattr(ev, "old_state", None)
             new_state = getattr(ev, "new_state", None)
             logger.debug(
                 "agent state changed",
                 extra={
-                    "old_state": getattr(ev, "old_state", None),
+                    "old_state": old_state,
                     "new_state": new_state,
                 },
             )
@@ -2749,8 +2906,8 @@ async def my_agent(ctx: JobContext):
                 voice_prompts.cancel_client_silence_timer()
             if new_state == "speaking":
                 voice_prompts.on_agent_started_speaking()
-            elif new_state == "listening":
-                voice_prompts.start_client_silence_timer()
+            elif old_state == "speaking" and new_state == "listening":
+                voice_prompts.on_agent_finished_speaking()
         except Exception as e:
             logger.exception("agent_state_changed handler failed: %s", e)
 

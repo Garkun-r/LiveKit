@@ -14,35 +14,65 @@ from eleven_v3_tts import (
 
 
 @pytest.mark.parametrize(
-    ("text", "expected_valid", "expected_reason"),
+    ("text", "expected_sanitized", "expected_reason"),
     [
-        ("", False, "empty_after_trim"),
-        ("   ", False, "empty_after_trim"),
-        ("🙂", False, "empty_after_emoji_strip"),
-        ("[speaker_1]:", False, "empty_after_speaker_tag_strip"),
-        ("speaker2: 🙂", False, "empty_after_emoji_strip"),
-        ("...", False, "punctuation_only"),
-        ("—", False, "punctuation_only"),
-        ("да", True, None),
-        ("мм", True, None),
-        ("ok!", True, None),
-        ("  a  ", True, None),
+        ("", "", "empty_after_trim"),
+        ("   ", "", "empty_after_trim"),
+        ("🙂", "", "empty_after_emoji_strip"),
+        ("[speaker_1]:", "", "empty_after_speaker_tag_strip"),
+        ("speaker2: 🙂", "", "empty_after_emoji_strip"),
+        ("[STATUS: LEAD]", "", "empty_after_bracket_tag_strip"),
+        ("Спасибо. [STATUS: LEAD]", "Спасибо.", None),
+        ("Хорошо [короткая пауза] до свидания", "Хорошо до свидания", None),
+        ("...", "", "punctuation_only"),
+        ("—", "", "punctuation_only"),
+        ("да", "да", None),
+        ("мм", "мм", None),
+        ("ok!", "ok!", None),
+        ("  a  ", "a", None),
     ],
 )
-def test_sanitize_outbound_text_segment(text: str, expected_valid: bool, expected_reason: str | None) -> None:
+def test_sanitize_outbound_text_segment(
+    text: str,
+    expected_sanitized: str,
+    expected_reason: str | None,
+) -> None:
     sanitized, reason = _sanitize_outbound_text_segment(text)
 
-    assert (reason is None) is expected_valid
     assert reason == expected_reason
-    if expected_valid:
-        assert sanitized == text.strip()
-    else:
-        assert sanitized == ""
+    assert sanitized == expected_sanitized
 
 
 class _NoHttpSession:
     def post(self, *args, **kwargs):  # pragma: no cover - should never be called
         raise AssertionError("HTTP request should not be executed for invalid text")
+
+
+class _OneChunkContent:
+    async def iter_any(self):
+        yield b"audio"
+
+
+class _AudioResponse:
+    status = 200
+    reason = "OK"
+    content_type = "audio/mpeg"
+    content = _OneChunkContent()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _CaptureHttpSession:
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+
+    def post(self, *args, **kwargs):
+        self.requests.append({"args": args, "kwargs": kwargs})
+        return _AudioResponse()
 
 
 @pytest.mark.asyncio
@@ -55,6 +85,44 @@ async def test_do_http_stream_skips_invalid_segment_before_http() -> None:
         tts_provider=tts_obj,
         opts=tts_obj._opts,
         text="🙂",
+        prev_text="hello",
+        conn_options=DEFAULT_API_CONNECT_OPTIONS,
+        on_chunk=q,
+    )
+
+    assert q.empty()
+
+
+@pytest.mark.asyncio
+async def test_do_http_stream_strips_bracketed_tags_from_payload() -> None:
+    http_session = _CaptureHttpSession()
+    tts_obj = ElevenV3HTTPStreamTTS(api_key="test-api-key", voice_id="voice")
+    tts_obj._session = http_session
+
+    q: asyncio.Queue[bytes | None] = asyncio.Queue()
+    await _do_http_stream(
+        tts_provider=tts_obj,
+        opts=tts_obj._opts,
+        text="Спасибо. [STATUS: LEAD]",
+        prev_text="hello",
+        conn_options=DEFAULT_API_CONNECT_OPTIONS,
+        on_chunk=q,
+    )
+
+    assert len(http_session.requests) == 1
+    assert http_session.requests[0]["kwargs"]["json"]["text"] == "Спасибо."
+
+
+@pytest.mark.asyncio
+async def test_do_http_stream_skips_bracket_only_segment_before_http() -> None:
+    tts_obj = ElevenV3HTTPStreamTTS(api_key="test-api-key", voice_id="voice")
+    tts_obj._session = _NoHttpSession()
+
+    q: asyncio.Queue[bytes | None] = asyncio.Queue()
+    await _do_http_stream(
+        tts_provider=tts_obj,
+        opts=tts_obj._opts,
+        text="[STATUS: LEAD]",
         prev_text="hello",
         conn_options=DEFAULT_API_CONNECT_OPTIONS,
         on_chunk=q,

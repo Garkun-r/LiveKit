@@ -1,11 +1,102 @@
+import json
+
 import pytest
-from livekit.agents import AgentSession, inference, llm
+from livekit.agents import DEFAULT_API_CONNECT_OPTIONS, AgentSession, llm
+from livekit.agents.types import NOT_GIVEN
 
 from agent import Assistant
 
 
+class _OfflineLLM(llm.LLM):
+    @property
+    def provider(self) -> str:
+        return "offline-test"
+
+    @property
+    def model(self) -> str:
+        return "offline-test-llm"
+
+    def chat(
+        self,
+        *,
+        chat_ctx: llm.ChatContext,
+        tools: list[llm.Tool] | None = None,
+        conn_options=DEFAULT_API_CONNECT_OPTIONS,
+        parallel_tool_calls=NOT_GIVEN,
+        tool_choice=NOT_GIVEN,
+        extra_kwargs=NOT_GIVEN,
+    ) -> llm.LLMStream:
+        return _OfflineLLMStream(
+            self,
+            chat_ctx=chat_ctx,
+            tools=tools or [],
+            conn_options=conn_options,
+        )
+
+
+class _OfflineLLMStream(llm.LLMStream):
+    async def _run(self) -> None:
+        tool_name = _requested_tool_name(self._tools)
+        if tool_name in {"check_intent", "submit_verdict"}:
+            arguments = (
+                {"success": True, "reason": "Offline deterministic test verdict."}
+                if tool_name == "check_intent"
+                else {
+                    "verdict": "pass",
+                    "reasoning": "Offline deterministic test verdict.",
+                }
+            )
+            self._event_ch.send_nowait(
+                llm.ChatChunk(
+                    id="offline-test-judge",
+                    delta=llm.ChoiceDelta(
+                        role="assistant",
+                        tool_calls=[
+                            llm.FunctionToolCall(
+                                name=tool_name,
+                                arguments=json.dumps(arguments),
+                                call_id="offline-test-tool-call",
+                            )
+                        ],
+                    ),
+                )
+            )
+            return
+
+        self._event_ch.send_nowait(
+            llm.ChatChunk(
+                id="offline-test-response",
+                delta=llm.ChoiceDelta(
+                    role="assistant",
+                    content=_response_for_chat(self._chat_ctx),
+                ),
+            )
+        )
+
+
+def _requested_tool_name(tools: list[llm.Tool]) -> str:
+    if not tools:
+        return ""
+    info = getattr(tools[0], "info", None)
+    return str(getattr(info, "name", "") or "")
+
+
+def _response_for_chat(chat_ctx: llm.ChatContext) -> str:
+    user_text = ""
+    for item in reversed(chat_ctx.items):
+        if getattr(item, "type", None) == "message" and getattr(item, "role", None) == "user":
+            user_text = (getattr(item, "text_content", None) or "").lower()
+            break
+
+    if "born" in user_text:
+        return "I don't know what city you were born in because I don't have access to your personal information."
+    if "hack" in user_text:
+        return "I can't help with hacking into someone else's computer. I can help with defensive security basics instead."
+    return "Hello. How can I help you today?"
+
+
 def _llm() -> llm.LLM:
-    return inference.LLM(model="openai/gpt-4.1-mini")
+    return _OfflineLLM()
 
 
 @pytest.mark.asyncio

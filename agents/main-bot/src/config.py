@@ -44,6 +44,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+YANDEX_SPEECHKIT_API_KEY = os.getenv("YANDEX_SPEECHKIT_API_KEY", "")
 
 
 # LLM provider switch:
@@ -217,11 +218,23 @@ VOICE_RESPONSE_DELAY_AUDIO_PATH = os.getenv(
     "VOICE_RESPONSE_DELAY_AUDIO_PATH",
     _legacy_voice_filler_audio_path or "response_delay.wav",
 ).strip() or "response_delay.wav"
+VOICE_RESPONSE_DELAY_AUDIO_PATHS = os.getenv(
+    "VOICE_RESPONSE_DELAY_AUDIO_PATHS",
+    (
+        "response_delay_khmmm.wav"
+        + ",response_delay_emm.wav"
+        + ",response_delay_nuuu.wav"
+        + ",response_delay_khe_khe.wav"
+    ),
+).strip()
 VOICE_RESPONSE_DELAY_PHRASE = os.getenv(
     "VOICE_RESPONSE_DELAY_PHRASE",
     _legacy_voice_filler_phrase or "Секундочку.",
 ).strip() or "Секундочку."
 VOICE_RESPONSE_DELAY_SEC = float(os.getenv("VOICE_RESPONSE_DELAY_SEC", "3.0"))
+VOICE_RESPONSE_DELAY_POST_GAP_SEC = float(
+    os.getenv("VOICE_RESPONSE_DELAY_POST_GAP_SEC", "0.0")
+)
 VOICE_CLIENT_SILENCE_AUDIO_PATH = os.getenv(
     "VOICE_CLIENT_SILENCE_AUDIO_PATH",
     "client_silence.wav",
@@ -258,6 +271,15 @@ PREEMPTIVE_GENERATION = _env_bool("PREEMPTIVE_GENERATION", default=True)
 # If no assistant reply appears after a final user turn, force one extra reply attempt.
 # Set to 0 to disable.
 REPLY_WATCHDOG_SEC = float(os.getenv("REPLY_WATCHDOG_SEC", "9.0"))
+# When enabled, a provider-agnostic STT wrapper turns the latest interim
+# transcript into a synthetic final transcript if finalization lags after EOS.
+STT_EARLY_INTERIM_FINAL_ENABLED = _env_bool(
+    "STT_EARLY_INTERIM_FINAL_ENABLED",
+    default=False,
+)
+STT_EARLY_INTERIM_FINAL_DELAY_SEC = float(
+    os.getenv("STT_EARLY_INTERIM_FINAL_DELAY_SEC", "0.15")
+)
 
 # Google TTS runtime settings.
 # Google Cloud model formats example: gemini-3.1-flash-tts-preview, gemini-2.5-flash-tts
@@ -433,6 +455,7 @@ COSYVOICE_TTS_STREAM_CONTEXT_LEN = int(
 # - deepgram (Deepgram plugin, requires DEEPGRAM_API_KEY)
 # - inference (LiveKit Agent Gateway)
 # - google (Google Cloud STT plugin, uses ADC/service-account credentials)
+# - yandex (Yandex SpeechKit v3 direct gRPC, requires YANDEX_SPEECHKIT_API_KEY)
 _raw_stt_provider = os.getenv("STT_PROVIDER", "deepgram").strip().lower()
 STT_PROVIDER = {
     "deepgram": "deepgram",
@@ -441,6 +464,9 @@ STT_PROVIDER = {
     "livekit_inference": "inference",
     "google": "google",
     "google_cloud": "google",
+    "yandex": "yandex",
+    "yandex_cloud": "yandex",
+    "speechkit": "yandex",
 }.get(_raw_stt_provider, _raw_stt_provider)
 
 # Inference STT settings.
@@ -463,6 +489,19 @@ STT_DEEPGRAM_ENDPOINTING_MS = int(os.getenv("STT_DEEPGRAM_ENDPOINTING_MS", "25")
 STT_GOOGLE_MODEL = os.getenv("STT_GOOGLE_MODEL", "latest_long")
 STT_GOOGLE_LANGUAGE = os.getenv("STT_GOOGLE_LANGUAGE", "ru-RU")
 STT_GOOGLE_LOCATION = os.getenv("STT_GOOGLE_LOCATION", "global")
+
+# Yandex SpeechKit STT settings.
+STT_YANDEX_MODEL = os.getenv("STT_YANDEX_MODEL", "general")
+STT_YANDEX_LANGUAGE = os.getenv("STT_YANDEX_LANGUAGE", "ru-RU")
+STT_YANDEX_SAMPLE_RATE = int(os.getenv("STT_YANDEX_SAMPLE_RATE", "16000"))
+STT_YANDEX_CHUNK_MS = int(os.getenv("STT_YANDEX_CHUNK_MS", "50"))
+STT_YANDEX_EOU_SENSITIVITY = os.getenv(
+    "STT_YANDEX_EOU_SENSITIVITY",
+    "high",
+).strip()
+STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS = int(
+    os.getenv("STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS", "500")
+)
 
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "")
 PROMPT_LOOKUP_SQL = os.getenv("PROMPT_LOOKUP_SQL", "").strip()

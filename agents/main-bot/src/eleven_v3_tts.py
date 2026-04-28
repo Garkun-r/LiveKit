@@ -56,6 +56,9 @@ _SPEAKER_TAG_PREFIX_RE = re.compile(
     r")+",
     flags=re.IGNORECASE,
 )
+_BRACKETED_TAG_RE = re.compile(r"\[[^\]]+\]|<[^>]+>")
+_MULTISPACE_RE = re.compile(r"\s+")
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([\.,!?:;…])")
 _STRONG_SENTENCE_END_RE = re.compile(r"[.!?…]\s*$")
 _TRAILING_SOFT_PUNCT_RE = re.compile(r"[\s\.,!?:;…\-—]+$")
 _SHORT_CONFIRMATIONS = {
@@ -97,6 +100,12 @@ def _strip_nones(data: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in data.items() if is_given(v) and v is not None}
 
 
+def _strip_bracketed_tags(text: str) -> str:
+    text = _BRACKETED_TAG_RE.sub(" ", text)
+    text = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", text)
+    return _MULTISPACE_RE.sub(" ", text).strip()
+
+
 def _sanitize_outbound_text_segment(text: str) -> tuple[str, str | None]:
     """Return trimmed text + skip reason when segment is unsafe for Eleven input."""
     trimmed = (text or "").strip()
@@ -107,6 +116,11 @@ def _sanitize_outbound_text_segment(text: str) -> tuple[str, str | None]:
     if not probe:
         return "", "empty_after_speaker_tag_strip"
 
+    sanitized = _strip_bracketed_tags(probe)
+    probe = sanitized
+    if not probe:
+        return "", "empty_after_bracket_tag_strip"
+
     probe = _EMOJI_RE.sub("", probe).strip()
     if not probe:
         return "", "empty_after_emoji_strip"
@@ -114,7 +128,7 @@ def _sanitize_outbound_text_segment(text: str) -> tuple[str, str | None]:
     if not any(char.isalnum() for char in probe):
         return "", "punctuation_only"
 
-    return trimmed, None
+    return sanitized, None
 
 
 def _is_short_confirmation(text: str) -> bool:

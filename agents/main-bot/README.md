@@ -217,6 +217,7 @@ To switch STT provider, set `STT_PROVIDER`:
 1. `STT_PROVIDER=deepgram` - Deepgram plugin STT (default, requires `DEEPGRAM_API_KEY`).
 2. `STT_PROVIDER=inference` - LiveKit Agent Gateway STT.
 3. `STT_PROVIDER=google` - Google Cloud STT plugin (uses Google credentials).
+4. `STT_PROVIDER=yandex` - Yandex SpeechKit v3 direct gRPC STT (requires `YANDEX_SPEECHKIT_API_KEY`).
 
 If you see `429 Too Many Requests` from `agent-gateway.livekit.cloud` for STT, either:
 
@@ -281,6 +282,19 @@ STT_GOOGLE_LANGUAGE=ru-RU
 STT_GOOGLE_LOCATION=global
 ```
 
+Yandex SpeechKit STT example:
+
+```console
+STT_PROVIDER=yandex
+YANDEX_SPEECHKIT_API_KEY=<your_yandex_speechkit_api_key>
+STT_YANDEX_MODEL=general
+STT_YANDEX_LANGUAGE=ru-RU
+STT_YANDEX_SAMPLE_RATE=16000
+STT_YANDEX_CHUNK_MS=50
+STT_YANDEX_EOU_SENSITIVITY=high
+STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS=500
+```
+
 If this model is rejected by current API in your region/project, the agent auto-falls back to `GOOGLE_TTS_FALLBACK_MODEL` (default: `gemini-2.5-flash-tts`).
 
 If needed, provide Google credentials via `GOOGLE_TTS_CREDENTIALS_FILE` (or `GOOGLE_APPLICATION_CREDENTIALS`).
@@ -315,6 +329,23 @@ TURN_ENDPOINTING_MODE=dynamic
 PREEMPTIVE_GENERATION=true
 REPLY_WATCHDOG_SEC=9.0
 ```
+
+`TURN_DETECTION_MODE=vad` detects the end of speech, but LiveKit still needs a
+final STT transcript to commit the user turn. If a streaming STT provider sends
+a good interim transcript and delays the final flag, enable the universal early
+interim final wrapper:
+
+```console
+STT_EARLY_INTERIM_FINAL_ENABLED=true
+STT_EARLY_INTERIM_FINAL_DELAY_SEC=0.15
+```
+
+This wrapper is provider-agnostic and is applied after the selected STT or STT
+fallback chain. It only activates for streaming STT providers that support
+interim transcripts and with `TURN_DETECTION_MODE=vad`. It emits the latest
+interim transcript as a synthetic final transcript after `END_OF_SPEECH` waits
+for the configured delay. Keep it opt-in because a synthetic final can be
+slightly less accurate than a late provider final.
 
 To make cloud updates seamless, keep secrets sync + deploy in one flow:
 

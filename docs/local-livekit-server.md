@@ -118,6 +118,20 @@ Squid принимает только Asterisk-сервер `87.226.145.66/32`, 
 SSH tunnel на `127.0.0.1:15001` сохранен только как rollback и не должен быть
 основным маршрутом.
 
+Для снижения задержки на STT final-флаге можно включить универсальный wrapper,
+который после `END_OF_SPEECH` ждет final transcript ограниченное время и затем
+коммитит последний interim как synthetic final:
+
+```console
+STT_EARLY_INTERIM_FINAL_ENABLED=true
+STT_EARLY_INTERIM_FINAL_DELAY_SEC=0.15
+```
+
+Wrapper не привязан к Deepgram: он ставится поверх итогового STT provider или
+`FallbackAdapter`, но включается только для streaming STT с interim results и
+`TURN_DETECTION_MODE=vad`. После включения проверяйте `transcription_delay`,
+`end_of_turn_delay` и отсутствие дублей пользовательских сообщений в n8n payload.
+
 ## Check Current State
 
 Asterisk/local LiveKit:
