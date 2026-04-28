@@ -63,6 +63,36 @@ async def test_do_http_stream_skips_invalid_segment_before_http() -> None:
     assert q.empty()
 
 
+def test_connection_reused_hint_tracks_provider_http_requests() -> None:
+    tts_obj = ElevenV3HTTPStreamTTS(api_key="test-api-key", voice_id="voice")
+
+    assert tts_obj._connection_reused_hint() is False
+    assert tts_obj._connection_reused_hint() is True
+    assert tts_obj._connection_reused_hint() is True
+
+
+@pytest.mark.asyncio
+async def test_warmup_synthesis_hits_stream_endpoint_and_discards_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    async def _fake_do_http_stream(**kwargs):
+        calls.append(kwargs)
+        kwargs["on_chunk"].push(b"discarded-audio")
+
+    monkeypatch.setattr(eleven_v3_tts, "_do_http_stream", _fake_do_http_stream)
+
+    tts_obj = ElevenV3HTTPStreamTTS(api_key="test-api-key", voice_id="voice")
+    await tts_obj.warmup_synthesis(text="Да.")
+
+    assert len(calls) == 1
+    assert calls[0]["tts_provider"] is tts_obj
+    assert calls[0]["text"] == "Да."
+    assert calls[0]["prev_text"] == ""
+    assert not isinstance(calls[0]["on_chunk"], asyncio.Queue)
+
+
 @dataclass
 class _Sentence:
     token: str

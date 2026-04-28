@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass, replace
-from typing import AsyncGenerator
 
 from google import genai
 from google.genai import types
@@ -13,12 +12,16 @@ from livekit.agents import (
     APIConnectionError,
     APIStatusError,
     APITimeoutError,
-    tts,
     tokenize,
+    tts,
     utils,
 )
-from livekit.agents.types import APIConnectOptions, NOT_GIVEN, NotGivenOr
-from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
+from livekit.agents.types import (
+    DEFAULT_API_CONNECT_OPTIONS,
+    NOT_GIVEN,
+    APIConnectOptions,
+    NotGivenOr,
+)
 from livekit.agents.utils import is_given
 
 DEFAULT_MODEL = "gemini-3.1-flash-tts-preview"
@@ -34,6 +37,7 @@ class _VertexGeminiTTSOptions:
     prompt: str | None
     project: str
     location: str
+    http_proxy: str | None
     tokenizer: tokenize.SentenceTokenizer
 
 
@@ -43,13 +47,20 @@ def _project_from_credentials_file() -> str | None:
         return None
 
     try:
-        with open(creds_path, "r", encoding="utf-8") as f:
+        with open(creds_path, encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         return None
 
     project = data.get("project_id")
     return str(project).strip() if project else None
+
+
+def _httpx_client_args(http_proxy: str | None) -> dict[str, object]:
+    args: dict[str, object] = {"trust_env": False}
+    if http_proxy:
+        args["proxy"] = http_proxy
+    return args
 
 
 def _iter_audio_bytes_from_chunk(chunk: types.GenerateContentResponse):
@@ -77,6 +88,7 @@ class VertexGeminiTTS(tts.TTS):
         prompt: NotGivenOr[str] = NOT_GIVEN,
         project: NotGivenOr[str] = NOT_GIVEN,
         location: str = DEFAULT_LOCATION,
+        http_proxy: str | None = None,
         tokenizer_obj: NotGivenOr[tokenize.SentenceTokenizer] = NOT_GIVEN,
     ) -> None:
         super().__init__(
@@ -111,6 +123,7 @@ class VertexGeminiTTS(tts.TTS):
             prompt=prompt if is_given(prompt) else None,
             project=resolved_project,
             location=location,
+            http_proxy=http_proxy,
             tokenizer=tokenizer_obj,
         )
 
@@ -123,6 +136,10 @@ class VertexGeminiTTS(tts.TTS):
             vertexai=True,
             project=resolved_project,
             location=location,
+            http_options=types.HttpOptions(
+                client_args=_httpx_client_args(http_proxy),
+                async_client_args=_httpx_client_args(http_proxy),
+            ),
         )
 
     @property

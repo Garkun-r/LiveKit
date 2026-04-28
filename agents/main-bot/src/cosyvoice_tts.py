@@ -56,6 +56,7 @@ class _CosyVoiceOptions:
     volume: int
     connection_reuse: bool
     playback_on_first_chunk: bool
+    http_proxy: str | None
     tokenizer: tokenize.SentenceTokenizer
 
 
@@ -145,6 +146,7 @@ class CosyVoiceTTS(tts.TTS):
         volume: int = DEFAULT_VOLUME,
         connection_reuse: bool = True,
         playback_on_first_chunk: bool = True,
+        http_proxy: str | None = None,
         tokenizer_obj: NotGivenOr[tokenize.SentenceTokenizer] = NOT_GIVEN,
     ) -> None:
         if not api_key.strip():
@@ -201,6 +203,7 @@ class CosyVoiceTTS(tts.TTS):
             volume=int(volume),
             connection_reuse=bool(connection_reuse),
             playback_on_first_chunk=bool(playback_on_first_chunk),
+            http_proxy=http_proxy,
             tokenizer=tokenizer_obj,
         )
 
@@ -255,6 +258,7 @@ class CosyVoiceTTS(tts.TTS):
                 ping_timeout=20,
                 close_timeout=5,
                 max_size=None,
+                proxy=self._opts.http_proxy,
             )
         except Exception as e:
             raise APIConnectionError(

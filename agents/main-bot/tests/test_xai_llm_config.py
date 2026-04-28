@@ -56,6 +56,21 @@ def test_xai_tools_disabled_by_default(monkeypatch) -> None:
     assert tool_choice is NOT_GIVEN
 
 
+def test_xai_provider_identity_disables_tools(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "XAI_ENABLE_TOOLS", False)
+    assistant = agent.Assistant()
+    configured_tools = [object()]
+
+    resolved_tools, tool_choice = assistant._resolve_tools_for_llm_call(
+        tools=configured_tools,
+        model_settings=_ModelSettings("auto"),
+        llm_provider="api.x.ai",
+    )
+
+    assert resolved_tools == []
+    assert tool_choice is NOT_GIVEN
+
+
 def test_xai_tools_can_be_enabled(monkeypatch) -> None:
     monkeypatch.setattr(agent, "LLM_PROVIDER", "xai")
     monkeypatch.setattr(agent, "XAI_ENABLE_TOOLS", True)

@@ -168,6 +168,7 @@ class ElevenV3HTTPStreamTTS(tts.TTS):
         merge_hold_ms: int = 140,
         max_merged_text_len: int = 80,
         http_session: aiohttp.ClientSession | None = None,
+        http_proxy: str | None = None,
     ) -> None:
         if not is_given(output_format):
             output_format = _DEFAULT_ENCODING
@@ -234,6 +235,9 @@ class ElevenV3HTTPStreamTTS(tts.TTS):
             max_merged_text_len=max(1, int(max_merged_text_len)),
         )
         self._session = http_session
+        self._http_proxy = http_proxy
+        self._owns_session = False
+        self._http_request_count = 0
         self._streams = weakref.WeakSet[ElevenV3HTTPStreamSynthesizeStream]()
 
     @property
@@ -246,8 +250,40 @@ class ElevenV3HTTPStreamTTS(tts.TTS):
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         if not self._session:
-            self._session = utils.http_context.http_session()
+            if self._http_proxy:
+                connector = aiohttp.TCPConnector(
+                    limit_per_host=50,
+                    keepalive_timeout=120,
+                )
+                self._session = aiohttp.ClientSession(
+                    proxy=self._http_proxy,
+                    connector=connector,
+                )
+                self._owns_session = True
+            else:
+                self._session = utils.http_context.http_session()
         return self._session
+
+    def _connection_reused_hint(self) -> bool:
+        reused = self._http_request_count > 0
+        self._http_request_count += 1
+        return reused
+
+    async def warmup_synthesis(self, text: str = "Да.") -> None:
+        """Warm the actual ElevenLabs streaming endpoint and discard audio bytes."""
+
+        class _DiscardAudio:
+            def push(self, _: bytes) -> None:
+                return
+
+        await _do_http_stream(
+            tts_provider=self,
+            opts=replace(self._opts),
+            text=text,
+            prev_text="",
+            conn_options=DEFAULT_API_CONNECT_OPTIONS,
+            on_chunk=_DiscardAudio(),
+        )
 
     def synthesize(
         self,
@@ -274,6 +310,10 @@ class ElevenV3HTTPStreamTTS(tts.TTS):
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
+        if self._owns_session and self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+            self._owns_session = False
 
 
 class ElevenV3HTTPChunkedStream(tts.ChunkedStream):
@@ -303,6 +343,7 @@ class ElevenV3HTTPChunkedStream(tts.ChunkedStream):
             prev_text="",
             conn_options=self._conn_options,
             output_emitter=output_emitter,
+            metrics_owner=self,
         )
         output_emitter.flush()
 
@@ -402,6 +443,7 @@ class ElevenV3HTTPStreamSynthesizeStream(tts.SynthesizeStream):
                     prev_text=prev_text,
                     conn_options=self._conn_options,
                     audio_q=audio_q,
+                    metrics_owner=self,
                 )
             except asyncio.CancelledError:
                 raise
@@ -635,6 +677,7 @@ async def _do_http_stream(
     prev_text: str,
     conn_options: APIConnectOptions,
     on_chunk: Any,  # tts.AudioEmitter | asyncio.Queue[bytes | None]
+    metrics_owner: Any | None = None,
 ) -> None:
     """Execute one ElevenLabs streaming request and route bytes to *on_chunk*.
 
@@ -663,6 +706,12 @@ async def _do_http_stream(
     is_pcm = opts.output_format.startswith("pcm")
     is_queue = isinstance(on_chunk, asyncio.Queue)
     pcm_tail = b""
+    connection_reused_hint = tts_provider._connection_reused_hint()
+    if metrics_owner is not None:
+        metrics_owner._connection_reused = (
+            getattr(metrics_owner, "_connection_reused", False)
+            or connection_reused_hint
+        )
 
     timeout = aiohttp.ClientTimeout(
         total=None,
@@ -710,12 +759,14 @@ async def _do_http_stream(
 
                 if first_chunk_at is None:
                     first_chunk_at = time.perf_counter()
-                    logger.debug(
+                    logger.info(
                         "eleven_v3 first audio chunk",
                         extra={
                             "ttfb_ms": round((first_chunk_at - t0) * 1000, 1),
                             "text_len": len(text),
                             "model": opts.model_id,
+                            "proxy_enabled": bool(tts_provider._http_proxy),
+                            "connection_reused_hint": connection_reused_hint,
                         },
                     )
 
@@ -765,7 +816,7 @@ async def _do_http_stream(
             f"eleven_v3 HTTP stream request failed: {exc}"
         ) from exc
     finally:
-        logger.debug(
+        logger.info(
             "eleven_v3 HTTP stream request finished",
             extra={
                 "model": opts.model_id,
@@ -779,6 +830,8 @@ async def _do_http_stream(
                 "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
                 "chunk_count": chunk_count,
                 "audio_bytes": total_bytes,
+                "proxy_enabled": bool(tts_provider._http_proxy),
+                "connection_reused_hint": connection_reused_hint,
             },
         )
 
@@ -791,6 +844,7 @@ async def _stream_to_emitter(
     prev_text: str,
     conn_options: APIConnectOptions,
     output_emitter: tts.AudioEmitter,
+    metrics_owner: Any | None = None,
 ) -> None:
     await _do_http_stream(
         tts_provider=tts_provider,
@@ -799,6 +853,7 @@ async def _stream_to_emitter(
         prev_text=prev_text,
         conn_options=conn_options,
         on_chunk=output_emitter,
+        metrics_owner=metrics_owner,
     )
 
 
@@ -810,6 +865,7 @@ async def _stream_to_queue(
     prev_text: str,
     conn_options: APIConnectOptions,
     audio_q: asyncio.Queue,
+    metrics_owner: Any | None = None,
 ) -> None:
     await _do_http_stream(
         tts_provider=tts_provider,
@@ -818,6 +874,7 @@ async def _stream_to_queue(
         prev_text=prev_text,
         conn_options=conn_options,
         on_chunk=audio_q,
+        metrics_owner=metrics_owner,
     )
 
 

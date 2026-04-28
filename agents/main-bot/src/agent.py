@@ -19,6 +19,7 @@ from google.auth import (
     load_credentials_from_file as google_auth_load_credentials_from_file,
 )
 from google.cloud import texttospeech_v1 as texttospeech
+from google.genai import Client as GenAIClient
 from google.genai import types as genai_types
 from livekit import rtc
 from livekit.agents import (
@@ -52,7 +53,6 @@ from livekit.plugins import (
     elevenlabs,
     google,
     minimax,
-    noise_cancellation,
     silero,
     xai,
 )
@@ -60,7 +60,12 @@ from livekit.plugins.minimax import tts as minimax_tts_plugin
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from config import (
+    AGENT_HEALTH_HOST,
+    AGENT_HEALTH_PORT,
+    AGENT_MAX_CONCURRENT_JOBS,
     AGENT_NAME,
+    AGENT_NUM_IDLE_PROCESSES,
+    AUDIO_INPUT_ENHANCEMENT,
     COMPLEX_LLM_BACKUP_MODEL,
     COMPLEX_LLM_BACKUP_PROVIDER,
     COMPLEX_LLM_PROVIDER,
@@ -128,6 +133,7 @@ from config import (
     GOOGLE_TTS_STREAM_CONTEXT_LEN,
     GOOGLE_TTS_USE_STREAMING,
     GOOGLE_TTS_VOICE_NAME,
+    LIVEKIT_SELF_HOSTED,
     LLM_ATTEMPT_TIMEOUT_SEC,
     LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
     LLM_FIRST_TOKEN_TIMEOUT_SEC,
@@ -191,6 +197,13 @@ from config import (
     XAI_TEMPERATURE,
 )
 from cosyvoice_tts import CosyVoiceTTS
+from egress import (
+    aiohttp_proxy,
+    httpx_client_args,
+    provider_egress,
+    provider_egress_env,
+    provider_proxy_url,
+)
 from eleven_v3_tts import ElevenV3TTS
 from prompt_repo import PromptResolution, get_active_prompt, resolve_prompt_for_call
 from routing.model_router import ModelRouter, ModelRouteResult, coerce_optional_bool
@@ -761,8 +774,29 @@ async def warmup_llm_transport(llm_client: Any, *, label: str) -> None:
         return
 
 
+def create_external_aiohttp_session(
+    provider: str,
+    owned_sessions: list[aiohttp.ClientSession] | None = None,
+) -> aiohttp.ClientSession | None:
+    proxy_url = aiohttp_proxy(provider)
+    if not proxy_url:
+        return None
+
+    connector = aiohttp.TCPConnector(
+        limit_per_host=50,
+        keepalive_timeout=120,
+    )
+    session = aiohttp.ClientSession(
+        proxy=proxy_url,
+        connector=connector,
+    )
+    if owned_sessions is not None:
+        owned_sessions.append(session)
+    return session
+
+
 async def warmup_tts_transport(tts_client: Any) -> None:
-    """Warm up TTS HTTP transport via ElevenLabs metadata call (no synthesis)."""
+    """Warm up TTS transport before the first user turn."""
     if not isinstance(tts_client, ElevenV3TTS):
         return
 
@@ -778,6 +812,23 @@ async def warmup_tts_transport(tts_client: Any) -> None:
 
     started_at = asyncio.get_running_loop().time()
     try:
+        warmup_synthesis = getattr(tts_client, "warmup_synthesis", None)
+        if callable(warmup_synthesis):
+            await asyncio.wait_for(
+                warmup_synthesis(),
+                timeout=_WARMUP_REQUEST_TIMEOUT_SEC,
+            )
+            elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000
+            logger.info(
+                "tts synthesis warmup completed",
+                extra={
+                    "provider": "elevenlabs",
+                    "voice_id": voice_id,
+                    "elapsed_ms": round(elapsed_ms, 1),
+                },
+            )
+            return
+
         session = tts_client._ensure_session()
         warmup_url = f"{base_url}/voices/{voice_id}"
         timeout = aiohttp.ClientTimeout(
@@ -946,6 +997,19 @@ def _gemini_http_timeout_ms() -> int:
     return int(timeout_sec * 1000)
 
 
+def _genai_http_options(
+    provider: str, *, timeout_ms: int | None = None
+) -> genai_types.HttpOptions:
+    client_args = httpx_client_args(provider)
+    options: dict[str, Any] = {
+        "client_args": client_args,
+        "async_client_args": client_args,
+    }
+    if timeout_ms is not None:
+        options["timeout"] = timeout_ms
+    return genai_types.HttpOptions(**options)
+
+
 def build_google_llm(model_name: str | None = None) -> google.LLM:
     if not GOOGLE_API_KEY:
         raise RuntimeError("GOOGLE_API_KEY is not set. Configure it in .env.local")
@@ -958,19 +1022,34 @@ def build_google_llm(model_name: str | None = None) -> google.LLM:
             "model": resolved_model,
             "temperature": GEMINI_TEMPERATURE,
             "http_timeout_sec": max(GEMINI_HTTP_TIMEOUT_SEC, 10.0),
+            "egress": provider_egress("gemini"),
         },
     )
 
-    # Direct Gemini API configuration (not LiveKit Inference).
-    return google.LLM(
+    http_options = _genai_http_options(
+        "gemini",
+        timeout_ms=_gemini_http_timeout_ms(),
+    )
+
+    # Direct Gemini API configuration (not LiveKit Inference). LiveKit's Google
+    # LLM currently stores per-call http_options but constructs google.genai.Client
+    # without them, so replace the client to enforce the per-provider egress route.
+    llm = google.LLM(
         model=resolved_model,
         api_key=GOOGLE_API_KEY,
+        vertexai=False,
         temperature=GEMINI_TEMPERATURE,
         max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
         top_p=GEMINI_TOP_P,
         thinking_config={"thinking_level": GEMINI_THINKING_LEVEL},
-        http_options=genai_types.HttpOptions(timeout=_gemini_http_timeout_ms()),
+        http_options=http_options,
     )
+    llm._client = GenAIClient(
+        api_key=GOOGLE_API_KEY,
+        vertexai=False,
+        http_options=http_options,
+    )
+    return llm
 
 
 def build_xai_llm(model_name: str | None = None) -> xai.responses.LLM:
@@ -986,15 +1065,17 @@ def build_xai_llm(model_name: str | None = None) -> xai.responses.LLM:
             "model": resolved_model,
             "temperature": XAI_TEMPERATURE,
             "base_url": XAI_BASE_URL or "https://api.x.ai/v1",
+            "egress": provider_egress("xai"),
         },
     )
 
-    return xai.responses.LLM(
-        model=resolved_model,
-        api_key=XAI_API_KEY,
-        base_url=base_url,
-        temperature=XAI_TEMPERATURE,
-    )
+    with provider_egress_env("xai"):
+        return xai.responses.LLM(
+            model=resolved_model,
+            api_key=XAI_API_KEY,
+            base_url=base_url,
+            temperature=XAI_TEMPERATURE,
+        )
 
 
 def build_llm(model_name: str | None = None) -> Any:
@@ -1231,6 +1312,7 @@ def build_elevenlabs_tts() -> Any:
                 "merge_hold_ms": max(0, ELEVENLABS_V3_MERGE_HOLD_MS),
                 "max_merged_text_len": max(1, ELEVENLABS_V3_MAX_MERGED_TEXT_LEN),
                 "optimize_streaming_latency": ELEVENLABS_V3_OPTIMIZE_STREAMING_LATENCY,
+                "egress": provider_egress("elevenlabs"),
             },
         )
         return ElevenV3TTS(
@@ -1250,18 +1332,23 @@ def build_elevenlabs_tts() -> Any:
             min_http_text_len=max(1, ELEVENLABS_V3_MIN_HTTP_TEXT_LEN),
             merge_hold_ms=max(0, ELEVENLABS_V3_MERGE_HOLD_MS),
             max_merged_text_len=max(1, ELEVENLABS_V3_MAX_MERGED_TEXT_LEN),
+            http_proxy=provider_proxy_url("elevenlabs"),
             tokenizer=tokenize.blingfire.SentenceTokenizer(
                 min_sentence_len=max(2, ELEVENLABS_V3_MIN_SENTENCE_LEN),
                 stream_context_len=max(1, ELEVENLABS_V3_STREAM_CONTEXT_LEN),
             ),
         )
 
-    logger.info("using ElevenLabs TTS provider", extra={"model": resolved_model})
-    return elevenlabs.TTS(
-        voice_id=ELEVENLABS_VOICE_ID,
-        model=resolved_model,
-        voice_settings=voice_settings,
+    logger.info(
+        "using ElevenLabs TTS provider",
+        extra={"model": resolved_model, "egress": provider_egress("elevenlabs")},
     )
+    with provider_egress_env("elevenlabs"):
+        return elevenlabs.TTS(
+            voice_id=ELEVENLABS_VOICE_ID,
+            model=resolved_model,
+            voice_settings=voice_settings,
+        )
 
 
 def _resolve_google_tts_credentials_file() -> str:
@@ -1338,7 +1425,9 @@ def _google_tts_credentials_available() -> bool:
         return False
 
 
-def build_tts() -> Any:
+def build_tts(
+    external_http_sessions: list[aiohttp.ClientSession] | None = None,
+) -> Any:
     if TTS_PROVIDER not in {"google", "vertex", "minimax", "cosyvoice", "elevenlabs"}:
         logger.warning(
             "Unknown TTS_PROVIDER='%s'. Falling back to ElevenLabs.",
@@ -1374,6 +1463,7 @@ def build_tts() -> Any:
                 "playback_on_first_chunk": COSYVOICE_TTS_PLAYBACK_ON_FIRST_CHUNK,
                 "min_sentence_len": max(2, COSYVOICE_TTS_MIN_SENTENCE_LEN),
                 "stream_context_len": max(1, COSYVOICE_TTS_STREAM_CONTEXT_LEN),
+                "egress": provider_egress("cosyvoice"),
             },
         )
         return CosyVoiceTTS(
@@ -1392,6 +1482,7 @@ def build_tts() -> Any:
             volume=COSYVOICE_TTS_VOLUME,
             connection_reuse=COSYVOICE_TTS_CONNECTION_REUSE,
             playback_on_first_chunk=COSYVOICE_TTS_PLAYBACK_ON_FIRST_CHUNK,
+            http_proxy=provider_proxy_url("cosyvoice"),
             tokenizer_obj=tokenize.blingfire.SentenceTokenizer(
                 min_sentence_len=max(2, COSYVOICE_TTS_MIN_SENTENCE_LEN),
                 stream_context_len=max(1, COSYVOICE_TTS_STREAM_CONTEXT_LEN),
@@ -1419,6 +1510,7 @@ def build_tts() -> Any:
                 "location": GOOGLE_TTS_LOCATION,
                 "min_sentence_len": max(2, VERTEX_TTS_MIN_SENTENCE_LEN),
                 "stream_context_len": max(1, VERTEX_TTS_STREAM_CONTEXT_LEN),
+                "egress": provider_egress("vertex_tts"),
             },
         )
         return VertexGeminiTTS(
@@ -1426,6 +1518,7 @@ def build_tts() -> Any:
             voice_name=GOOGLE_TTS_VOICE_NAME or "Zephyr",
             prompt=GOOGLE_TTS_PROMPT,
             location=GOOGLE_TTS_LOCATION,
+            http_proxy=provider_proxy_url("vertex_tts"),
             tokenizer_obj=tokenize.blingfire.SentenceTokenizer(
                 min_sentence_len=max(2, VERTEX_TTS_MIN_SENTENCE_LEN),
                 stream_context_len=max(1, VERTEX_TTS_STREAM_CONTEXT_LEN),
@@ -1512,9 +1605,11 @@ def build_tts() -> Any:
                 "location": GOOGLE_TTS_LOCATION,
                 "min_sentence_len": max(2, GOOGLE_TTS_MIN_SENTENCE_LEN),
                 "stream_context_len": max(1, GOOGLE_TTS_STREAM_CONTEXT_LEN),
+                "egress": provider_egress("google_tts"),
             },
         )
-        return google.TTS(**tts_kwargs)
+        with provider_egress_env("google_tts"):
+            return google.TTS(**tts_kwargs)
 
     if TTS_PROVIDER == "minimax":
         if not MINIMAX_API_KEY.strip():
@@ -1535,6 +1630,7 @@ def build_tts() -> Any:
                 "timbre": MINIMAX_TTS_TIMBRE,
                 "sound_effects": MINIMAX_TTS_SOUND_EFFECTS or None,
                 "streaming": True,
+                "egress": provider_egress("minimax"),
             },
         )
         return minimax.TTS(
@@ -1557,12 +1653,18 @@ def build_tts() -> Any:
             text_pacing=False,
             api_key=MINIMAX_API_KEY,
             base_url=MINIMAX_TTS_BASE_URL,
+            http_session=create_external_aiohttp_session(
+                "minimax",
+                external_http_sessions,
+            ),
         )
 
     return build_elevenlabs_tts()
 
 
-def build_stt() -> Any:
+def build_stt(
+    external_http_sessions: list[aiohttp.ClientSession] | None = None,
+) -> Any:
     def _build_google_stt_or_none(*, log_prefix: str) -> Any | None:
         resolved_creds_file = _resolve_google_tts_credentials_file()
         if not _google_tts_credentials_available():
@@ -1587,16 +1689,18 @@ def build_stt() -> Any:
         if resolved_creds_file:
             stt_kwargs["credentials_file"] = resolved_creds_file
 
-        return google.STT(**stt_kwargs)
+        with provider_egress_env("google_stt"):
+            return google.STT(**stt_kwargs)
 
     # Default path: LiveKit inference STT.
     if STT_PROVIDER == "inference":
-        stt_instances: list[Any] = [
-            inference.STT(
-                model=STT_INFERENCE_MODEL,
-                language=STT_INFERENCE_LANGUAGE,
-            )
-        ]
+        with provider_egress_env("livekit_inference"):
+            stt_instances: list[Any] = [
+                inference.STT(
+                    model=STT_INFERENCE_MODEL,
+                    language=STT_INFERENCE_LANGUAGE,
+                )
+            ]
         fallback_descriptions = [STT_INFERENCE_MODEL]
 
         if STT_INFERENCE_INCLUDE_GOOGLE_FALLBACK:
@@ -1667,6 +1771,7 @@ def build_stt() -> Any:
                 "model": STT_GOOGLE_MODEL,
                 "language": STT_GOOGLE_LANGUAGE,
                 "location": STT_GOOGLE_LOCATION,
+                "egress": provider_egress("google_stt"),
             },
         )
         if len(stt_instances) == 1:
@@ -1701,12 +1806,17 @@ def build_stt() -> Any:
             extra={
                 "model": STT_DEEPGRAM_MODEL,
                 "language": STT_DEEPGRAM_LANGUAGE,
+                "egress": provider_egress("deepgram"),
             },
         )
         return deepgram.STT(
             api_key=DEEPGRAM_API_KEY,
             model=STT_DEEPGRAM_MODEL,
             language=STT_DEEPGRAM_LANGUAGE,
+            http_session=create_external_aiohttp_session(
+                "deepgram",
+                external_http_sessions,
+            ),
             interim_results=True,
             no_delay=True,
             endpointing_ms=STT_DEEPGRAM_ENDPOINTING_MS,
@@ -1984,11 +2094,12 @@ class Assistant(Agent):
     ) -> tuple[list[Any], Any]:
         tool_choice = model_settings.tool_choice if model_settings else NOT_GIVEN
         resolved_tools = tools
-        provider = llm_provider or LLM_PROVIDER
+        provider = str(llm_provider or LLM_PROVIDER).strip().lower()
+        is_xai_provider = provider in {"xai", "api.x.ai", "x.ai"}
         # For xAI provider we keep tools disabled by default, even if declared in the agent.
         # This avoids Responses API 400 errors around tool_choice/tools coupling
         # and keeps lower TTFT for voice turns.
-        if provider == "xai" and not XAI_ENABLE_TOOLS:
+        if is_xai_provider and not XAI_ENABLE_TOOLS:
             if resolved_tools:
                 logger.info(
                     "xAI tools are disabled by default; ignoring %d configured tool(s)",
@@ -2068,6 +2179,17 @@ class Assistant(Agent):
             )
         elif route_metadata is not None:
             primary_provider = route_metadata.primary_provider
+
+        if route_metadata is None and isinstance(primary_llm, inference.LLM):
+            async for chunk in self._stream_llm(
+                primary_llm,
+                "livekit_inference",
+                chat_ctx,
+                tools,
+                model_settings,
+            ):
+                yield chunk
+            return
 
         if USE_LIVEKIT_FALLBACK_ADAPTER:
             self._llm_branch_started_at[selected_branch] = (
@@ -2200,7 +2322,21 @@ class Assistant(Agent):
         raise StopResponse()
 
 
-server = AgentServer()
+def compute_server_load(agent_server: AgentServer) -> float:
+    return min(len(agent_server.active_jobs) / AGENT_MAX_CONCURRENT_JOBS, 1.0)
+
+
+if LIVEKIT_SELF_HOSTED:
+    server = AgentServer(
+        host=AGENT_HEALTH_HOST,
+        port=AGENT_HEALTH_PORT,
+        http_proxy=None,
+        load_fnc=compute_server_load,
+        load_threshold=1.0,
+        num_idle_processes=AGENT_NUM_IDLE_PROCESSES,
+    )
+else:
+    server = AgentServer()
 
 
 def prewarm(proc: JobProcess):
@@ -2208,6 +2344,37 @@ def prewarm(proc: JobProcess):
 
 
 server.setup_fnc = prewarm
+
+
+def build_audio_input_options() -> room_io.AudioInputOptions:
+    if AUDIO_INPUT_ENHANCEMENT in {"", "none", "off", "disable", "disabled", "false"}:
+        return room_io.AudioInputOptions()
+
+    if AUDIO_INPUT_ENHANCEMENT == "livekit":
+        from livekit.plugins import noise_cancellation
+
+        return room_io.AudioInputOptions(
+            noise_cancellation=lambda params: (
+                noise_cancellation.BVCTelephony()
+                if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+                else ai_coustics.audio_enhancement(
+                    model=ai_coustics.EnhancerModel.QUAIL_VF_L
+                )
+            ),
+        )
+
+    if AUDIO_INPUT_ENHANCEMENT == "ai_coustics":
+        return room_io.AudioInputOptions(
+            noise_cancellation=ai_coustics.audio_enhancement(
+                model=ai_coustics.EnhancerModel.QUAIL_VF_L
+            )
+        )
+
+    logger.warning(
+        "unknown AUDIO_INPUT_ENHANCEMENT=%s; audio enhancement disabled",
+        AUDIO_INPUT_ENHANCEMENT,
+    )
+    return room_io.AudioInputOptions()
 
 
 @server.rtc_session(agent_name=AGENT_NAME)
@@ -2316,11 +2483,12 @@ async def my_agent(ctx: JobContext):
         turn_detection_mode = "vad"
 
     audio_output_sample_rate = resolve_audio_output_sample_rate()
+    external_http_sessions: list[aiohttp.ClientSession] = []
 
     session = AgentSession(
-        stt=build_stt(),
+        stt=build_stt(external_http_sessions=external_http_sessions),
         llm=session_llm or build_llm(),
-        tts=build_tts(),
+        tts=build_tts(external_http_sessions=external_http_sessions),
         turn_handling={
             "turn_detection": turn_detection_mode,
             "endpointing": {
@@ -2507,6 +2675,14 @@ async def my_agent(ctx: JobContext):
             )
             transcript = (getattr(ev, "transcript", None) or "").strip()
             if transcript:
+                logger.info(
+                    "user input transcribed",
+                    extra={
+                        "transcript": transcript,
+                        "is_final": bool(getattr(ev, "is_final", False)),
+                        "language": getattr(ev, "language", None),
+                    },
+                )
                 # Any new user speech cancels a pending auto-hangup timer.
                 user_activity_count += 1
                 user_activity_event.set()
@@ -2694,6 +2870,9 @@ async def my_agent(ctx: JobContext):
         close_reason = f"end_call:{reason}"
         try:
             close_info["reason"] = close_reason
+            voice_prompts.cancel_client_silence_timer()
+            voice_prompts.cancel_response_delay_timer()
+            await ensure_session_closed(timeout_sec=4.0)
             logger.info("ending call by deleting room", extra={"room": ctx.room.name})
             # Bound delete_room call to avoid waiting indefinitely on API edge cases.
             await asyncio.wait_for(
@@ -2777,6 +2956,8 @@ async def my_agent(ctx: JobContext):
             reply_watchdog_task = None
         voice_prompts.cancel_response_delay_timer()
         voice_prompts.cancel_client_silence_timer()
+        if end_call_task and not end_call_task.done():
+            return
         close_event.set()
 
     async def export_best_effort(timeout_sec: float) -> None:
@@ -2834,16 +3015,7 @@ async def my_agent(ctx: JobContext):
             agent=assistant,
             room=ctx.room,
             room_options=room_io.RoomOptions(
-                audio_input=room_io.AudioInputOptions(
-                    noise_cancellation=lambda params: (
-                        noise_cancellation.BVCTelephony()
-                        if params.participant.kind
-                        == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                        else ai_coustics.audio_enhancement(
-                            model=ai_coustics.EnhancerModel.QUAIL_VF_L
-                        )
-                    ),
-                ),
+                audio_input=build_audio_input_options(),
                 audio_output=room_io.AudioOutputOptions(
                     sample_rate=audio_output_sample_rate,
                     num_channels=1,
@@ -2917,6 +3089,10 @@ async def my_agent(ctx: JobContext):
         with suppress(Exception):
             await background_audio.aclose()
         await ensure_session_closed(timeout_sec=2.0)
+        for http_session in external_http_sessions:
+            if not http_session.closed:
+                with suppress(Exception):
+                    await http_session.close()
         if export_task and not export_task.done():
             try:
                 await asyncio.wait_for(

@@ -36,6 +36,9 @@ def _env_optional_int(name: str) -> int | None:
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
+AGENT_EXTERNAL_HTTP_PROXY = (
+    os.getenv("AGENT_EXTERNAL_HTTP_PROXY") or os.getenv("HTTPS_PROXY") or ""
+).strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
@@ -154,11 +157,12 @@ XAI_BASE_URL = os.getenv("XAI_BASE_URL", "").strip()
 XAI_ENABLE_TOOLS = _env_bool("XAI_ENABLE_TOOLS", default=False)
 
 # LLM fallback settings.
-# USE_LIVEKIT_FALLBACK_ADAPTER=false keeps the legacy manual llm_node retry path
-# available as a quick rollback switch.
+# Default to the local manual first-token timeout path. In telephony this is more
+# predictable than LiveKit FallbackAdapter, which can wait on provider/client
+# timeouts before emitting availability changes.
 USE_LIVEKIT_FALLBACK_ADAPTER = _env_bool(
     "USE_LIVEKIT_FALLBACK_ADAPTER",
-    default=True,
+    default=False,
 )
 LLM_ATTEMPT_TIMEOUT_SEC = float(os.getenv("LLM_ATTEMPT_TIMEOUT_SEC", "2.5"))
 LLM_MAX_RETRY_PER_LLM = int(os.getenv("LLM_MAX_RETRY_PER_LLM", "0"))
@@ -464,6 +468,25 @@ POSTGRES_DSN = os.getenv("POSTGRES_DSN", "")
 PROMPT_LOOKUP_SQL = os.getenv("PROMPT_LOOKUP_SQL", "").strip()
 PROMPT_LOOKUP_TIMEOUT_SEC = float(os.getenv("PROMPT_LOOKUP_TIMEOUT_SEC", "2.0"))
 AGENT_NAME = os.getenv("AGENT_NAME", "main-bot")
+LIVEKIT_SELF_HOSTED = _env_bool("LIVEKIT_SELF_HOSTED", default=False)
+AGENT_HEALTH_HOST = os.getenv(
+    "AGENT_HEALTH_HOST",
+    "127.0.0.1" if LIVEKIT_SELF_HOSTED else "",
+)
+AGENT_HEALTH_PORT = int(
+    os.getenv("AGENT_HEALTH_PORT", "18081" if LIVEKIT_SELF_HOSTED else "8081")
+)
+AGENT_MAX_CONCURRENT_JOBS = max(
+    1,
+    int(os.getenv("AGENT_MAX_CONCURRENT_JOBS", "10")),
+)
+AGENT_NUM_IDLE_PROCESSES = int(
+    os.getenv("AGENT_NUM_IDLE_PROCESSES", "1" if LIVEKIT_SELF_HOSTED else "10")
+)
+AUDIO_INPUT_ENHANCEMENT = os.getenv(
+    "AUDIO_INPUT_ENHANCEMENT",
+    "none" if LIVEKIT_SELF_HOSTED else "livekit",
+).strip().lower()
 
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 N8N_WEBHOOK_TOKEN = os.getenv("N8N_WEBHOOK_TOKEN", "")

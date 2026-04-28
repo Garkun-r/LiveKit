@@ -104,6 +104,53 @@ Next, run this command to speak to your agent directly in your terminal:
 uv run python src/agent.py console
 ```
 
+## Provider egress routing
+
+For the self-hosted Asterisk/LiveKit server runbook, see
+[`../../docs/local-livekit-server.md`](../../docs/local-livekit-server.md).
+
+The local robot should not use a global `HTTPS_PROXY`. Configure egress per
+provider so fast/unblocked providers can go direct and geoblocked providers can
+go through the VPS Squid HTTP CONNECT proxy:
+
+```console
+EGRESS_PROXY_URL=http://66.248.207.203:15182
+EGRESS_DEFAULT=direct
+
+# Current measured defaults for the local Asterisk robot:
+ELEVENLABS_EGRESS=proxy
+GEMINI_EGRESS=proxy
+GOOGLE_TTS_EGRESS=proxy
+VERTEX_TTS_EGRESS=proxy
+GOOGLE_STT_EGRESS=proxy
+XAI_EGRESS=direct
+DEEPGRAM_EGRESS=direct
+MINIMAX_TTS_EGRESS=direct
+COSYVOICE_TTS_EGRESS=direct
+LIVEKIT_INFERENCE_EGRESS=proxy
+```
+
+New providers do not need a separate proxy subsystem. Use the shared helpers in
+`src/egress.py`; any provider name automatically supports an env var named
+`<PROVIDER>_EGRESS=direct|proxy` (for example `OPENAI_EGRESS=proxy`). Add a
+default to `_PROVIDER_DEFAULTS` only after latency/geoblock testing shows the
+right production route.
+
+Provider client wiring checklist:
+
+1. Pick a stable provider key, for example `openai`, `cartesia`, or `anthropic`.
+2. Add `<PROVIDER>_EGRESS=direct|proxy` to `.env.example` and production env.
+3. Wire the SDK through one shared helper:
+   - `provider_proxy_url("<provider>")` for SDKs that accept a proxy URL.
+   - `httpx_client_args("<provider>")` for httpx/Google GenAI clients.
+   - `create_external_aiohttp_session("<provider>")` for aiohttp-based LiveKit clients.
+   - `provider_egress_env("<provider>")` only for SDKs that read proxy variables
+     during client construction.
+4. For direct mode, make sure the SDK ignores global proxy env (`trust_env=False`
+   or equivalent).
+5. Test both routes from the Asterisk host under 10-call concurrency, then record
+   the chosen default in `_PROVIDER_DEFAULTS` and this README.
+
 To switch LLM provider, set `LLM_PROVIDER`:
 
 1. `LLM_PROVIDER=google` - direct Gemini API path (default).
@@ -258,8 +305,9 @@ VERTEX_TTS_STREAM_CONTEXT_LEN=2
 To reduce "hung" turns (long silence after user speech), tune these guards:
 
 ```console
-LLM_FIRST_TOKEN_TIMEOUT_SEC=8.0
-LLM_RETRY_DELAY_SEC=0.35
+USE_LIVEKIT_FALLBACK_ADAPTER=false
+LLM_FIRST_TOKEN_TIMEOUT_SEC=2.5
+LLM_RETRY_DELAY_SEC=0.3
 TURN_MIN_ENDPOINTING_DELAY=0.25
 TURN_MAX_ENDPOINTING_DELAY=1.0
 TURN_DETECTION_MODE=vad

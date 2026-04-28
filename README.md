@@ -10,3 +10,8 @@
 
 Первый агент:
 - agents/main-bot
+
+Операционные runbook:
+- [Локальный LiveKit на Asterisk-сервере](./docs/local-livekit-server.md)
+- [LiveKit Cloud](./docs/cloud/README.md)
+- [Asterisk E2E Voice Test](./docs/asterisk-e2e-voice-test.md)
