@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -939,10 +940,11 @@ async def warmup_llm_prompt_cache(
     model_name = str(getattr(llm_client, "model", "unknown"))
 
     try:
+        # Some Responses-compatible providers, including xAI, reject
+        # tool_choice when the request has no tools.
         chat_kwargs: dict[str, Any] = {
             "chat_ctx": chat_ctx,
             "tools": [],
-            "tool_choice": "none",
         }
         if conn_options is not None:
             chat_kwargs["conn_options"] = conn_options
@@ -1863,6 +1865,8 @@ class Assistant(Agent):
         self._voice_prompts = voice_prompts
         self._awaiting_first_user_turn = True
         self._llm_branch_started_at: dict[str, float] = {}
+        self._tts_first_frame_ready_at: float | None = None
+        self._tts_first_frame_yielded_at: float | None = None
         resolved_prompt = prompt if prompt is not None else get_active_prompt()
         super().__init__(
             instructions=(
@@ -1912,8 +1916,11 @@ class Assistant(Agent):
         waited_for_prompt = False
         async for frame in audio_stream:
             if not waited_for_prompt:
+                self._tts_first_frame_ready_at = time.time()
+                self._tts_first_frame_yielded_at = None
                 if self._voice_prompts is not None:
                     await self._voice_prompts.wait_for_active_prompt()
+                self._tts_first_frame_yielded_at = time.time()
                 waited_for_prompt = True
             yield frame
 
@@ -2748,6 +2755,25 @@ async def my_agent(ctx: JobContext):
             if new_state in {"thinking", "speaking"}:
                 voice_prompts.cancel_client_silence_timer()
             if new_state == "speaking":
+                tts_first_frame_ready_at = assistant._tts_first_frame_ready_at
+                tts_first_frame_yielded_at = assistant._tts_first_frame_yielded_at
+                created_at = getattr(ev, "created_at", None)
+                if isinstance(created_at, (int, float)):
+                    logger.info(
+                        "agent playback started latency",
+                        extra={
+                            "tts_first_frame_ready_to_speaking_ms": round(
+                                (created_at - tts_first_frame_ready_at) * 1000, 1
+                            )
+                            if tts_first_frame_ready_at is not None
+                            else None,
+                            "tts_first_frame_yielded_to_speaking_ms": round(
+                                (created_at - tts_first_frame_yielded_at) * 1000, 1
+                            )
+                            if tts_first_frame_yielded_at is not None
+                            else None,
+                        },
+                    )
                 voice_prompts.on_agent_started_speaking()
             elif new_state == "listening":
                 voice_prompts.start_client_silence_timer()

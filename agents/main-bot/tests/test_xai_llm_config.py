@@ -41,6 +41,47 @@ class _ModelSettings:
         self.tool_choice = tool_choice
 
 
+class _WarmupStream:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+class _WarmupLLM:
+    provider = "api.x.ai"
+    model = "grok-test"
+
+    def __init__(self) -> None:
+        self.chat_kwargs = None
+
+    def chat(self, **kwargs):
+        self.chat_kwargs = kwargs
+        return _WarmupStream()
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_warmup_omits_tool_choice_without_tools() -> None:
+    llm = _WarmupLLM()
+
+    await agent.warmup_llm_prompt_cache(
+        llm_client=llm,
+        instructions="test instructions",
+        conn_options=None,
+    )
+
+    assert llm.chat_kwargs is not None
+    assert llm.chat_kwargs["tools"] == []
+    assert "tool_choice" not in llm.chat_kwargs
+
+
 def test_xai_tools_disabled_by_default(monkeypatch) -> None:
     monkeypatch.setattr(agent, "LLM_PROVIDER", "xai")
     monkeypatch.setattr(agent, "XAI_ENABLE_TOOLS", False)
