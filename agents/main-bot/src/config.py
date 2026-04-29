@@ -529,3 +529,10 @@ AUDIO_INPUT_ENHANCEMENT = os.getenv(
 
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 N8N_WEBHOOK_TOKEN = os.getenv("N8N_WEBHOOK_TOKEN", "")
+
+SMS_RU_API_URL = os.getenv("SMS_RU_API_URL", "https://sms.ru/sms/send")
+SMS_RU_API_ID = os.getenv("SMS_RU_API_ID", "")
+SMS_LINK_SIGNATURE = os.getenv(
+    "SMS_LINK_SIGNATURE",
+    "Отправил наш ИИ робот: jcall.io",
+)

@@ -15,3 +15,4 @@
 - [Локальный LiveKit на Asterisk-сервере](./docs/local-livekit-server.md)
 - [LiveKit Cloud](./docs/cloud/README.md)
 - [Asterisk E2E Voice Test](./docs/asterisk-e2e-voice-test.md)
+- [Парсер тегов и навыки робота](./docs/robot-tags-and-skills.md)
