@@ -26,6 +26,7 @@ _PROVIDER_DEFAULTS: dict[str, str] = {
     "deepgram": "direct",
     "minimax": "direct",
     "cosyvoice": "direct",
+    "sber_tts": "direct",
     "livekit_inference": "proxy",
 }
 
@@ -41,6 +42,7 @@ _PROVIDER_ENV_NAMES: dict[str, tuple[str, ...]] = {
     "deepgram": ("DEEPGRAM_EGRESS", "STT_DEEPGRAM_EGRESS"),
     "minimax": ("MINIMAX_EGRESS", "MINIMAX_TTS_EGRESS"),
     "cosyvoice": ("COSYVOICE_EGRESS", "COSYVOICE_TTS_EGRESS"),
+    "sber_tts": ("SBER_EGRESS", "SBER_TTS_EGRESS"),
     "livekit_inference": ("LIVEKIT_INFERENCE_EGRESS", "STT_INFERENCE_EGRESS"),
 }
 

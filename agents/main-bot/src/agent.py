@@ -166,6 +166,21 @@ from config import (
     MODEL_ROUTER_FAST_MODEL,
     PREEMPTIVE_GENERATION,
     REPLY_WATCHDOG_SEC,
+    SBER_SALUTESPEECH_AUTH_KEY,
+    SBER_TTS_CA_CERT_FILE,
+    SBER_TTS_ENDPOINT,
+    SBER_TTS_LANGUAGE,
+    SBER_TTS_MIN_SENTENCE_LEN,
+    SBER_TTS_OAUTH_SCOPE,
+    SBER_TTS_OAUTH_URL,
+    SBER_TTS_PAINT_LOUDNESS,
+    SBER_TTS_PAINT_PITCH,
+    SBER_TTS_PAINT_SPEED,
+    SBER_TTS_REBUILD_CACHE,
+    SBER_TTS_REQUEST_TIMEOUT_SEC,
+    SBER_TTS_SAMPLE_RATE,
+    SBER_TTS_STREAM_CONTEXT_LEN,
+    SBER_TTS_VOICE,
     STT_DEEPGRAM_ENDPOINTING_MS,
     STT_DEEPGRAM_LANGUAGE,
     STT_DEEPGRAM_MODEL,
@@ -223,6 +238,7 @@ from egress import (
 from eleven_v3_tts import ElevenV3TTS
 from prompt_repo import PromptResolution, get_active_prompt, resolve_prompt_for_call
 from routing.model_router import ModelRouter, ModelRouteResult, coerce_optional_bool
+from sber_tts import SberSaluteTTS
 from session_export import send_session_to_n8n
 from vertex_gemini_tts import VertexGeminiTTS
 from yandex_stt import YandexSpeechKitSTT
@@ -1519,7 +1535,14 @@ def _google_tts_credentials_available() -> bool:
 def build_tts(
     external_http_sessions: list[aiohttp.ClientSession] | None = None,
 ) -> Any:
-    if TTS_PROVIDER not in {"google", "vertex", "minimax", "cosyvoice", "elevenlabs"}:
+    if TTS_PROVIDER not in {
+        "google",
+        "vertex",
+        "minimax",
+        "cosyvoice",
+        "sber",
+        "elevenlabs",
+    }:
         logger.warning(
             "Unknown TTS_PROVIDER='%s'. Falling back to ElevenLabs.",
             TTS_PROVIDER,
@@ -1579,6 +1602,51 @@ def build_tts(
                 stream_context_len=max(1, COSYVOICE_TTS_STREAM_CONTEXT_LEN),
             ),
         )
+
+    if TTS_PROVIDER == "sber":
+        if not SBER_SALUTESPEECH_AUTH_KEY.strip():
+            raise RuntimeError(
+                "SBER_SALUTESPEECH_AUTH_KEY is not set. "
+                "Sber SaluteSpeech provider is configured without auth key."
+            )
+
+        logger.info(
+            "using Sber SaluteSpeech TTS provider",
+            extra={
+                "endpoint": SBER_TTS_ENDPOINT,
+                "voice": SBER_TTS_VOICE,
+                "language": SBER_TTS_LANGUAGE,
+                "sample_rate": SBER_TTS_SAMPLE_RATE,
+                "ca_cert_file": bool(SBER_TTS_CA_CERT_FILE),
+                "paint_pitch": SBER_TTS_PAINT_PITCH,
+                "paint_speed": SBER_TTS_PAINT_SPEED,
+                "paint_loudness": SBER_TTS_PAINT_LOUDNESS,
+                "min_sentence_len": max(2, SBER_TTS_MIN_SENTENCE_LEN),
+                "stream_context_len": max(1, SBER_TTS_STREAM_CONTEXT_LEN),
+                "egress": provider_egress("sber_tts"),
+            },
+        )
+        with provider_egress_env("sber_tts"):
+            return SberSaluteTTS(
+                auth_key=SBER_SALUTESPEECH_AUTH_KEY,
+                oauth_scope=SBER_TTS_OAUTH_SCOPE,
+                oauth_url=SBER_TTS_OAUTH_URL,
+                endpoint=SBER_TTS_ENDPOINT,
+                voice=SBER_TTS_VOICE,
+                language=SBER_TTS_LANGUAGE,
+                sample_rate=SBER_TTS_SAMPLE_RATE,
+                ca_cert_file=SBER_TTS_CA_CERT_FILE or None,
+                paint_pitch=SBER_TTS_PAINT_PITCH,
+                paint_speed=SBER_TTS_PAINT_SPEED,
+                paint_loudness=SBER_TTS_PAINT_LOUDNESS,
+                request_timeout=SBER_TTS_REQUEST_TIMEOUT_SEC,
+                rebuild_cache=SBER_TTS_REBUILD_CACHE,
+                http_proxy=provider_proxy_url("sber_tts"),
+                tokenizer_obj=tokenize.blingfire.SentenceTokenizer(
+                    min_sentence_len=max(2, SBER_TTS_MIN_SENTENCE_LEN),
+                    stream_context_len=max(1, SBER_TTS_STREAM_CONTEXT_LEN),
+                ),
+            )
 
     if TTS_PROVIDER == "vertex":
         resolved_creds_file = _resolve_google_tts_credentials_file()

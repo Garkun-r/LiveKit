@@ -19,6 +19,7 @@ def test_provider_defaults_match_latency_policy(monkeypatch) -> None:
     assert provider_egress("gemini") == "proxy"
     assert provider_egress("xai") == "proxy"
     assert provider_egress("deepgram") == "direct"
+    assert provider_egress("sber_tts") == "direct"
     assert provider_egress("livekit_inference") == "proxy"
 
 
