@@ -45,6 +45,16 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 YANDEX_SPEECHKIT_API_KEY = os.getenv("YANDEX_SPEECHKIT_API_KEY", "")
+TBANK_VOICEKIT_API_KEY = os.getenv(
+    "TBANK_VOICEKIT_API_KEY",
+    os.getenv("VOICEKIT_API_KEY", ""),
+)
+TBANK_VOICEKIT_SECRET_KEY = os.getenv(
+    "TBANK_VOICEKIT_SECRET_KEY",
+    os.getenv("VOICEKIT_SECRET_KEY", ""),
+)
+TBANK_VOICEKIT_ENDPOINT = os.getenv("TBANK_VOICEKIT_ENDPOINT", "api.tinkoff.ai:443")
+TBANK_VOICEKIT_AUTHORITY = os.getenv("TBANK_VOICEKIT_AUTHORITY", "").strip()
 
 
 # LLM provider switch:
@@ -79,6 +89,7 @@ MODEL_ROUTER_COMPLEX_MODEL = os.getenv("MODEL_ROUTER_COMPLEX_MODEL", "").strip()
 # - vertex (google.genai Vertex API path)
 # - minimax (official livekit.plugins.minimax TTS plugin)
 # - cosyvoice (Alibaba Cloud Model Studio WebSocket API)
+# - tbank (T-Bank VoiceKit gRPC streaming synthesis)
 _raw_tts_provider = os.getenv("TTS_PROVIDER", "elevenlabs").strip().lower()
 TTS_PROVIDER = {
     "eleven": "elevenlabs",
@@ -94,6 +105,10 @@ TTS_PROVIDER = {
     "cosyvoice": "cosyvoice",
     "cosy_voice": "cosyvoice",
     "cosy-voice": "cosyvoice",
+    "tbank": "tbank",
+    "t-bank": "tbank",
+    "tbank_voicekit": "tbank",
+    "voicekit": "tbank",
 }.get(_raw_tts_provider, _raw_tts_provider)
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "wF58OrxELqJ5nFJxXiva")
 ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")
@@ -139,6 +154,15 @@ ELEVENLABS_VOICE_SPEED = _env_optional_float("ELEVENLABS_VOICE_SPEED")
 ELEVENLABS_VOICE_USE_SPEAKER_BOOST = _env_optional_bool(
     "ELEVENLABS_VOICE_USE_SPEAKER_BOOST"
 )
+
+# T-Bank VoiceKit TTS runtime settings.
+TTS_TBANK_VOICE_NAME = os.getenv("TTS_TBANK_VOICE_NAME", "anna")
+TTS_TBANK_PITCH = float(os.getenv("TTS_TBANK_PITCH", "0.8"))
+TTS_TBANK_SPEAKING_RATE = float(os.getenv("TTS_TBANK_SPEAKING_RATE", "1.0"))
+TTS_TBANK_FORMAT = os.getenv("TTS_TBANK_FORMAT", "linear16")
+TTS_TBANK_SAMPLE_RATE = int(os.getenv("TTS_TBANK_SAMPLE_RATE", "24000"))
+TTS_TBANK_MIN_SENTENCE_LEN = int(os.getenv("TTS_TBANK_MIN_SENTENCE_LEN", "4"))
+TTS_TBANK_STREAM_CONTEXT_LEN = int(os.getenv("TTS_TBANK_STREAM_CONTEXT_LEN", "1"))
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash")
@@ -456,6 +480,7 @@ COSYVOICE_TTS_STREAM_CONTEXT_LEN = int(
 # - inference (LiveKit Agent Gateway)
 # - google (Google Cloud STT plugin, uses ADC/service-account credentials)
 # - yandex (Yandex SpeechKit v3 direct gRPC, requires YANDEX_SPEECHKIT_API_KEY)
+# - tbank (T-Bank VoiceKit gRPC StreamingRecognize)
 _raw_stt_provider = os.getenv("STT_PROVIDER", "deepgram").strip().lower()
 STT_PROVIDER = {
     "deepgram": "deepgram",
@@ -467,6 +492,10 @@ STT_PROVIDER = {
     "yandex": "yandex",
     "yandex_cloud": "yandex",
     "speechkit": "yandex",
+    "tbank": "tbank",
+    "t-bank": "tbank",
+    "tbank_voicekit": "tbank",
+    "voicekit": "tbank",
 }.get(_raw_stt_provider, _raw_stt_provider)
 
 # Inference STT settings.
@@ -501,6 +530,15 @@ STT_YANDEX_EOU_SENSITIVITY = os.getenv(
 ).strip()
 STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS = int(
     os.getenv("STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS", "500")
+)
+
+# T-Bank VoiceKit STT settings.
+STT_TBANK_MODEL = os.getenv("STT_TBANK_MODEL", "")
+STT_TBANK_LANGUAGE = os.getenv("STT_TBANK_LANGUAGE", "ru-RU")
+STT_TBANK_SAMPLE_RATE = int(os.getenv("STT_TBANK_SAMPLE_RATE", "16000"))
+STT_TBANK_CHUNK_MS = int(os.getenv("STT_TBANK_CHUNK_MS", "50"))
+STT_TBANK_INTERIM_INTERVAL_SEC = float(
+    os.getenv("STT_TBANK_INTERIM_INTERVAL_SEC", "0.1")
 )
 
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "")
