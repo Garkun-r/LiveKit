@@ -22,6 +22,7 @@ def test_provider_defaults_match_latency_policy(monkeypatch) -> None:
     assert provider_egress("deepgram") == "direct"
     assert provider_egress("tbank_stt") == "direct"
     assert provider_egress("tbank_tts") == "direct"
+    assert provider_egress("sber_tts") == "direct"
     assert provider_egress("livekit_inference") == "proxy"
 
 

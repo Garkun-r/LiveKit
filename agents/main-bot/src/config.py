@@ -90,6 +90,7 @@ MODEL_ROUTER_COMPLEX_MODEL = os.getenv("MODEL_ROUTER_COMPLEX_MODEL", "").strip()
 # - minimax (official livekit.plugins.minimax TTS plugin)
 # - cosyvoice (Alibaba Cloud Model Studio WebSocket API)
 # - tbank (T-Bank VoiceKit gRPC streaming synthesis)
+# - sber (Sber SaluteSpeech gRPC API)
 _raw_tts_provider = os.getenv("TTS_PROVIDER", "elevenlabs").strip().lower()
 TTS_PROVIDER = {
     "eleven": "elevenlabs",
@@ -109,6 +110,10 @@ TTS_PROVIDER = {
     "t-bank": "tbank",
     "tbank_voicekit": "tbank",
     "voicekit": "tbank",
+    "sber": "sber",
+    "salutespeech": "sber",
+    "salute_speech": "sber",
+    "sber_salutespeech": "sber",
 }.get(_raw_tts_provider, _raw_tts_provider)
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "wF58OrxELqJ5nFJxXiva")
 ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")
@@ -371,6 +376,32 @@ MINIMAX_TTS_BITRATE = int(os.getenv("MINIMAX_TTS_BITRATE", "128000"))
 MINIMAX_TTS_CHANNEL = int(os.getenv("MINIMAX_TTS_CHANNEL", "1"))
 MINIMAX_TTS_MIN_SENTENCE_LEN = int(os.getenv("MINIMAX_TTS_MIN_SENTENCE_LEN", "4"))
 MINIMAX_TTS_STREAM_CONTEXT_LEN = int(os.getenv("MINIMAX_TTS_STREAM_CONTEXT_LEN", "1"))
+
+# Sber SaluteSpeech TTS runtime settings.
+# SBER_SALUTESPEECH_AUTH_KEY is the Authorization key from Sber, without secrets in code.
+SBER_SALUTESPEECH_AUTH_KEY = os.getenv(
+    "SBER_SALUTESPEECH_AUTH_KEY",
+    os.getenv("SBER_AUTH_KEY", ""),
+)
+SBER_TTS_OAUTH_SCOPE = os.getenv("SBER_TTS_OAUTH_SCOPE", "SALUTE_SPEECH_PERS")
+SBER_TTS_OAUTH_URL = os.getenv(
+    "SBER_TTS_OAUTH_URL",
+    "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+)
+SBER_TTS_ENDPOINT = os.getenv("SBER_TTS_ENDPOINT", "smartspeech.sber.ru:443")
+SBER_TTS_CA_CERT_FILE = os.getenv("SBER_TTS_CA_CERT_FILE", "").strip()
+SBER_TTS_VOICE = os.getenv("SBER_TTS_VOICE", "Ost_24000")
+SBER_TTS_LANGUAGE = os.getenv("SBER_TTS_LANGUAGE", "ru-RU")
+SBER_TTS_SAMPLE_RATE = int(os.getenv("SBER_TTS_SAMPLE_RATE", "24000"))
+SBER_TTS_PAINT_PITCH = os.getenv("SBER_TTS_PAINT_PITCH", "2")
+SBER_TTS_PAINT_SPEED = os.getenv("SBER_TTS_PAINT_SPEED", "4")
+SBER_TTS_PAINT_LOUDNESS = os.getenv("SBER_TTS_PAINT_LOUDNESS", "5")
+SBER_TTS_REQUEST_TIMEOUT_SEC = float(
+    os.getenv("SBER_TTS_REQUEST_TIMEOUT_SEC", "15.0")
+)
+SBER_TTS_REBUILD_CACHE = _env_bool("SBER_TTS_REBUILD_CACHE", default=False)
+SBER_TTS_MIN_SENTENCE_LEN = int(os.getenv("SBER_TTS_MIN_SENTENCE_LEN", "4"))
+SBER_TTS_STREAM_CONTEXT_LEN = int(os.getenv("SBER_TTS_STREAM_CONTEXT_LEN", "1"))
 
 # CosyVoice (Alibaba DashScope / Model Studio) runtime settings.
 _raw_cosyvoice_profile = (

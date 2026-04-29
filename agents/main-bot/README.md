@@ -127,6 +127,7 @@ XAI_EGRESS=direct
 DEEPGRAM_EGRESS=direct
 MINIMAX_TTS_EGRESS=direct
 COSYVOICE_TTS_EGRESS=direct
+SBER_TTS_EGRESS=direct
 LIVEKIT_INFERENCE_EGRESS=proxy
 ```
 
@@ -176,6 +177,7 @@ To switch TTS provider, set `TTS_PROVIDER`:
 3. `TTS_PROVIDER=vertex` - Vertex Gemini API streaming path (`google.genai`, `vertexai=True`).
 4. `TTS_PROVIDER=minimax` - official `livekit.plugins.minimax.TTS` path (`speech-2.8-turbo`).
 5. `TTS_PROVIDER=cosyvoice` - custom Alibaba CosyVoice WebSocket path.
+6. `TTS_PROVIDER=sber` - custom Sber SaluteSpeech gRPC streaming path.
 
 ElevenLabs `eleven_v3` custom HTTP streaming path:
 
@@ -253,6 +255,36 @@ MINIMAX_TTS_MODEL=speech-2.8-turbo
 MINIMAX_TTS_VOICE_ID=moss_audio_43d3c43e-3a2d-11f1-b47e-928b88df9451
 MINIMAX_TTS_FORMAT=mp3
 ```
+
+Sber SaluteSpeech example:
+
+```console
+TTS_PROVIDER=sber
+SBER_SALUTESPEECH_AUTH_KEY=<your_sber_authorization_key>
+SBER_TTS_CA_CERT_FILE=/path/to/russian-trusted-root-ca.pem
+SBER_TTS_VOICE=Ost_24000
+SBER_TTS_LANGUAGE=ru-RU
+SBER_TTS_SAMPLE_RATE=24000
+SBER_TTS_PAINT_PITCH=2
+SBER_TTS_PAINT_SPEED=4
+SBER_TTS_PAINT_LOUDNESS=5
+SBER_TTS_MIN_SENTENCE_LEN=4
+SBER_TTS_STREAM_CONTEXT_LEN=1
+```
+
+The Sber adapter sends short SSML requests over gRPC `Synthesize` and pushes PCM chunks to LiveKit as soon as Sber returns them. This keeps first-audio latency low even though Sber does not expose bidirectional text streaming.
+
+If OAuth or gRPC TLS verification fails on a machine without Russian trusted root certificates, set `SBER_TTS_CA_CERT_FILE` to the root CA bundle used to verify Sber endpoints.
+
+For local LiveKit with Asterisk, keep Sber traffic direct and configure these values in the local `.env.local` on the robot:
+
+```console
+SBER_TTS_EGRESS=direct
+SBER_SALUTESPEECH_AUTH_KEY=<your_sber_authorization_key>
+SBER_TTS_CA_CERT_FILE=/path/to/russian-trusted-root-ca.pem
+```
+
+This local path does not require LiveKit Cloud secret sync.
 
 STT failover example:
 
