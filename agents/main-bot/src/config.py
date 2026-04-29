@@ -506,6 +506,47 @@ STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS = int(
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "")
 PROMPT_LOOKUP_SQL = os.getenv("PROMPT_LOOKUP_SQL", "").strip()
 PROMPT_LOOKUP_TIMEOUT_SEC = float(os.getenv("PROMPT_LOOKUP_TIMEOUT_SEC", "2.0"))
+
+# Directus prompt lookup. The LiveKit agent uses a read-only Directus token
+# instead of connecting to Postgres directly.
+DIRECTUS_URL = os.getenv("DIRECTUS_URL", "").strip().rstrip("/")
+DIRECTUS_TOKEN = os.getenv("DIRECTUS_TOKEN", "").strip()
+DIRECTUS_REQUEST_TIMEOUT_SEC = float(os.getenv("DIRECTUS_REQUEST_TIMEOUT_SEC", "2.0"))
+DIRECTUS_PROMPT_CACHE_TTL_SEC = float(
+    os.getenv("DIRECTUS_PROMPT_CACHE_TTL_SEC", "300")
+)
+DIRECTUS_DEFAULT_TIMEZONE = os.getenv(
+    "DIRECTUS_DEFAULT_TIMEZONE",
+    "Europe/Kaliningrad",
+).strip()
+DIRECTUS_COLLECTION_CALLER_ID = os.getenv(
+    "DIRECTUS_COLLECTION_CALLER_ID",
+    "CallerID",
+).strip()
+DIRECTUS_COLLECTION_BOT_CONFIGURATIONS = os.getenv(
+    "DIRECTUS_COLLECTION_BOT_CONFIGURATIONS",
+    "bot_configurations",
+).strip()
+DIRECTUS_COLLECTION_CLIENTS = os.getenv(
+    "DIRECTUS_COLLECTION_CLIENTS",
+    "clients",
+).strip()
+DIRECTUS_COLLECTION_CLIENTS_PROMPT = os.getenv(
+    "DIRECTUS_COLLECTION_CLIENTS_PROMPT",
+    "clients_prompt",
+).strip()
+DIRECTUS_COLLECTION_WEBPARSING = os.getenv(
+    "DIRECTUS_COLLECTION_WEBPARSING",
+    "webparsing",
+).strip()
+DIRECTUS_COLLECTION_TRANSFER_NUMBER = os.getenv(
+    "DIRECTUS_COLLECTION_TRANSFER_NUMBER",
+    "transfer_number",
+).strip()
+DIRECTUS_COLLECTION_CLIENT_PROMPT_CACHE = os.getenv(
+    "DIRECTUS_COLLECTION_CLIENT_PROMPT_CACHE",
+    "client_prompt_cache",
+).strip()
 AGENT_NAME = os.getenv("AGENT_NAME", "main-bot")
 LIVEKIT_SELF_HOSTED = _env_bool("LIVEKIT_SELF_HOSTED", default=False)
 AGENT_HEALTH_HOST = os.getenv(
