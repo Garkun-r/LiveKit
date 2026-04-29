@@ -6,7 +6,7 @@ import os
 import random
 import re
 import tempfile
-from collections.abc import AsyncIterable, AsyncIterator, Awaitable
+from collections.abc import AsyncIterable, AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,9 +32,7 @@ from livekit.agents import (
     BackgroundAudioPlayer,
     JobContext,
     JobProcess,
-    RunContext,
     cli,
-    function_tool,
     inference,
     room_io,
     tokenize,
@@ -219,6 +217,8 @@ from egress import (
 )
 from eleven_v3_tts import ElevenV3TTS
 from prompt_repo import PromptResolution, get_active_prompt, resolve_prompt_for_call
+from robot_skills import RobotSkillContext, RobotSkillRunner
+from robot_tags import parse_robot_tags, sanitize_tagged_text_stream
 from routing.model_router import ModelRouter, ModelRouteResult, coerce_optional_bool
 from session_export import send_session_to_n8n
 from vertex_gemini_tts import VertexGeminiTTS
@@ -1989,7 +1989,6 @@ def build_stt(
 class Assistant(Agent):
     def __init__(
         self,
-        request_end_call: Callable[[RunContext, str], Awaitable[str]] | None = None,
         model_router: ModelRouter | None = None,
         routed_llms: dict[str, Any] | None = None,
         routed_llm_providers: dict[str, str] | None = None,
@@ -1998,9 +1997,9 @@ class Assistant(Agent):
         first_turn_short_greeting_audio_path: Path = _SHORT_GREETING_AUDIO_PATH,
         prerecorded_audio_sample_rate: int = 24000,
         voice_prompts: VoicePromptManager | None = None,
+        tag_skill_runner: RobotSkillRunner | None = None,
         prompt: str | None = None,
     ) -> None:
-        self._request_end_call = request_end_call or self._noop_end_call
         self._model_router = model_router
         self._routed_llms = routed_llms or {}
         self._routed_llm_providers = routed_llm_providers or {}
@@ -2011,21 +2010,12 @@ class Assistant(Agent):
         )
         self._prerecorded_audio_sample_rate = prerecorded_audio_sample_rate
         self._voice_prompts = voice_prompts
+        self._tag_skill_runner = tag_skill_runner
         self._awaiting_first_user_turn = True
         self._llm_branch_started_at: dict[str, float] = {}
         resolved_prompt = prompt if prompt is not None else get_active_prompt()
-        super().__init__(
-            instructions=(
-                f"{resolved_prompt}\n\n"
-                "Дополнительное правило: когда разговор логически завершен и ты уже "
-                "сказала финальную прощальную фразу, вызови tool end_call.\n"
-                "После вызова end_call не добавляй новых реплик пользователю."
-            )
-        )
+        super().__init__(instructions=resolved_prompt)
         self._register_llm_availability_listeners()
-
-    async def _noop_end_call(self, _: RunContext, __: str) -> str:
-        return "END_CALL_DISABLED"
 
     async def on_user_turn_completed(self, _: Any, new_message: ChatMessage) -> None:
         if not self._awaiting_first_user_turn:
@@ -2058,7 +2048,11 @@ class Assistant(Agent):
     async def tts_node(
         self, text: AsyncIterable[str], model_settings: Any
     ) -> AsyncIterator[rtc.AudioFrame]:
-        audio_stream = Agent.default.tts_node(self, text, model_settings)
+        audio_stream = Agent.default.tts_node(
+            self,
+            sanitize_tagged_text_stream(text),
+            model_settings,
+        )
         waited_for_prompt = False
         async for frame in audio_stream:
             if not waited_for_prompt:
@@ -2066,6 +2060,95 @@ class Assistant(Agent):
                     await self._voice_prompts.wait_for_active_prompt()
                 waited_for_prompt = True
             yield frame
+
+    async def transcription_node(
+        self, text: AsyncIterable[str], model_settings: Any
+    ) -> AsyncIterator[str]:
+        async for chunk in Agent.default.transcription_node(
+            self,
+            sanitize_tagged_text_stream(text),
+            model_settings,
+        ):
+            yield chunk
+
+    def _capture_robot_tag_text(self, raw_parts: list[str], chunk: Any) -> None:
+        if isinstance(chunk, str):
+            raw_parts.append(chunk)
+            return
+
+        delta = getattr(chunk, "delta", None)
+        content = getattr(delta, "content", None)
+        if content:
+            raw_parts.append(str(content))
+
+    def _register_robot_tag_output(self, raw_text: str) -> None:
+        if self._tag_skill_runner is None or not raw_text:
+            return
+
+        parsed = parse_robot_tags(raw_text)
+        if not parsed.has_action_or_tags:
+            return
+
+        try:
+            from livekit.agents.voice.agent_activity import _SpeechHandleContextVar
+
+            speech_handle = _SpeechHandleContextVar.get(None)
+        except Exception:
+            speech_handle = None
+
+        if speech_handle is None:
+            self._schedule_robot_tag_run(
+                parsed,
+                speech_handle_id=None,
+                interrupted=False,
+            )
+            return
+
+        def _on_speech_done(handle: Any) -> None:
+            self._schedule_robot_tag_run(
+                parsed,
+                speech_handle_id=str(getattr(handle, "id", "")) or None,
+                interrupted=bool(getattr(handle, "interrupted", False)),
+            )
+
+        speech_handle.add_done_callback(_on_speech_done)
+
+    def _schedule_robot_tag_run(
+        self,
+        parsed: Any,
+        *,
+        speech_handle_id: str | None,
+        interrupted: bool,
+    ) -> None:
+        if self._tag_skill_runner is None:
+            return
+
+        task = asyncio.create_task(
+            self._tag_skill_runner.run(
+                parsed,
+                speech_handle_id=speech_handle_id,
+                interrupted=interrupted,
+            ),
+            name="robot_tag_skill",
+        )
+
+        def _log_task_result(done_task: asyncio.Task) -> None:
+            with suppress(BaseException):
+                done_task.result()
+
+        task.add_done_callback(_log_task_result)
+
+    async def _tracked_robot_tag_llm_stream(
+        self,
+        stream: AsyncIterable[Any],
+    ) -> AsyncIterator[Any]:
+        raw_parts: list[str] = []
+        try:
+            async for chunk in stream:
+                self._capture_robot_tag_text(raw_parts, chunk)
+                yield chunk
+        finally:
+            self._register_robot_tag_output("".join(raw_parts))
 
     def _get_last_user_turn(self, chat_ctx: Any) -> tuple[str | None, bool | None]:
         if self._model_router is None:
@@ -2331,12 +2414,14 @@ class Assistant(Agent):
             primary_provider = route_metadata.primary_provider
 
         if route_metadata is None and isinstance(primary_llm, inference.LLM):
-            async for chunk in self._stream_llm(
-                primary_llm,
-                "livekit_inference",
-                chat_ctx,
-                tools,
-                model_settings,
+            async for chunk in self._tracked_robot_tag_llm_stream(
+                self._stream_llm(
+                    primary_llm,
+                    "livekit_inference",
+                    chat_ctx,
+                    tools,
+                    model_settings,
+                )
             ):
                 yield chunk
             return
@@ -2347,12 +2432,14 @@ class Assistant(Agent):
             )
             yielded_any = False
             try:
-                async for chunk in self._stream_llm(
-                    primary_llm,
-                    primary_provider,
-                    chat_ctx,
-                    tools,
-                    model_settings,
+                async for chunk in self._tracked_robot_tag_llm_stream(
+                    self._stream_llm(
+                        primary_llm,
+                        primary_provider,
+                        chat_ctx,
+                        tools,
+                        model_settings,
+                    )
                 ):
                     yielded_any = True
                     yield chunk
@@ -2385,13 +2472,15 @@ class Assistant(Agent):
         yielded_any = False
 
         try:
-            async for chunk in self._stream_llm_with_ttft_timeout(
-                primary_llm,
-                primary_provider,
-                chat_ctx,
-                tools,
-                model_settings,
-                first_token_timeout=LLM_FIRST_TOKEN_TIMEOUT_SEC,
+            async for chunk in self._tracked_robot_tag_llm_stream(
+                self._stream_llm_with_ttft_timeout(
+                    primary_llm,
+                    primary_provider,
+                    chat_ctx,
+                    tools,
+                    model_settings,
+                    first_token_timeout=LLM_FIRST_TOKEN_TIMEOUT_SEC,
+                )
             ):
                 yielded_any = True
                 yield chunk
@@ -2418,13 +2507,15 @@ class Assistant(Agent):
         await asyncio.sleep(max(0.0, LLM_RETRY_DELAY_SEC))
 
         try:
-            async for chunk in self._stream_llm_with_ttft_timeout(
-                primary_llm,
-                primary_provider,
-                chat_ctx,
-                tools,
-                model_settings,
-                first_token_timeout=LLM_FIRST_TOKEN_TIMEOUT_SEC,
+            async for chunk in self._tracked_robot_tag_llm_stream(
+                self._stream_llm_with_ttft_timeout(
+                    primary_llm,
+                    primary_provider,
+                    chat_ctx,
+                    tools,
+                    model_settings,
+                    first_token_timeout=LLM_FIRST_TOKEN_TIMEOUT_SEC,
+                )
             ):
                 yield chunk
             return
@@ -2446,30 +2537,17 @@ class Assistant(Agent):
                 raise
             logger.warning("retry failed; switching to fallback model")
 
-        async for chunk in self._stream_llm_with_ttft_timeout(
-            self._fallback_llm,
-            "google",
-            chat_ctx,
-            tools,
-            model_settings,
-            first_token_timeout=LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
+        async for chunk in self._tracked_robot_tag_llm_stream(
+            self._stream_llm_with_ttft_timeout(
+                self._fallback_llm,
+                "google",
+                chat_ctx,
+                tools,
+                model_settings,
+                first_token_timeout=LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
+            )
         ):
             yield chunk
-
-    @function_tool
-    async def end_call(
-        self, context: RunContext, reason: str = "conversation_completed"
-    ) -> None:
-        """Use only when the conversation is logically finished and no more questions are expected.
-
-        Rules:
-        - Call only after a final goodbye phrase.
-        - Never call in the middle of consultation.
-        - If the user asks a new question, continue dialogue and do not call this tool.
-        - After this tool call, do not produce additional user-facing text.
-        """
-        await self._request_end_call(context, reason)
-        raise StopResponse()
 
 
 def compute_server_load(agent_server: AgentServer) -> float:
@@ -2536,16 +2614,15 @@ async def my_agent(ctx: JobContext):
     session_started_at = datetime.now(timezone.utc)
 
     transcript_items = []
+    tag_events = []
     usage_updates = []
     metrics_events = []
     close_info = {"reason": None, "error": None}
     close_event = asyncio.Event()
-    user_activity_event = asyncio.Event()
     user_activity_count = 0
     assistant_message_count = 0
     end_call_task: asyncio.Task | None = None
     reply_watchdog_task: asyncio.Task | None = None
-    end_call_grace_sec = 6.0
     export_wait_sec = 20.0
     export_task: asyncio.Task | None = None
     session_close_task: asyncio.Task | None = None
@@ -2775,7 +2852,7 @@ async def my_agent(ctx: JobContext):
                 },
             )
             # Safety path for stuck scheduling:
-            # - disable tools to prevent accidental end_call
+            # - disable tools to prevent accidental action calls
             # - nudge model to answer latest user request directly
             await session.generate_reply(
                 instructions=(
@@ -2841,10 +2918,6 @@ async def my_agent(ctx: JobContext):
                 )
                 # Any new user speech cancels a pending auto-hangup timer.
                 user_activity_count += 1
-                user_activity_event.set()
-                if end_call_task and not end_call_task.done():
-                    end_call_task.cancel()
-                    end_call_task = None
                 if bool(getattr(ev, "is_final", False)) and REPLY_WATCHDOG_SEC > 0:
                     if reply_watchdog_task and not reply_watchdog_task.done():
                         reply_watchdog_task.cancel()
@@ -2993,10 +3066,12 @@ async def my_agent(ctx: JobContext):
                 "prompt_lookup_error": prompt_resolution.error,
             },
             "transcript_items": transcript_items,
+            "tag_events": tag_events,
             "usage_updates": usage_updates,
             "metrics_events": metrics_events,
             "summary": {
                 "transcript_count": len(transcript_items),
+                "tag_event_count": len(tag_events),
                 "usage_update_count": len(usage_updates),
                 "metrics_count": len(metrics_events),
             },
@@ -3024,7 +3099,7 @@ async def my_agent(ctx: JobContext):
             logger.exception("session close failed: %s", e)
 
     async def delete_room_safely(reason: str) -> None:
-        close_reason = f"end_call:{reason}"
+        close_reason = f"tag_action:{reason}"
         try:
             close_info["reason"] = close_reason
             voice_prompts.cancel_client_silence_timer()
@@ -3039,7 +3114,7 @@ async def my_agent(ctx: JobContext):
             logger.warning("delete_room timed out; forcing local shutdown")
         except Exception as e:
             logger.exception("failed to delete room: %s", e)
-            close_reason = f"end_call_failed:{reason}"
+            close_reason = f"tag_action_failed:{reason}"
             close_info["reason"] = close_reason
         finally:
             # Unblock main entrypoint even if LiveKit close signal arrives late.
@@ -3050,54 +3125,23 @@ async def my_agent(ctx: JobContext):
             # waiting for an external room-close callback.
             await ensure_session_closed(timeout_sec=2.0)
 
-    async def request_end_call(context: RunContext, reason: str) -> str:
+    async def request_tag_end_call(reason: str) -> str:
         nonlocal end_call_task
         if end_call_task and not end_call_task.done():
             return "END_CALL_ALREADY_SCHEDULED"
 
-        requested_activity = user_activity_count
-        end_call_requested_at = asyncio.get_running_loop().time()
         voice_prompts.cancel_client_silence_timer()
         voice_prompts.cancel_response_delay_timer()
 
-        async def end_after_farewell() -> None:
+        async def end_after_tag() -> None:
             try:
-                # Prevent cutting the final assistant phrase.
-                await context.wait_for_playout()
-            except Exception as e:
-                logger.exception("wait_for_playout failed before end_call: %s", e)
-                return
-
-            if user_activity_count != requested_activity:
-                logger.info("end_call canceled: user spoke during final playout")
-                return
-
-            # Grace timeout is counted from end_call request moment to avoid
-            # stacking "playout duration + full grace period".
-            elapsed = asyncio.get_running_loop().time() - end_call_requested_at
-            remaining_grace = max(0.0, end_call_grace_sec - elapsed)
-            try:
-                # If the grace window has already passed while the final phrase
-                # was playing, end the room immediately.
-                if remaining_grace <= 0:
-                    await delete_room_safely(reason)
-                    return
-
-                user_activity_event.clear()
-                # Fallback grace period: if user resumes talking, keep the call open.
-                await asyncio.wait_for(
-                    user_activity_event.wait(), timeout=remaining_grace
-                )
-                logger.info("end_call canceled: user resumed speech")
-                return
-            except asyncio.TimeoutError:
                 await delete_room_safely(reason)
             except asyncio.CancelledError:
-                logger.info("end_call timer canceled")
+                logger.info("tag end-call task canceled")
             except Exception as e:
-                logger.exception("end_call timer failed: %s", e)
+                logger.exception("tag end-call task failed: %s", e)
 
-        end_call_task = asyncio.create_task(end_after_farewell())
+        end_call_task = asyncio.create_task(end_after_tag(), name="tag_end_call")
         return "END_CALL_SCHEDULED"
 
     @session.on("close")
@@ -3154,9 +3198,19 @@ async def my_agent(ctx: JobContext):
                 "sip_client_number": prompt_resolution.sip_client_number,
             },
         )
+        tag_skill_runner = RobotSkillRunner(
+            context=RobotSkillContext(
+                agent_name=AGENT_NAME,
+                room_name=ctx.room.name,
+                participant_identity=str(getattr(participant, "identity", "") or "")
+                or None,
+                sip_call_numbers=sip_call_numbers,
+            ),
+            request_end_call=request_tag_end_call,
+            record_event=tag_events.append,
+        )
 
         assistant = Assistant(
-            request_end_call=request_end_call,
             model_router=model_router,
             routed_llms=routed_llms,
             routed_llm_providers=routed_llm_providers,
@@ -3165,6 +3219,7 @@ async def my_agent(ctx: JobContext):
             first_turn_short_greeting_audio_path=_SHORT_GREETING_AUDIO_PATH,
             prerecorded_audio_sample_rate=audio_output_sample_rate,
             voice_prompts=voice_prompts,
+            tag_skill_runner=tag_skill_runner,
             prompt=prompt_resolution.prompt,
         )
 

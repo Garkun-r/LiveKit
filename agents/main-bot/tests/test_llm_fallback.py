@@ -584,21 +584,12 @@ async def test_agent_speech_interrupts_active_response_delay_prompt(tmp_path) ->
     assert handle.stopped is True
 
 
-@pytest.mark.asyncio
-async def test_end_call_stops_tool_reply_generation() -> None:
-    requested_reasons: list[str] = []
+def test_end_call_tool_removed() -> None:
+    assistant = agent.Assistant(prompt="test prompt")
 
-    async def request_end_call(_, reason: str) -> str:
-        requested_reasons.append(reason)
-        return "END_CALL_SCHEDULED"
-
-    assistant = agent.Assistant(request_end_call=request_end_call)
-
-    with pytest.raises(agent.StopResponse):
-        await assistant.end_call._func(
-            assistant,
-            object(),
-            "conversation_completed",
-        )
-
-    assert requested_reasons == ["conversation_completed"]
+    tool_names = [
+        str(getattr(getattr(tool, "info", None), "name", "") or "")
+        for tool in assistant.tools
+    ]
+    assert "end_call" not in tool_names
+    assert not hasattr(assistant, "end_call")
