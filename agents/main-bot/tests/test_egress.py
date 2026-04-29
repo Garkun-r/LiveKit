@@ -14,11 +14,14 @@ def test_provider_defaults_match_latency_policy(monkeypatch) -> None:
     monkeypatch.delenv("GEMINI_EGRESS", raising=False)
     monkeypatch.delenv("XAI_EGRESS", raising=False)
     monkeypatch.delenv("DEEPGRAM_EGRESS", raising=False)
+    monkeypatch.delenv("TBANK_VOICEKIT_EGRESS", raising=False)
 
     assert provider_egress("elevenlabs") == "proxy"
     assert provider_egress("gemini") == "proxy"
     assert provider_egress("xai") == "direct"
     assert provider_egress("deepgram") == "direct"
+    assert provider_egress("tbank_stt") == "direct"
+    assert provider_egress("tbank_tts") == "direct"
     assert provider_egress("livekit_inference") == "proxy"
 
 
@@ -32,6 +35,15 @@ def test_provider_override_and_proxy_url(monkeypatch) -> None:
         "trust_env": False,
         "proxy": "http://proxy.example:15182",
     }
+
+
+def test_tbank_shared_egress_override(monkeypatch) -> None:
+    monkeypatch.setenv("EGRESS_PROXY_URL", "http://proxy.example:15182")
+    monkeypatch.setenv("TBANK_VOICEKIT_EGRESS", "proxy")
+
+    assert provider_egress("tbank_stt") == "proxy"
+    assert provider_egress("tbank_tts") == "proxy"
+    assert provider_proxy_url("tbank_stt") == "http://proxy.example:15182"
 
 
 def test_direct_mode_ignores_global_proxy_env(monkeypatch) -> None:

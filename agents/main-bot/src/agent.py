@@ -177,13 +177,29 @@ from config import (
     STT_INFERENCE_LANGUAGE,
     STT_INFERENCE_MODEL,
     STT_PROVIDER,
+    STT_TBANK_CHUNK_MS,
+    STT_TBANK_INTERIM_INTERVAL_SEC,
+    STT_TBANK_LANGUAGE,
+    STT_TBANK_MODEL,
+    STT_TBANK_SAMPLE_RATE,
     STT_YANDEX_CHUNK_MS,
     STT_YANDEX_EOU_SENSITIVITY,
     STT_YANDEX_LANGUAGE,
     STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS,
     STT_YANDEX_MODEL,
     STT_YANDEX_SAMPLE_RATE,
+    TBANK_VOICEKIT_API_KEY,
+    TBANK_VOICEKIT_AUTHORITY,
+    TBANK_VOICEKIT_ENDPOINT,
+    TBANK_VOICEKIT_SECRET_KEY,
     TTS_PROVIDER,
+    TTS_TBANK_FORMAT,
+    TTS_TBANK_MIN_SENTENCE_LEN,
+    TTS_TBANK_PITCH,
+    TTS_TBANK_SAMPLE_RATE,
+    TTS_TBANK_SPEAKING_RATE,
+    TTS_TBANK_STREAM_CONTEXT_LEN,
+    TTS_TBANK_VOICE_NAME,
     TURN_DETECTION_MODE,
     TURN_ENDPOINTING_MODE,
     TURN_MAX_ENDPOINTING_DELAY,
@@ -221,6 +237,8 @@ from eleven_v3_tts import ElevenV3TTS
 from prompt_repo import PromptResolution, get_active_prompt, resolve_prompt_for_call
 from routing.model_router import ModelRouter, ModelRouteResult, coerce_optional_bool
 from session_export import send_session_to_n8n
+from tbank_stt import TBankVoiceKitSTT
+from tbank_tts import TBankVoiceKitTTS
 from vertex_gemini_tts import VertexGeminiTTS
 from yandex_stt import YandexSpeechKitSTT
 
@@ -393,6 +411,8 @@ def resolve_audio_output_sample_rate() -> int:
         return MINIMAX_TTS_SAMPLE_RATE
     if TTS_PROVIDER == "cosyvoice":
         return COSYVOICE_TTS_SAMPLE_RATE
+    if TTS_PROVIDER == "tbank":
+        return TTS_TBANK_SAMPLE_RATE
     return 24000
 
 
@@ -1515,12 +1535,58 @@ def _google_tts_credentials_available() -> bool:
 def build_tts(
     external_http_sessions: list[aiohttp.ClientSession] | None = None,
 ) -> Any:
-    if TTS_PROVIDER not in {"google", "vertex", "minimax", "cosyvoice", "elevenlabs"}:
+    if TTS_PROVIDER not in {
+        "google",
+        "vertex",
+        "minimax",
+        "cosyvoice",
+        "tbank",
+        "elevenlabs",
+    }:
         logger.warning(
             "Unknown TTS_PROVIDER='%s'. Falling back to ElevenLabs.",
             TTS_PROVIDER,
         )
         return build_elevenlabs_tts()
+
+    if TTS_PROVIDER == "tbank":
+        if not TBANK_VOICEKIT_API_KEY.strip() or not TBANK_VOICEKIT_SECRET_KEY.strip():
+            raise RuntimeError(
+                "T-Bank VoiceKit TTS is configured but TBANK_VOICEKIT_API_KEY "
+                "or TBANK_VOICEKIT_SECRET_KEY is missing."
+            )
+
+        logger.info(
+            "using T-Bank VoiceKit TTS provider",
+            extra={
+                "voice": TTS_TBANK_VOICE_NAME,
+                "format": TTS_TBANK_FORMAT,
+                "sample_rate": TTS_TBANK_SAMPLE_RATE,
+                "speaking_rate": TTS_TBANK_SPEAKING_RATE,
+                "pitch": TTS_TBANK_PITCH,
+                "min_sentence_len": max(2, TTS_TBANK_MIN_SENTENCE_LEN),
+                "stream_context_len": max(1, TTS_TBANK_STREAM_CONTEXT_LEN),
+                "endpoint": TBANK_VOICEKIT_ENDPOINT,
+                "authority": TBANK_VOICEKIT_AUTHORITY or None,
+                "egress": provider_egress("tbank_tts"),
+            },
+        )
+        with provider_egress_env("tbank_tts"):
+            return TBankVoiceKitTTS(
+                api_key=TBANK_VOICEKIT_API_KEY,
+                secret_key=TBANK_VOICEKIT_SECRET_KEY,
+                voice_name=TTS_TBANK_VOICE_NAME,
+                audio_format=TTS_TBANK_FORMAT,
+                sample_rate=TTS_TBANK_SAMPLE_RATE,
+                speaking_rate=TTS_TBANK_SPEAKING_RATE,
+                pitch=TTS_TBANK_PITCH,
+                endpoint=TBANK_VOICEKIT_ENDPOINT,
+                authority=TBANK_VOICEKIT_AUTHORITY,
+                tokenizer_obj=tokenize.blingfire.SentenceTokenizer(
+                    min_sentence_len=max(2, TTS_TBANK_MIN_SENTENCE_LEN),
+                    stream_context_len=max(1, TTS_TBANK_STREAM_CONTEXT_LEN),
+                ),
+            )
 
     if TTS_PROVIDER == "cosyvoice":
         if COSYVOICE_TTS_TRANSPORT != "websocket":
@@ -1932,6 +1998,41 @@ def build_stt(
                     max_pause_between_words_hint_ms=(
                         STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS
                     ),
+                )
+            )
+
+    if STT_PROVIDER == "tbank":
+        if not TBANK_VOICEKIT_API_KEY.strip() or not TBANK_VOICEKIT_SECRET_KEY.strip():
+            raise RuntimeError(
+                "T-Bank VoiceKit STT is configured but TBANK_VOICEKIT_API_KEY "
+                "or TBANK_VOICEKIT_SECRET_KEY is missing."
+            )
+
+        logger.info(
+            "using T-Bank VoiceKit STT provider",
+            extra={
+                "model": STT_TBANK_MODEL or "default",
+                "language": STT_TBANK_LANGUAGE,
+                "sample_rate": STT_TBANK_SAMPLE_RATE,
+                "chunk_ms": STT_TBANK_CHUNK_MS,
+                "interim_interval_sec": STT_TBANK_INTERIM_INTERVAL_SEC,
+                "endpoint": TBANK_VOICEKIT_ENDPOINT,
+                "authority": TBANK_VOICEKIT_AUTHORITY or None,
+                "egress": provider_egress("tbank_stt"),
+            },
+        )
+        with provider_egress_env("tbank_stt"):
+            return _wrap_stt_for_early_interim_final(
+                TBankVoiceKitSTT(
+                    api_key=TBANK_VOICEKIT_API_KEY,
+                    secret_key=TBANK_VOICEKIT_SECRET_KEY,
+                    model=STT_TBANK_MODEL,
+                    language=STT_TBANK_LANGUAGE,
+                    sample_rate=STT_TBANK_SAMPLE_RATE,
+                    chunk_ms=STT_TBANK_CHUNK_MS,
+                    interim_interval_sec=STT_TBANK_INTERIM_INTERVAL_SEC,
+                    endpoint=TBANK_VOICEKIT_ENDPOINT,
+                    authority=TBANK_VOICEKIT_AUTHORITY,
                 )
             )
 
