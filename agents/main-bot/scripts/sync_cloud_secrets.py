@@ -9,14 +9,41 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-# Sync all non-empty .env vars by default, except connection creds
-# that should come from LiveKit Cloud environment itself.
+# Sync all non-empty .env vars by default, except connection creds that should
+# come from LiveKit Cloud itself and local proxy routes that are only for the
+# self-hosted/local robot.
 DEFAULT_EXCLUDE_KEYS = {
+    "AGENT_EXTERNAL_HTTP_PROXY",
+    "ALL_PROXY",
+    "EGRESS_PROXY_URL",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
     "LIVEKIT_URL",
     "LIVEKIT_API_KEY",
     "LIVEKIT_API_SECRET",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
+}
+PROXY_EGRESS_VALUES = {
+    "1",
+    "http_connect",
+    "on",
+    "proxied",
+    "proxy",
+    "squid",
+    "true",
+    "vps",
+    "yes",
 }
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def is_proxy_egress_setting(key: str, value: str) -> bool:
+    normalized_value = value.strip().lower()
+    if normalized_value not in PROXY_EGRESS_VALUES:
+        return False
+    return key == "EGRESS_DEFAULT" or key.endswith("_EGRESS")
 
 
 def build_secret_map(env_file: Path, exclude_keys: set[str]) -> dict[str, str]:
@@ -31,6 +58,8 @@ def build_secret_map(env_file: Path, exclude_keys: set[str]) -> dict[str, str]:
             continue
         value_str = str(value).strip()
         if not value_str:
+            continue
+        if is_proxy_egress_setting(key, value_str):
             continue
         secrets[key] = value_str
 

@@ -22,7 +22,7 @@ _PROVIDER_DEFAULTS: dict[str, str] = {
     "vertex_tts": "proxy",
     "google_stt": "proxy",
     "yandex_stt": "direct",
-    "xai": "direct",
+    "xai": "proxy",
     "deepgram": "direct",
     "minimax": "direct",
     "cosyvoice": "direct",

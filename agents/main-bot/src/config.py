@@ -51,16 +51,20 @@ YANDEX_SPEECHKIT_API_KEY = os.getenv("YANDEX_SPEECHKIT_API_KEY", "")
 # - google (default, direct Gemini API)
 # - xai (xAI Grok via livekit.plugins.xai.responses.LLM)
 def _normalize_llm_provider(raw_provider: str) -> str:
+    normalized = raw_provider.strip().lower()
+    if normalized in {"", "0", "false", "none", "off", "disabled"}:
+        return ""
     return {
         "google": "google",
         "gemini": "google",
         "xai": "xai",
         "grok": "xai",
-    }.get(raw_provider.strip().lower(), raw_provider.strip().lower())
+    }.get(normalized, normalized)
 
 
 _raw_llm_provider = os.getenv("LLM_PROVIDER", "google")
 LLM_PROVIDER = _normalize_llm_provider(_raw_llm_provider)
+LLM_ENABLE_TOOLS = _env_bool("LLM_ENABLE_TOOLS", default=True)
 
 # Optional rule-based routing providers.
 # If both are set, routing is enabled:
@@ -279,6 +283,10 @@ STT_EARLY_INTERIM_FINAL_ENABLED = _env_bool(
 )
 STT_EARLY_INTERIM_FINAL_DELAY_SEC = float(
     os.getenv("STT_EARLY_INTERIM_FINAL_DELAY_SEC", "0.15")
+)
+STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS = max(
+    1,
+    _env_optional_int("STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS") or 1,
 )
 
 # Google TTS runtime settings.

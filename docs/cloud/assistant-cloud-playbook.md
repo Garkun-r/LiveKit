@@ -47,7 +47,7 @@ With the right access, Codex can help manage:
 Start from the agent directory:
 
 ```bash
-cd /Users/romangarkun/Documents/LiveKit/agents/main-bot
+cd /Users/romangarkun/Documents/Проекты/LiveKit/agents/main-bot
 ```
 
 Check docs first:
@@ -131,6 +131,11 @@ Preferred sync path for this repository:
 ```bash
 uv run python scripts/sync_cloud_secrets.py --env-file .env.local
 ```
+
+This sync path filters out LiveKit connection credentials and local proxy
+routing. Cloud secrets should not include local service proxy flags such as
+`EGRESS_PROXY_URL` or `<PROVIDER>_EGRESS=proxy`; those belong to local/self-hosted
+deploy env only.
 
 Direct LiveKit CLI alternative:
 

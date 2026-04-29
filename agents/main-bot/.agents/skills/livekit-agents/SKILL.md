@@ -13,6 +13,19 @@ This skill provides opinionated guidance for building voice AI agents with LiveK
 
 **This skill is for LiveKit Cloud developers.** If you're self-hosting LiveKit, some recommendations (particularly around LiveKit Inference) won't apply directly.
 
+## Project Override: Business Logic Approval
+
+This project already has production choices for providers, models, prompts,
+fallbacks, latency guards, and voice workflow. This skill's general LiveKit
+recommendations do not authorize changing those choices.
+
+Do not switch LLM/STT/TTS providers or models, change prompts, enable/disable
+fallbacks, alter handoffs/tasks, or change turn/latency behavior without
+explicit owner approval. If a provider is slow, blocked, rate-limited, or
+failing, diagnose the root cause first and present any provider/model switch as
+a business decision with quality, latency, cost, reliability, and rollback
+tradeoffs.
+
 ## MANDATORY: Read This Checklist Before Starting
 
 Before writing ANY code, complete this checklist:

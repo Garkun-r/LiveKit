@@ -17,7 +17,7 @@ def test_provider_defaults_match_latency_policy(monkeypatch) -> None:
 
     assert provider_egress("elevenlabs") == "proxy"
     assert provider_egress("gemini") == "proxy"
-    assert provider_egress("xai") == "direct"
+    assert provider_egress("xai") == "proxy"
     assert provider_egress("deepgram") == "direct"
     assert provider_egress("livekit_inference") == "proxy"
 

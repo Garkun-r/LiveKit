@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import weakref
 from contextlib import suppress
 from dataclasses import replace
 from difflib import SequenceMatcher
@@ -24,11 +25,19 @@ _WHITESPACE_RE = re.compile(r"\s+")
 class EarlyInterimFinalSTT(stt.STT):
     """Provider-agnostic STT wrapper that finalizes a held interim after EOS."""
 
-    def __init__(self, wrapped: stt.STT, *, delay_sec: float = 0.15) -> None:
+    def __init__(
+        self,
+        wrapped: stt.STT,
+        *,
+        delay_sec: float = 0.15,
+        min_stable_interims: int = 1,
+    ) -> None:
         super().__init__(capabilities=wrapped.capabilities)
         self._wrapped = wrapped
         self._delay_sec = max(0.0, delay_sec)
+        self._min_stable_interims = max(1, min_stable_interims)
         self._recognize_metrics_needed = False
+        self._streams: weakref.WeakSet[EarlyInterimFinalStream] = weakref.WeakSet()
 
         wrapped.on("metrics_collected", self._on_metrics_collected)
         wrapped.on("error", self._on_error)
@@ -44,6 +53,10 @@ class EarlyInterimFinalSTT(stt.STT):
     @property
     def delay_sec(self) -> float:
         return self._delay_sec
+
+    @property
+    def min_stable_interims(self) -> int:
+        return self._min_stable_interims
 
     @property
     def wrapped(self) -> stt.STT:
@@ -68,14 +81,23 @@ class EarlyInterimFinalSTT(stt.STT):
         language: NotGivenOr[str] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> EarlyInterimFinalStream:
-        return EarlyInterimFinalStream(
+        stream = EarlyInterimFinalStream(
             stt_obj=self,
             inner_stream=self._wrapped.stream(
                 language=language,
                 conn_options=conn_options,
             ),
             delay_sec=self._delay_sec,
+            min_stable_interims=self._min_stable_interims,
         )
+        self._streams.add(stream)
+        return stream
+
+    def notify_local_end_of_speech(self, *, ended_at: float | None = None) -> None:
+        """Notify active STT streams that local VAD has detected speech end."""
+
+        for stream in list(self._streams):
+            stream.notify_local_end_of_speech(ended_at=ended_at)
 
     async def aclose(self) -> None:
         await self._wrapped.aclose()
@@ -97,6 +119,7 @@ class EarlyInterimFinalStream(stt.SpeechStream):
         stt_obj: EarlyInterimFinalSTT,
         inner_stream: stt.SpeechStream,
         delay_sec: float,
+        min_stable_interims: int,
     ) -> None:
         super().__init__(
             stt=stt_obj,
@@ -104,15 +127,22 @@ class EarlyInterimFinalStream(stt.SpeechStream):
         )
         self._inner_stream = inner_stream
         self._delay_sec = max(0.0, delay_sec)
+        self._min_stable_interims = max(1, min_stable_interims)
         self._state_lock = asyncio.Lock()
         self._forward_input_task: asyncio.Task[None] | None = None
         self._pending_eos_task: asyncio.Task[None] | None = None
+        self._local_eos_task: asyncio.Task[None] | None = None
+        self._notify_tasks: set[asyncio.Task[None]] = set()
         self._pending_eos: stt.SpeechEvent | None = None
         self._last_interim: stt.SpeechEvent | None = None
+        self._last_interim_normalized_text = ""
+        self._last_interim_stable_count = 0
         self._last_synthetic_text = ""
         self._final_seen = False
         self._synthetic_committed = False
         self._speech_ended = False
+        self._local_eos_deadline: float | None = None
+        self._local_eos_due = False
 
     async def _run(self) -> None:
         self._forward_input_task = asyncio.create_task(
@@ -126,6 +156,8 @@ class EarlyInterimFinalStream(stt.SpeechStream):
         finally:
             await self._flush_pending_eos()
             await self._cancel_pending_eos_task()
+            await self._cancel_local_eos_task()
+            await _cancel_tasks(self._notify_tasks)
             if self._forward_input_task is not None:
                 self._forward_input_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -150,6 +182,7 @@ class EarlyInterimFinalStream(stt.SpeechStream):
         if ev.type == stt.SpeechEventType.START_OF_SPEECH:
             async with self._state_lock:
                 await self._cancel_pending_eos_task_locked()
+                await self._cancel_local_eos_task_locked()
                 self._reset_segment_locked()
                 self._event_ch.send_nowait(ev)
             return
@@ -162,8 +195,9 @@ class EarlyInterimFinalStream(stt.SpeechStream):
                 if self._speech_ended:
                     self._reset_segment_locked()
                 if _event_text(ev):
-                    self._last_interim = ev
+                    self._remember_interim_locked(ev)
                 self._event_ch.send_nowait(ev)
+                self._emit_due_local_synthetic_final_locked()
             return
 
         if ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
@@ -174,6 +208,8 @@ class EarlyInterimFinalStream(stt.SpeechStream):
 
                 self._final_seen = True
                 await self._cancel_pending_eos_task_locked()
+                await self._cancel_local_eos_task_locked()
+                self._clear_local_eos_locked()
                 self._event_ch.send_nowait(ev)
                 self._last_interim = None
                 if self._pending_eos is not None:
@@ -182,7 +218,11 @@ class EarlyInterimFinalStream(stt.SpeechStream):
 
         if ev.type == stt.SpeechEventType.END_OF_SPEECH:
             async with self._state_lock:
-                if self._final_seen or self._last_interim is None:
+                if (
+                    self._final_seen
+                    or self._synthetic_committed
+                    or self._last_interim is None
+                ):
                     self._event_ch.send_nowait(ev)
                     self._speech_ended = True
                     return
@@ -197,12 +237,79 @@ class EarlyInterimFinalStream(stt.SpeechStream):
 
         self._event_ch.send_nowait(ev)
 
+    def notify_local_end_of_speech(self, *, ended_at: float | None = None) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(
+                "cannot notify local VAD end of speech without a running event loop"
+            )
+            return
+
+        task = loop.create_task(
+            self._notify_local_end_of_speech(ended_at=ended_at),
+            name="EarlyInterimFinalStream._notify_local_end_of_speech",
+        )
+        self._notify_tasks.add(task)
+        task.add_done_callback(self._notify_tasks.discard)
+
+    async def _notify_local_end_of_speech(
+        self, *, ended_at: float | None = None
+    ) -> None:
+        async with self._state_lock:
+            if self._final_seen or self._synthetic_committed:
+                return
+
+            await self._cancel_local_eos_task_locked()
+            self._local_eos_due = False
+            self._local_eos_deadline = (
+                asyncio.get_running_loop().time() + self._delay_sec
+            )
+            self._local_eos_task = asyncio.create_task(
+                self._delayed_emit_local_synthetic_final(ended_at=ended_at),
+                name="EarlyInterimFinalStream._delayed_emit_local_synthetic_final",
+            )
+            logger.debug(
+                "local VAD end of speech received for early interim final",
+                extra={
+                    "delay_sec": self._delay_sec,
+                    "min_stable_interims": self._min_stable_interims,
+                    "ended_at": ended_at,
+                    "has_interim": self._last_interim is not None,
+                    "interim_stable_count": self._last_interim_stable_count,
+                },
+            )
+
     async def _delayed_emit_synthetic_final(self) -> None:
         try:
             await asyncio.sleep(self._delay_sec)
             async with self._state_lock:
                 self._emit_synthetic_final_and_pending_eos_locked()
                 self._pending_eos_task = None
+        except asyncio.CancelledError:
+            return
+
+    async def _delayed_emit_local_synthetic_final(
+        self, *, ended_at: float | None = None
+    ) -> None:
+        try:
+            await asyncio.sleep(self._delay_sec)
+            async with self._state_lock:
+                self._local_eos_task = None
+                self._local_eos_due = True
+                emitted = self._emit_synthetic_final_locked(source="local_vad")
+                if not emitted:
+                    logger.debug(
+                        "local VAD early interim final waiting for next interim",
+                        extra={
+                            "delay_sec": self._delay_sec,
+                            "min_stable_interims": self._min_stable_interims,
+                            "ended_at": ended_at,
+                            "has_interim": self._last_interim is not None,
+                            "interim_stable_count": self._last_interim_stable_count,
+                            "final_seen": self._final_seen,
+                        },
+                    )
         except asyncio.CancelledError:
             return
 
@@ -213,25 +320,60 @@ class EarlyInterimFinalStream(stt.SpeechStream):
     def _emit_synthetic_final_and_pending_eos_locked(self) -> None:
         if self._pending_eos is None:
             return
-        if self._last_interim is not None and not self._final_seen:
-            text = _event_text(self._last_interim)
-            if text:
-                synthetic = replace(
-                    self._last_interim,
-                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                )
-                self._event_ch.send_nowait(synthetic)
-                self._synthetic_committed = True
-                self._last_synthetic_text = text
-                logger.info(
-                    "early interim final created",
-                    extra={
-                        "delay_sec": self._delay_sec,
-                        "request_id": synthetic.request_id,
-                        "characters_count": len(text),
-                    },
-                )
+        self._emit_synthetic_final_locked(source="stt_eos")
         self._emit_pending_eos_locked()
+
+    def _emit_due_local_synthetic_final_locked(self) -> bool:
+        if self._local_eos_deadline is None:
+            return False
+        if asyncio.get_running_loop().time() >= self._local_eos_deadline:
+            self._local_eos_due = True
+        if not self._local_eos_due:
+            return False
+        return self._emit_synthetic_final_locked(source="local_vad")
+
+    def _emit_synthetic_final_locked(self, *, source: str) -> bool:
+        if self._last_interim is None or self._final_seen or self._synthetic_committed:
+            return False
+
+        text = _event_text(self._last_interim)
+        if not text:
+            return False
+        if self._last_interim_stable_count < self._min_stable_interims:
+            logger.debug(
+                "early interim final skipped: interim is not stable enough",
+                extra={
+                    "delay_sec": self._delay_sec,
+                    "source": source,
+                    "request_id": self._last_interim.request_id,
+                    "characters_count": len(text),
+                    "interim_stable_count": self._last_interim_stable_count,
+                    "min_stable_interims": self._min_stable_interims,
+                },
+            )
+            return False
+
+        synthetic = replace(
+            self._last_interim,
+            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+        )
+        self._event_ch.send_nowait(synthetic)
+        self._synthetic_committed = True
+        self._final_seen = True
+        self._last_synthetic_text = text
+        self._clear_local_eos_locked()
+        logger.info(
+            "early interim final created",
+            extra={
+                "delay_sec": self._delay_sec,
+                "source": source,
+                "request_id": synthetic.request_id,
+                "characters_count": len(text),
+                "interim_stable_count": self._last_interim_stable_count,
+                "min_stable_interims": self._min_stable_interims,
+            },
+        )
+        return True
 
     def _emit_pending_eos_locked(self) -> None:
         if self._pending_eos is None:
@@ -253,13 +395,43 @@ class EarlyInterimFinalStream(stt.SpeechStream):
         with suppress(asyncio.CancelledError):
             await task
 
+    async def _cancel_local_eos_task(self) -> None:
+        async with self._state_lock:
+            await self._cancel_local_eos_task_locked()
+
+    async def _cancel_local_eos_task_locked(self) -> None:
+        task = self._local_eos_task
+        if task is None:
+            return
+        self._local_eos_task = None
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    def _clear_local_eos_locked(self) -> None:
+        self._local_eos_deadline = None
+        self._local_eos_due = False
+
+    def _remember_interim_locked(self, ev: stt.SpeechEvent) -> None:
+        text = _event_text(ev)
+        normalized_text = _normalize_text(text)
+        if _texts_equivalent(self._last_interim_normalized_text, normalized_text):
+            self._last_interim_stable_count += 1
+        else:
+            self._last_interim_stable_count = 1
+        self._last_interim = ev
+        self._last_interim_normalized_text = normalized_text
+
     def _reset_segment_locked(self) -> None:
         self._pending_eos = None
         self._last_interim = None
+        self._last_interim_normalized_text = ""
+        self._last_interim_stable_count = 0
         self._last_synthetic_text = ""
         self._final_seen = False
         self._synthetic_committed = False
         self._speech_ended = False
+        self._clear_local_eos_locked()
 
     def _log_late_final_locked(self, ev: stt.SpeechEvent) -> None:
         text = _event_text(ev)
@@ -322,6 +494,7 @@ def wrap_stt_if_enabled(
     *,
     enabled: bool,
     delay_sec: float,
+    min_stable_interims: int = 1,
     turn_detection_mode: str,
     logger_: logging.Logger = logger,
 ) -> stt.STT:
@@ -333,11 +506,16 @@ def wrap_stt_if_enabled(
     ):
         return stt_obj
 
-    wrapped = EarlyInterimFinalSTT(stt_obj, delay_sec=delay_sec)
+    wrapped = EarlyInterimFinalSTT(
+        stt_obj,
+        delay_sec=delay_sec,
+        min_stable_interims=min_stable_interims,
+    )
     logger_.info(
         "early interim final STT wrapper enabled",
         extra={
             "delay_sec": wrapped.delay_sec,
+            "min_stable_interims": wrapped.min_stable_interims,
             "provider": stt_obj.provider,
             "model": stt_obj.model,
         },
@@ -363,3 +541,15 @@ def _texts_equivalent(left: str, right: str) -> bool:
     if normalized_left == normalized_right:
         return True
     return SequenceMatcher(None, normalized_left, normalized_right).ratio() >= 0.92
+
+
+async def _cancel_tasks(tasks: set[asyncio.Task[None]]) -> None:
+    if not tasks:
+        return
+    pending = list(tasks)
+    tasks.clear()
+    for task in pending:
+        task.cancel()
+    for task in pending:
+        with suppress(asyncio.CancelledError):
+            await task

@@ -12,8 +12,8 @@ This folder is the project runbook for LiveKit Cloud work. Read it before touchi
 
 ## Project entrypoints
 
-- Repository root: `/Users/romangarkun/Documents/LiveKit`
-- Main agent directory: `/Users/romangarkun/Documents/LiveKit/agents/main-bot`
+- Repository root: `/Users/romangarkun/Documents/Проекты/LiveKit`
+- Main agent directory: `/Users/romangarkun/Documents/Проекты/LiveKit/agents/main-bot`
 - Agent code entrypoint: `agents/main-bot/src/agent.py`
 - Cloud deployment config: `agents/main-bot/livekit.toml`
 - Local env template: `agents/main-bot/.env.example`
@@ -33,7 +33,7 @@ Before making cloud changes:
 Useful read-only commands:
 
 ```bash
-cd /Users/romangarkun/Documents/LiveKit/agents/main-bot
+cd /Users/romangarkun/Documents/Проекты/LiveKit/agents/main-bot
 lk project list
 lk agent status
 lk agent versions
@@ -52,11 +52,32 @@ lk egress list
 Use the repository's existing workflow unless the task explicitly requires something else:
 
 ```bash
-cd /Users/romangarkun/Documents/LiveKit/agents/main-bot
+cd /Users/romangarkun/Documents/Проекты/LiveKit/agents/main-bot
 uv run python scripts/sync_cloud_secrets.py --env-file .env.local
 lk agent deploy
 lk agent status
 ```
+
+The Cloud deploy flow includes env sync: update LiveKit Cloud secrets from the
+env file before every `lk agent deploy`. The helper script is
+`agents/main-bot/scripts/sync_cloud_secrets.py`; it uploads non-empty keys but
+filters out LiveKit connection credentials (`LIVEKIT_URL`, `LIVEKIT_API_KEY`,
+`LIVEKIT_API_SECRET`) and local proxy routing.
+
+Cloud env must not contain service proxy routing. Do not sync local proxy keys
+such as `EGRESS_PROXY_URL`, `AGENT_EXTERNAL_HTTP_PROXY`, `HTTP_PROXY`,
+`HTTPS_PROXY`, `ALL_PROXY`, or provider flags like `ELEVENLABS_EGRESS=proxy`,
+`GEMINI_EGRESS=proxy`, `GOOGLE_TTS_EGRESS=proxy`, `VERTEX_TTS_EGRESS=proxy`,
+`GOOGLE_STT_EGRESS=proxy`, `XAI_EGRESS=proxy`, and
+`LIVEKIT_INFERENCE_EGRESS=proxy`.
+
+If the source env file also contains a local-only proxy key that the script does
+not know yet, remove that key from the Cloud source file or pass
+`--exclude <KEY>` when syncing secrets.
+
+For local/self-hosted deploys, keep the provider proxy route explicit in the
+local production env: `EGRESS_PROXY_URL=...`, `EGRESS_DEFAULT=direct`, and the
+services that need the VPS route set to `<PROVIDER>_EGRESS=proxy`.
 
 For diagnostics after deploy:
 

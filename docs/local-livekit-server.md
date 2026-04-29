@@ -101,7 +101,7 @@ GEMINI_EGRESS=proxy
 GOOGLE_TTS_EGRESS=proxy
 VERTEX_TTS_EGRESS=proxy
 GOOGLE_STT_EGRESS=proxy
-XAI_EGRESS=direct
+XAI_EGRESS=proxy
 DEEPGRAM_EGRESS=direct
 MINIMAX_TTS_EGRESS=direct
 COSYVOICE_TTS_EGRESS=direct
@@ -110,8 +110,8 @@ LIVEKIT_INFERENCE_EGRESS=proxy
 
 Текущий выбор основан на тестах задержки и geoblock:
 
-- `proxy`: ElevenLabs, Gemini/Google LLM, Google TTS/STT, Vertex TTS, LiveKit Inference.
-- `direct`: xAI, Deepgram, MiniMax, CosyVoice.
+- `proxy`: ElevenLabs, Gemini/Google LLM, xAI, Google TTS/STT, Vertex TTS, LiveKit Inference.
+- `direct`: Deepgram, MiniMax, CosyVoice.
 
 Squid принимает только Asterisk-сервер `87.226.145.66/32`, только метод
 `CONNECT`, только порт `443`. Это основной proxy для локального робота. Legacy
@@ -119,18 +119,23 @@ SSH tunnel на `127.0.0.1:15001` сохранен только как rollback 
 основным маршрутом.
 
 Для снижения задержки на STT final-флаге можно включить универсальный wrapper,
-который после `END_OF_SPEECH` ждет final transcript ограниченное время и затем
-коммитит последний interim как synthetic final:
+который берет локальный LiveKit/Silero VAD `speaking -> listening` как момент
+окончания речи. Если provider final transcript не пришел за ограниченное время,
+wrapper коммитит последний interim как synthetic final:
 
 ```console
 STT_EARLY_INTERIM_FINAL_ENABLED=true
 STT_EARLY_INTERIM_FINAL_DELAY_SEC=0.15
+STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS=1
 ```
 
 Wrapper не привязан к Deepgram: он ставится поверх итогового STT provider или
 `FallbackAdapter`, но включается только для streaming STT с interim results и
-`TURN_DETECTION_MODE=vad`. После включения проверяйте `transcription_delay`,
-`end_of_turn_delay` и отсутствие дублей пользовательских сообщений в n8n payload.
+`TURN_DETECTION_MODE=vad`. Для Deepgram безопаснее начинать с
+`STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS=2`, чтобы не коммитить первый
+нестабильный interim как final. После включения проверяйте
+`transcription_delay`, `end_of_turn_delay` и отсутствие дублей пользовательских
+сообщений в n8n payload.
 
 ## Check Current State
 

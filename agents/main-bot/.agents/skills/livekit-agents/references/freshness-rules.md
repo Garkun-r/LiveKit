@@ -57,6 +57,11 @@ Some things legitimately cannot be verified against documentation:
 - Integration with user's existing codebase
 - Business logic and application requirements
 
+Documentation can verify API behavior, but it cannot approve business decisions.
+For this project, changing providers, models, prompts, fallback policy,
+handoffs/workflows, latency guards, turn logic, or client-visible behavior
+requires explicit owner approval even when the API change is technically valid.
+
 When providing guidance on these topics, clearly distinguish between:
 - "According to LiveKit documentation..." (verified)
 - "Based on your requirements..." (application-specific)

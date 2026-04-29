@@ -38,14 +38,14 @@ No-cost options:
 - For development and repeated testing, run a local worker and keep it alive:
 
 ```bash
-cd /Users/romangarkun/Documents/LiveKit/agents/main-bot
+cd /Users/romangarkun/Documents/Проекты/LiveKit/agents/main-bot
 UV_CACHE_DIR=/tmp/uv-cache uv run src/agent.py dev
 ```
 
 - For terminal-only behavior tests, use console mode:
 
 ```bash
-cd /Users/romangarkun/Documents/LiveKit/agents/main-bot
+cd /Users/romangarkun/Documents/Проекты/LiveKit/agents/main-bot
 UV_CACHE_DIR=/tmp/uv-cache uv run src/agent.py console
 ```
 

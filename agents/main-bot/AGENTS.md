@@ -4,6 +4,14 @@ This is a LiveKit Agents project. LiveKit Agents is a Python SDK for building vo
 
 The following is a guide for working with this project.
 
+## Codex Git/worktree workflow
+
+Before editing this agent, follow the repository-level workflow in `../../AGENTS.md`.
+New non-trivial tasks should use a dedicated worktree under
+`/Users/romangarkun/Documents/Проекты/_worktrees/LiveKit/<task-name>`.
+Do not push, deploy to LiveKit Cloud, roll back Cloud versions, or sync Cloud
+secrets without explicit user approval.
+
 ## Project structure
 
 This Python project uses the `uv` package manager. You should always use `uv` to install dependencies, run the agent, and run tests.
@@ -11,6 +19,21 @@ This Python project uses the `uv` package manager. You should always use `uv` to
 All app-level code is in the `src/` directory. In general, simple agents can be constructed with a single `agent.py` file. Additional files can be added, but you must retain `agent.py` as the entrypoint (see the associated Dockerfile for how this is deployed).
 
 Be sure to maintain code formatting. You can use the ruff formatter/linter as needed: `uv run ruff format` and `uv run ruff check`.
+
+## Business logic change control
+
+This agent is part of a production voice flow. Do not change business logic
+without explicit owner approval.
+
+Business logic includes provider/model selection, LLM/STT/TTS choice, prompts,
+agent instructions, handoffs/tasks, tool behavior, model routing, fallback
+activation, retry/timeout settings, latency guards, turn detection, customer
+flow, and any client-visible response behavior.
+
+If Gemini, xAI, Deepgram, ElevenLabs, Google, Vertex, LiveKit Inference, or any
+other provider is slow or failing, investigate the root cause first. Switching
+to a backup provider/model/service is a business decision. Present the expected
+quality, latency, cost, reliability, and rollback impact, then wait for approval.
 
 ## LiveKit Documentation
 

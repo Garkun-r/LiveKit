@@ -123,7 +123,7 @@ GEMINI_EGRESS=proxy
 GOOGLE_TTS_EGRESS=proxy
 VERTEX_TTS_EGRESS=proxy
 GOOGLE_STT_EGRESS=proxy
-XAI_EGRESS=direct
+XAI_EGRESS=proxy
 DEEPGRAM_EGRESS=direct
 MINIMAX_TTS_EGRESS=direct
 COSYVOICE_TTS_EGRESS=direct
@@ -151,6 +151,18 @@ Provider client wiring checklist:
 5. Test both routes from the Asterisk host under 10-call concurrency, then record
    the chosen default in `_PROVIDER_DEFAULTS` and this README.
 
+## Production provider changes
+
+The provider sections below document supported configuration options. They do
+not authorize an agent to change production defaults or business behavior.
+
+Do not switch LLM/STT/TTS provider, model, voice, prompt, fallback, timeout,
+retry policy, latency guard, turn logic, or workflow behavior without explicit
+owner approval. If a provider is slow, blocked, rate-limited, or failing,
+diagnose the root cause first. Any provider/model/fallback switch must be
+proposed with quality, latency, cost, reliability, and rollback tradeoffs before
+implementation.
+
 To switch LLM provider, set `LLM_PROVIDER`:
 
 1. `LLM_PROVIDER=google` - direct Gemini API path (default).
@@ -165,7 +177,9 @@ XAI_MODEL=grok-4-1-fast-non-reasoning-latest
 XAI_TEMPERATURE=0.3
 # Optional: force Europe region endpoint
 XAI_BASE_URL=https://eu-west-1.api.x.ai/v1
-# Tools are disabled by default for xAI in this project.
+# Disable function tools for every LLM provider.
+LLM_ENABLE_TOOLS=false
+# xAI also has a provider-specific tools flag for compatibility.
 XAI_ENABLE_TOOLS=false
 ```
 
@@ -338,14 +352,18 @@ interim final wrapper:
 ```console
 STT_EARLY_INTERIM_FINAL_ENABLED=true
 STT_EARLY_INTERIM_FINAL_DELAY_SEC=0.15
+STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS=1
 ```
 
 This wrapper is provider-agnostic and is applied after the selected STT or STT
 fallback chain. It only activates for streaming STT providers that support
-interim transcripts and with `TURN_DETECTION_MODE=vad`. It emits the latest
-interim transcript as a synthetic final transcript after `END_OF_SPEECH` waits
-for the configured delay. Keep it opt-in because a synthetic final can be
-slightly less accurate than a late provider final.
+interim transcripts and with `TURN_DETECTION_MODE=vad`. It uses the local
+LiveKit/Silero VAD `speaking -> listening` transition as the deadline source:
+if the provider final flag has not arrived after the configured delay, the
+latest stable interim transcript is emitted as a synthetic final.
+`STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS=2` is safer for providers whose
+first interim can change materially. Keep it opt-in because a synthetic final
+can be slightly less accurate than a late provider final.
 
 To make cloud updates seamless, keep secrets sync + deploy in one flow:
 
@@ -416,8 +434,9 @@ uv run python scripts/sync_cloud_secrets.py --env-file .env.local
 lk agent deploy
 ```
 
-The sync command updates secrets as a full set (`--overwrite`) to keep Cloud env equal to your local env file.
-It syncs all non-empty keys from `.env.local` automatically (except `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`).
+The sync command updates secrets as a full set (`--overwrite`) to keep Cloud env aligned with your local env file.
+It syncs non-empty keys from `.env.local` automatically, but filters out LiveKit connection credentials (`LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`), global proxy vars, and any `<PROVIDER>_EGRESS=proxy` values.
+For local/self-hosted deploys, keep proxy routing explicit in the production env for services that must go through the VPS proxy.
 
 ## Self-hosted LiveKit
 

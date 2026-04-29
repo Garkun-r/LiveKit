@@ -7,7 +7,7 @@ This snapshot was collected with read-only `lk` commands. It intentionally does 
 ## CLI and local config
 
 - CLI version: `lk 2.16.0`
-- Agent working directory: `/Users/romangarkun/Documents/LiveKit/agents/main-bot`
+- Agent working directory: `/Users/romangarkun/Documents/Проекты/LiveKit/agents/main-bot`
 - Cloud config file: `agents/main-bot/livekit.toml`
 - Configured project subdomain: `jcallio-g451240m`
 - Configured agent ID: `CA_oaEZ279sgQGr`

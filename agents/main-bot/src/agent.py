@@ -6,6 +6,7 @@ import os
 import random
 import re
 import tempfile
+import time
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -136,6 +137,7 @@ from config import (
     GOOGLE_TTS_VOICE_NAME,
     LIVEKIT_SELF_HOSTED,
     LLM_ATTEMPT_TIMEOUT_SEC,
+    LLM_ENABLE_TOOLS,
     LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
     LLM_FIRST_TOKEN_TIMEOUT_SEC,
     LLM_MAX_RETRY_PER_LLM,
@@ -169,6 +171,7 @@ from config import (
     STT_DEEPGRAM_MODEL,
     STT_EARLY_INTERIM_FINAL_DELAY_SEC,
     STT_EARLY_INTERIM_FINAL_ENABLED,
+    STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS,
     STT_GOOGLE_LANGUAGE,
     STT_GOOGLE_LOCATION,
     STT_GOOGLE_MODEL,
@@ -1026,10 +1029,11 @@ async def warmup_llm_prompt_cache(
     model_name = str(getattr(llm_client, "model", "unknown"))
 
     try:
+        # Some Responses-compatible providers, including xAI, reject
+        # tool_choice when the request has no tools.
         chat_kwargs: dict[str, Any] = {
             "chat_ctx": chat_ctx,
             "tools": [],
-            "tool_choice": "none",
         }
         if conn_options is not None:
             chat_kwargs["conn_options"] = conn_options
@@ -1754,6 +1758,7 @@ def _wrap_stt_for_early_interim_final(stt_client: lk_stt.STT) -> lk_stt.STT:
         stt_client,
         enabled=STT_EARLY_INTERIM_FINAL_ENABLED,
         delay_sec=STT_EARLY_INTERIM_FINAL_DELAY_SEC,
+        min_stable_interims=STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS,
         turn_detection_mode=TURN_DETECTION_MODE,
         logger_=logger,
     )
@@ -2013,6 +2018,8 @@ class Assistant(Agent):
         self._voice_prompts = voice_prompts
         self._awaiting_first_user_turn = True
         self._llm_branch_started_at: dict[str, float] = {}
+        self._tts_first_frame_ready_at: float | None = None
+        self._tts_first_frame_yielded_at: float | None = None
         resolved_prompt = prompt if prompt is not None else get_active_prompt()
         super().__init__(
             instructions=(
@@ -2062,8 +2069,11 @@ class Assistant(Agent):
         waited_for_prompt = False
         async for frame in audio_stream:
             if not waited_for_prompt:
+                self._tts_first_frame_ready_at = time.time()
+                self._tts_first_frame_yielded_at = None
                 if self._voice_prompts is not None:
                     await self._voice_prompts.wait_for_active_prompt()
+                self._tts_first_frame_yielded_at = time.time()
                 waited_for_prompt = True
             yield frame
 
@@ -2246,6 +2256,16 @@ class Assistant(Agent):
         resolved_tools = tools
         provider = str(llm_provider or LLM_PROVIDER).strip().lower()
         is_xai_provider = provider in {"xai", "api.x.ai", "x.ai"}
+        if not LLM_ENABLE_TOOLS:
+            if resolved_tools:
+                logger.info(
+                    "LLM tools are disabled; ignoring %d configured tool(s)",
+                    len(resolved_tools),
+                )
+            resolved_tools = []
+            tool_choice = NOT_GIVEN
+            return resolved_tools, tool_choice
+
         # For xAI provider we keep tools disabled by default, even if declared in the agent.
         # This avoids Responses API 400 errors around tool_choice/tools coupling
         # and keeps lower TTFT for voice turns.
@@ -2634,9 +2654,10 @@ async def my_agent(ctx: JobContext):
 
     audio_output_sample_rate = resolve_audio_output_sample_rate()
     external_http_sessions: list[aiohttp.ClientSession] = []
+    stt_client = build_stt(external_http_sessions=external_http_sessions)
 
     session = AgentSession(
-        stt=build_stt(external_http_sessions=external_http_sessions),
+        stt=stt_client,
         llm=session_llm or build_llm(),
         tts=build_tts(external_http_sessions=external_http_sessions),
         turn_handling={
@@ -2691,6 +2712,7 @@ async def my_agent(ctx: JobContext):
             "reply_watchdog_sec": REPLY_WATCHDOG_SEC,
             "stt_early_interim_final_enabled": STT_EARLY_INTERIM_FINAL_ENABLED,
             "stt_early_interim_final_delay_sec": STT_EARLY_INTERIM_FINAL_DELAY_SEC,
+            "stt_early_interim_final_min_stable_interims": STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS,
             "voice_response_delay_sec": VOICE_RESPONSE_DELAY_SEC,
             "voice_response_delay_post_gap_sec": VOICE_RESPONSE_DELAY_POST_GAP_SEC,
             "voice_response_delay_audio_paths": [
@@ -2870,6 +2892,11 @@ async def my_agent(ctx: JobContext):
                 voice_prompts.on_user_started_speaking()
                 return
             if old_state == "speaking" and new_state == "listening":
+                notify_local_end_of_speech = getattr(
+                    stt_client, "notify_local_end_of_speech", None
+                )
+                if callable(notify_local_end_of_speech):
+                    notify_local_end_of_speech(ended_at=getattr(ev, "created_at", None))
                 voice_prompts.start_response_delay_timer()
         except Exception as e:
             logger.exception("user_state_changed handler failed: %s", e)
@@ -2905,6 +2932,25 @@ async def my_agent(ctx: JobContext):
             if new_state in {"thinking", "speaking"}:
                 voice_prompts.cancel_client_silence_timer()
             if new_state == "speaking":
+                tts_first_frame_ready_at = assistant._tts_first_frame_ready_at
+                tts_first_frame_yielded_at = assistant._tts_first_frame_yielded_at
+                created_at = getattr(ev, "created_at", None)
+                if isinstance(created_at, (int, float)):
+                    logger.info(
+                        "agent playback started latency",
+                        extra={
+                            "tts_first_frame_ready_to_speaking_ms": round(
+                                (created_at - tts_first_frame_ready_at) * 1000, 1
+                            )
+                            if tts_first_frame_ready_at is not None
+                            else None,
+                            "tts_first_frame_yielded_to_speaking_ms": round(
+                                (created_at - tts_first_frame_yielded_at) * 1000, 1
+                            )
+                            if tts_first_frame_yielded_at is not None
+                            else None,
+                        },
+                    )
                 voice_prompts.on_agent_started_speaking()
             elif old_state == "speaking" and new_state == "listening":
                 voice_prompts.on_agent_finished_speaking()

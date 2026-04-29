@@ -41,8 +41,50 @@ class _ModelSettings:
         self.tool_choice = tool_choice
 
 
+class _WarmupStream:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+class _WarmupLLM:
+    provider = "api.x.ai"
+    model = "grok-test"
+
+    def __init__(self) -> None:
+        self.chat_kwargs = None
+
+    def chat(self, **kwargs):
+        self.chat_kwargs = kwargs
+        return _WarmupStream()
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_warmup_omits_tool_choice_without_tools() -> None:
+    llm = _WarmupLLM()
+
+    await agent.warmup_llm_prompt_cache(
+        llm_client=llm,
+        instructions="test instructions",
+        conn_options=None,
+    )
+
+    assert llm.chat_kwargs is not None
+    assert llm.chat_kwargs["tools"] == []
+    assert "tool_choice" not in llm.chat_kwargs
+
+
 def test_xai_tools_disabled_by_default(monkeypatch) -> None:
     monkeypatch.setattr(agent, "LLM_PROVIDER", "xai")
+    monkeypatch.setattr(agent, "LLM_ENABLE_TOOLS", True)
     monkeypatch.setattr(agent, "XAI_ENABLE_TOOLS", False)
     assistant = agent.Assistant()
     configured_tools = [object()]
@@ -57,6 +99,7 @@ def test_xai_tools_disabled_by_default(monkeypatch) -> None:
 
 
 def test_xai_provider_identity_disables_tools(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "LLM_ENABLE_TOOLS", True)
     monkeypatch.setattr(agent, "XAI_ENABLE_TOOLS", False)
     assistant = agent.Assistant()
     configured_tools = [object()]
@@ -73,6 +116,7 @@ def test_xai_provider_identity_disables_tools(monkeypatch) -> None:
 
 def test_xai_tools_can_be_enabled(monkeypatch) -> None:
     monkeypatch.setattr(agent, "LLM_PROVIDER", "xai")
+    monkeypatch.setattr(agent, "LLM_ENABLE_TOOLS", True)
     monkeypatch.setattr(agent, "XAI_ENABLE_TOOLS", True)
     assistant = agent.Assistant()
     configured_tools = [object()]
@@ -88,6 +132,7 @@ def test_xai_tools_can_be_enabled(monkeypatch) -> None:
 
 def test_non_xai_provider_keeps_tools(monkeypatch) -> None:
     monkeypatch.setattr(agent, "LLM_PROVIDER", "google")
+    monkeypatch.setattr(agent, "LLM_ENABLE_TOOLS", True)
     monkeypatch.setattr(agent, "XAI_ENABLE_TOOLS", False)
     assistant = agent.Assistant()
     configured_tools = [object()]
@@ -99,3 +144,19 @@ def test_non_xai_provider_keeps_tools(monkeypatch) -> None:
 
     assert resolved_tools == configured_tools
     assert tool_choice == "auto"
+
+
+def test_global_tools_can_be_disabled_for_google(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "LLM_PROVIDER", "google")
+    monkeypatch.setattr(agent, "LLM_ENABLE_TOOLS", False)
+    monkeypatch.setattr(agent, "XAI_ENABLE_TOOLS", True)
+    assistant = agent.Assistant()
+    configured_tools = [object()]
+
+    resolved_tools, tool_choice = assistant._resolve_tools_for_llm_call(
+        tools=configured_tools,
+        model_settings=_ModelSettings("auto"),
+    )
+
+    assert resolved_tools == []
+    assert tool_choice is NOT_GIVEN

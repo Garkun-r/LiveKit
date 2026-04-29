@@ -5,6 +5,16 @@ Instructions for AI coding agents working in this repository.
 Merge these project-specific rules with task-specific context as needed.
 Tradeoff: these guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
+## 0. Codex Git/worktree workflow
+
+- For new non-trivial tasks, do not work directly in the shared `LiveKit/` folder if it is dirty.
+- Use a dedicated worktree under `/Users/romangarkun/Documents/Проекты/_worktrees/LiveKit/<task-name>`.
+- Branch names: `task/livekit/YYYYMMDD-short-name`; rescue branches: `rescue/livekit/YYYYMMDD-current-state`.
+- Before commit, inspect `git status`, `git diff --stat`, `git diff --check`, and scan the diff for secrets.
+- Prefer visible WIP/checkpoint commits in task/rescue branches over `git stash`.
+- `git push`, merge to `main`, `lk agent deploy`, `lk agent rollback`, and Cloud secret changes require explicit user approval.
+- The cross-repository workflow is documented in `../VPS/docs/codex-git-workflow.md`.
+
 ## 1. Think Before Coding
 
 Don't assume. Don't hide confusion. Surface tradeoffs.
@@ -57,6 +67,25 @@ Repository-specific rules:
 - For each new webhook, create a separate module.
 - Do not rename files or folders without a clear reason.
 - Preserve project structure unless a change is clearly required.
+
+## 3A. Business Logic Change Control
+
+Do not change product or voice-agent business logic without explicit owner
+approval.
+
+This includes:
+- switching LLM, STT, TTS, voice, model, provider, contractor, or service;
+- changing prompts, agent instructions, handoffs, tasks, workflow principles,
+  model-routing rules, fallback policy, timeout/retry policy, latency guards, or
+  turn logic;
+- changing customer-facing behavior, pricing/billing semantics, database
+  meaning, webhook decisions, or routing to external services;
+- changing which provider/model/service is primary or backup.
+
+If a provider is slow, blocked, rate-limited, or failing, diagnose the root
+cause first. Do not silently switch from the configured primary path to another
+provider/model/service. Present that as a business option with quality, latency,
+cost, reliability, and rollback tradeoffs, then wait for approval.
 
 ## 4. Goal-Driven Execution
 
@@ -111,7 +140,7 @@ Current local test command:
 - `uv run src/agent.py console`
 
 Current git workflow:
-- `cd ~/Documents/LiveKit`
+- `cd ~/Documents/Проекты/LiveKit`
 - `git add .`
 - `git commit -m "Describe change"`
 - `git push`

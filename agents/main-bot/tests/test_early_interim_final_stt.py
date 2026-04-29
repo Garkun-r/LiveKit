@@ -77,7 +77,9 @@ class _ScriptedSTT(stt.STT):
         language: NotGivenOr[str] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> _ScriptedStream:
-        return _ScriptedStream(stt_obj=self, script=self._script, conn_options=conn_options)
+        return _ScriptedStream(
+            stt_obj=self, script=self._script, conn_options=conn_options
+        )
 
     async def aclose(self) -> None:
         self.closed = True
@@ -104,6 +106,27 @@ async def _collect_events(stt_client: stt.STT) -> list[stt.SpeechEvent]:
     stream = stt_client.stream()
     stream.end_input()
     return [event async for event in stream]
+
+
+async def _collect_events_with_local_vad_notify(
+    stt_client: EarlyInterimFinalSTT,
+    *,
+    notify_after_sec: float,
+    timeout_sec: float = 1.0,
+) -> list[stt.SpeechEvent]:
+    stream = stt_client.stream()
+    stream.end_input()
+    events: list[stt.SpeechEvent] = []
+
+    async def _collect() -> None:
+        async for event in stream:
+            events.append(event)
+
+    collect_task = asyncio.create_task(_collect())
+    await asyncio.sleep(notify_after_sec)
+    stt_client.notify_local_end_of_speech(ended_at=123.0)
+    await asyncio.wait_for(collect_task, timeout=timeout_sec)
+    return events
 
 
 def test_should_wrap_stt_respects_disabled_mode() -> None:
@@ -175,6 +198,143 @@ async def test_interim_becomes_synthetic_final_after_eos_delay() -> None:
         stt.SpeechEventType.END_OF_SPEECH,
     ]
     assert events[2].alternatives[0].text == "адрес"
+
+
+@pytest.mark.asyncio
+async def test_local_vad_end_creates_synthetic_final_without_stt_eos() -> None:
+    wrapped = EarlyInterimFinalSTT(
+        _ScriptedSTT(
+            [
+                (0, _event(stt.SpeechEventType.START_OF_SPEECH)),
+                (0, _event(stt.SpeechEventType.INTERIM_TRANSCRIPT, "адрес")),
+                (0.05, _event(stt.SpeechEventType.FINAL_TRANSCRIPT, "адрес")),
+            ]
+        ),
+        delay_sec=0.01,
+    )
+
+    events = await _collect_events_with_local_vad_notify(
+        wrapped,
+        notify_after_sec=0.001,
+    )
+
+    assert [event.type for event in events] == [
+        stt.SpeechEventType.START_OF_SPEECH,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+    ]
+    assert events[2].alternatives[0].text == "адрес"
+
+
+@pytest.mark.asyncio
+async def test_real_final_before_local_vad_delay_cancels_synthetic() -> None:
+    wrapped = EarlyInterimFinalSTT(
+        _ScriptedSTT(
+            [
+                (0, _event(stt.SpeechEventType.START_OF_SPEECH)),
+                (0, _event(stt.SpeechEventType.INTERIM_TRANSCRIPT, "адрес")),
+                (0.005, _event(stt.SpeechEventType.FINAL_TRANSCRIPT, "точный адрес")),
+            ]
+        ),
+        delay_sec=0.05,
+    )
+
+    events = await _collect_events_with_local_vad_notify(
+        wrapped,
+        notify_after_sec=0.001,
+    )
+
+    assert [event.type for event in events] == [
+        stt.SpeechEventType.START_OF_SPEECH,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+    ]
+    assert events[2].alternatives[0].text == "точный адрес"
+
+
+@pytest.mark.asyncio
+async def test_local_vad_deadline_waits_for_next_interim_if_none_seen() -> None:
+    wrapped = EarlyInterimFinalSTT(
+        _ScriptedSTT(
+            [
+                (0, _event(stt.SpeechEventType.START_OF_SPEECH)),
+                (0.05, _event(stt.SpeechEventType.INTERIM_TRANSCRIPT, "адрес")),
+                (0.05, _event(stt.SpeechEventType.FINAL_TRANSCRIPT, "адрес")),
+            ]
+        ),
+        delay_sec=0.01,
+    )
+
+    events = await _collect_events_with_local_vad_notify(
+        wrapped,
+        notify_after_sec=0.001,
+    )
+
+    assert [event.type for event in events] == [
+        stt.SpeechEventType.START_OF_SPEECH,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+    ]
+    assert events[2].alternatives[0].text == "адрес"
+
+
+@pytest.mark.asyncio
+async def test_local_vad_waits_for_provider_final_when_interim_is_not_stable() -> None:
+    wrapped = EarlyInterimFinalSTT(
+        _ScriptedSTT(
+            [
+                (0, _event(stt.SpeechEventType.START_OF_SPEECH)),
+                (0, _event(stt.SpeechEventType.INTERIM_TRANSCRIPT, "чего денег")),
+                (
+                    0.05,
+                    _event(stt.SpeechEventType.FINAL_TRANSCRIPT, "чем вы занимаетесь"),
+                ),
+            ]
+        ),
+        delay_sec=0.01,
+        min_stable_interims=2,
+    )
+
+    events = await _collect_events_with_local_vad_notify(
+        wrapped,
+        notify_after_sec=0.001,
+    )
+
+    assert [event.type for event in events] == [
+        stt.SpeechEventType.START_OF_SPEECH,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+    ]
+    assert events[2].alternatives[0].text == "чем вы занимаетесь"
+
+
+@pytest.mark.asyncio
+async def test_local_vad_creates_synthetic_after_stable_interim_repeats() -> None:
+    wrapped = EarlyInterimFinalSTT(
+        _ScriptedSTT(
+            [
+                (0, _event(stt.SpeechEventType.START_OF_SPEECH)),
+                (0, _event(stt.SpeechEventType.INTERIM_TRANSCRIPT, "адрес")),
+                (0.05, _event(stt.SpeechEventType.INTERIM_TRANSCRIPT, "адрес")),
+                (0.05, _event(stt.SpeechEventType.RECOGNITION_USAGE)),
+            ]
+        ),
+        delay_sec=0.01,
+        min_stable_interims=2,
+    )
+
+    events = await _collect_events_with_local_vad_notify(
+        wrapped,
+        notify_after_sec=0.001,
+    )
+
+    assert [event.type for event in events[:4]] == [
+        stt.SpeechEventType.START_OF_SPEECH,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+    ]
+    assert events[3].alternatives[0].text == "адрес"
 
 
 @pytest.mark.asyncio
@@ -273,13 +433,16 @@ def test_metrics_and_error_events_are_forwarded() -> None:
     assert seen_errors == [marker_error]
 
 
-def test_build_stt_wraps_any_streaming_interim_provider_when_enabled(monkeypatch) -> None:
+def test_build_stt_wraps_any_streaming_interim_provider_when_enabled(
+    monkeypatch,
+) -> None:
     fake_stt = _ScriptedSTT()
 
     monkeypatch.setattr(agent, "STT_PROVIDER", "yandex")
     monkeypatch.setattr(agent, "YANDEX_SPEECHKIT_API_KEY", "test-key")
     monkeypatch.setattr(agent, "STT_EARLY_INTERIM_FINAL_ENABLED", True)
     monkeypatch.setattr(agent, "STT_EARLY_INTERIM_FINAL_DELAY_SEC", 0.15)
+    monkeypatch.setattr(agent, "STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS", 2)
     monkeypatch.setattr(agent, "TURN_DETECTION_MODE", "vad")
     monkeypatch.setattr(agent, "YandexSpeechKitSTT", lambda **_: fake_stt)
 
@@ -287,3 +450,4 @@ def test_build_stt_wraps_any_streaming_interim_provider_when_enabled(monkeypatch
 
     assert isinstance(result, EarlyInterimFinalSTT)
     assert result.wrapped is fake_stt
+    assert result.min_stable_interims == 2
