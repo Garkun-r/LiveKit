@@ -338,6 +338,63 @@ async def test_local_vad_creates_synthetic_after_stable_interim_repeats() -> Non
 
 
 @pytest.mark.asyncio
+async def test_unstable_interim_after_stt_eos_waits_for_provider_final() -> None:
+    wrapped = EarlyInterimFinalSTT(
+        _ScriptedSTT(
+            [
+                (0, _event(stt.SpeechEventType.START_OF_SPEECH)),
+                (0, _event(stt.SpeechEventType.INTERIM_TRANSCRIPT, "чего денег")),
+                (0, _event(stt.SpeechEventType.END_OF_SPEECH)),
+                (
+                    0.05,
+                    _event(stt.SpeechEventType.FINAL_TRANSCRIPT, "чем вы занимаетесь"),
+                ),
+            ]
+        ),
+        delay_sec=0.01,
+        min_stable_interims=2,
+    )
+
+    events = await _collect_events(wrapped)
+
+    assert [event.type for event in events] == [
+        stt.SpeechEventType.START_OF_SPEECH,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+        stt.SpeechEventType.END_OF_SPEECH,
+    ]
+    assert events[2].alternatives[0].text == "чем вы занимаетесь"
+
+
+@pytest.mark.asyncio
+async def test_late_stable_interim_after_stt_eos_uses_pending_eos() -> None:
+    wrapped = EarlyInterimFinalSTT(
+        _ScriptedSTT(
+            [
+                (0, _event(stt.SpeechEventType.START_OF_SPEECH)),
+                (0, _event(stt.SpeechEventType.INTERIM_TRANSCRIPT, "адрес")),
+                (0, _event(stt.SpeechEventType.END_OF_SPEECH)),
+                (0.05, _event(stt.SpeechEventType.INTERIM_TRANSCRIPT, "адрес")),
+                (0.05, _event(stt.SpeechEventType.RECOGNITION_USAGE)),
+            ]
+        ),
+        delay_sec=0.01,
+        min_stable_interims=2,
+    )
+
+    events = await _collect_events(wrapped)
+
+    assert [event.type for event in events[:5]] == [
+        stt.SpeechEventType.START_OF_SPEECH,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+        stt.SpeechEventType.END_OF_SPEECH,
+    ]
+    assert events[3].alternatives[0].text == "адрес"
+
+
+@pytest.mark.asyncio
 async def test_late_duplicate_final_after_synthetic_is_suppressed() -> None:
     wrapped = EarlyInterimFinalSTT(
         _ScriptedSTT(

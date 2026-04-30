@@ -2934,6 +2934,8 @@ async def my_agent(ctx: JobContext):
             if new_state == "speaking":
                 tts_first_frame_ready_at = assistant._tts_first_frame_ready_at
                 tts_first_frame_yielded_at = assistant._tts_first_frame_yielded_at
+                assistant._tts_first_frame_ready_at = None
+                assistant._tts_first_frame_yielded_at = None
                 created_at = getattr(ev, "created_at", None)
                 if isinstance(created_at, (int, float)):
                     logger.info(

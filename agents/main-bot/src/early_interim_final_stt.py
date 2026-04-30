@@ -134,6 +134,8 @@ class EarlyInterimFinalStream(stt.SpeechStream):
         self._local_eos_task: asyncio.Task[None] | None = None
         self._notify_tasks: set[asyncio.Task[None]] = set()
         self._pending_eos: stt.SpeechEvent | None = None
+        self._pending_eos_deadline: float | None = None
+        self._pending_eos_due = False
         self._last_interim: stt.SpeechEvent | None = None
         self._last_interim_normalized_text = ""
         self._last_interim_stable_count = 0
@@ -189,14 +191,12 @@ class EarlyInterimFinalStream(stt.SpeechStream):
 
         if ev.type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
             async with self._state_lock:
-                if self._pending_eos is not None:
-                    await self._cancel_pending_eos_task_locked()
-                    self._pending_eos = None
-                if self._speech_ended:
+                if self._speech_ended and self._pending_eos is None:
                     self._reset_segment_locked()
                 if _event_text(ev):
                     self._remember_interim_locked(ev)
                 self._event_ch.send_nowait(ev)
+                self._emit_due_pending_eos_synthetic_locked()
                 self._emit_due_local_synthetic_final_locked()
             return
 
@@ -228,6 +228,10 @@ class EarlyInterimFinalStream(stt.SpeechStream):
                     return
 
                 self._pending_eos = ev
+                self._pending_eos_due = False
+                self._pending_eos_deadline = (
+                    asyncio.get_running_loop().time() + self._delay_sec
+                )
                 await self._cancel_pending_eos_task_locked()
                 self._pending_eos_task = asyncio.create_task(
                     self._delayed_emit_synthetic_final(),
@@ -284,8 +288,20 @@ class EarlyInterimFinalStream(stt.SpeechStream):
         try:
             await asyncio.sleep(self._delay_sec)
             async with self._state_lock:
-                self._emit_synthetic_final_and_pending_eos_locked()
                 self._pending_eos_task = None
+                self._pending_eos_due = True
+                emitted = self._emit_synthetic_final_and_pending_eos_locked()
+                if not emitted and self._pending_eos is not None:
+                    logger.debug(
+                        "STT EOS early interim final waiting for provider final or stable interim",
+                        extra={
+                            "delay_sec": self._delay_sec,
+                            "min_stable_interims": self._min_stable_interims,
+                            "has_interim": self._last_interim is not None,
+                            "interim_stable_count": self._last_interim_stable_count,
+                            "final_seen": self._final_seen,
+                        },
+                    )
         except asyncio.CancelledError:
             return
 
@@ -315,13 +331,26 @@ class EarlyInterimFinalStream(stt.SpeechStream):
 
     async def _flush_pending_eos(self) -> None:
         async with self._state_lock:
-            self._emit_synthetic_final_and_pending_eos_locked()
+            self._emit_synthetic_final_and_pending_eos_locked(force_eos=True)
 
-    def _emit_synthetic_final_and_pending_eos_locked(self) -> None:
+    def _emit_synthetic_final_and_pending_eos_locked(
+        self, *, force_eos: bool = False
+    ) -> bool:
         if self._pending_eos is None:
-            return
-        self._emit_synthetic_final_locked(source="stt_eos")
-        self._emit_pending_eos_locked()
+            return False
+        emitted = self._emit_synthetic_final_locked(source="stt_eos")
+        if emitted or force_eos:
+            self._emit_pending_eos_locked()
+        return emitted
+
+    def _emit_due_pending_eos_synthetic_locked(self) -> bool:
+        if self._pending_eos_deadline is None:
+            return False
+        if asyncio.get_running_loop().time() >= self._pending_eos_deadline:
+            self._pending_eos_due = True
+        if not self._pending_eos_due:
+            return False
+        return self._emit_synthetic_final_and_pending_eos_locked()
 
     def _emit_due_local_synthetic_final_locked(self) -> bool:
         if self._local_eos_deadline is None:
@@ -380,6 +409,8 @@ class EarlyInterimFinalStream(stt.SpeechStream):
             return
         self._event_ch.send_nowait(self._pending_eos)
         self._pending_eos = None
+        self._pending_eos_deadline = None
+        self._pending_eos_due = False
         self._speech_ended = True
 
     async def _cancel_pending_eos_task(self) -> None:
@@ -424,6 +455,8 @@ class EarlyInterimFinalStream(stt.SpeechStream):
 
     def _reset_segment_locked(self) -> None:
         self._pending_eos = None
+        self._pending_eos_deadline = None
+        self._pending_eos_due = False
         self._last_interim = None
         self._last_interim_normalized_text = ""
         self._last_interim_stable_count = 0
