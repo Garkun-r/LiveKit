@@ -7,8 +7,7 @@ Do not use an admin token in LiveKit Cloud.
 
 Create a Directus role named `Livekit`.
 
-For the first version, grant only read permissions to the collections used for
-prompt assembly:
+Grant read permissions to the collections used for prompt assembly:
 
 - `CallerID`
 - `bot_configurations`
@@ -18,9 +17,9 @@ prompt assembly:
 - `transfer_number`
 - `client_prompt_cache`
 
-Do not change existing roles or user permissions. Do not grant create, update,
-or delete permissions for future skills until that specific write path is
-approved.
+Additionally, grant `create` and `update` only on `client_prompt_cache`. This
+lets the robot save the current assembled template after a cache miss. Do not
+grant write permissions to source client collections. Do not grant delete.
 
 Recommended readable fields:
 
@@ -30,8 +29,12 @@ Recommended readable fields:
 - `clients_prompt`: `name`, `text`
 - `webparsing`: `url`, `text`
 - `transfer_number`: `client_id`, `disc`, `direction`
-- `client_prompt_cache`: `caller_id`, `client_id`, `prompt_template`,
-  `timezone`, `active`, `date_updated`
+- `client_prompt_cache` read: `id`, `caller_id`, `client_id`,
+  `prompt_template`, `timezone`, `source_hash`, `active`, `last_error`,
+  `date_updated`
+- `client_prompt_cache` create/update: `caller_id`, `client_id`,
+  `prompt_template`, `timezone`, `source_hash`, `active`, `last_error`,
+  `date_updated`
 
 Create a service user for the role and use a static token. Store the token in
 LiveKit Cloud as `DIRECTUS_TOKEN`.
@@ -77,9 +80,25 @@ The cached value must be a template, not a fully rendered prompt. Use
 `{{CURRENT_DATETIME_BLOCK}}` where the robot should inject fresh local company
 date and time on each call.
 
+## Robot write-through cache
+
+The LiveKit robot uses write-through cache behavior:
+
+1. Read `client_prompt_cache` by `caller_id` and `active = true`.
+2. If found, render fresh `<current_datetime>` and start the call.
+3. If not found, build the prompt live from source collections.
+4. After a successful live build, upsert only `client_prompt_cache`.
+5. If the cache write fails, continue the call with the live prompt and log a
+   warning.
+
+The robot does not write to `CallerID`, `bot_configurations`, `clients`,
+`clients_prompt`, `webparsing`, or `transfer_number`.
+
 ## Flow
 
-Create a Directus Flow that rebuilds only `client_prompt_cache`.
+Create a Directus Flow that rebuilds only `client_prompt_cache`. This Flow is a
+future freshness improvement; the robot can already create a cache row on the
+first cache miss.
 
 Recommended triggers:
 

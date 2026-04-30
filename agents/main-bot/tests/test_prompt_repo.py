@@ -10,10 +10,17 @@ import prompt_repo
 
 
 class _DirectusResponse:
-    def __init__(self, payload: dict[str, Any], status_code: int = 200) -> None:
+    def __init__(
+        self,
+        payload: dict[str, Any],
+        status_code: int = 200,
+        *,
+        method: str = "GET",
+        url: str = "https://directus.example/items/test",
+    ) -> None:
         self._payload = payload
         self.status_code = status_code
-        self.request = httpx.Request("GET", "https://directus.example/items/test")
+        self.request = httpx.Request(method, url)
 
     def json(self) -> dict[str, Any]:
         return self._payload
@@ -37,6 +44,7 @@ class _DirectusHttpClient:
         self.rows_by_collection = rows_by_collection
         self.status_by_collection = status_by_collection or {}
         self.requests = []
+        self.writes = []
 
     async def get(self, path: str, *, params: dict[str, Any]) -> _DirectusResponse:
         collection = path.rsplit("/", 1)[-1]
@@ -57,6 +65,41 @@ class _DirectusHttpClient:
         limit = int(params.get("limit", "1"))
         return _DirectusResponse({"data": rows[:limit]})
 
+    async def post(self, path: str, *, json: dict[str, Any]) -> _DirectusResponse:
+        collection = path.rsplit("/", 1)[-1]
+        self.writes.append(("post", collection, dict(json)))
+        status_code = self.status_by_collection.get(collection)
+        if status_code is not None:
+            return _DirectusResponse(
+                {"errors": []},
+                status_code=status_code,
+                method="POST",
+            )
+
+        rows = self.rows_by_collection.setdefault(collection, [])
+        next_id = max([int(row.get("id", 0) or 0) for row in rows] + [0]) + 1
+        row = {"id": next_id, **json}
+        rows.append(row)
+        return _DirectusResponse({"data": row}, method="POST")
+
+    async def patch(self, path: str, *, json: dict[str, Any]) -> _DirectusResponse:
+        collection, row_id = path.rsplit("/", 2)[-2:]
+        self.writes.append(("patch", collection, row_id, dict(json)))
+        status_code = self.status_by_collection.get(collection)
+        if status_code is not None:
+            return _DirectusResponse(
+                {"errors": []},
+                status_code=status_code,
+                method="PATCH",
+            )
+
+        rows = self.rows_by_collection.setdefault(collection, [])
+        for row in rows:
+            if str(row.get("id")) == str(row_id):
+                row.update(json)
+                return _DirectusResponse({"data": row}, method="PATCH")
+        return _DirectusResponse({"errors": []}, status_code=404, method="PATCH")
+
 
 class _ErrorDirectusClient:
     async def __aenter__(self) -> "_ErrorDirectusClient":
@@ -67,6 +110,9 @@ class _ErrorDirectusClient:
 
     async def fetch_cached_prompt(self, caller_id: str):
         raise httpx.TimeoutException("timeout")
+
+    async def save_cached_prompt(self, *, caller_id: str, prompt_template):
+        raise AssertionError("save should not be called")
 
 
 @pytest.fixture(autouse=True)
@@ -245,6 +291,74 @@ async def test_resolve_prompt_builds_live_prompt_on_cache_miss(
     assert "| TR1 | Sales |" in result.prompt
     assert "specific strategy" in result.prompt
     assert "dialogue example" in result.prompt
+    assert len(http_client.writes) == 1
+    method, collection, payload = http_client.writes[0]
+    assert method == "post"
+    assert collection == "client_prompt_cache"
+    assert payload["caller_id"] == "+15550100"
+    assert payload["client_id"] == 7
+    assert payload["active"] is True
+    assert payload["last_error"] is None
+    assert len(payload["source_hash"]) == 64
+    assert "global rules text" in payload["prompt_template"]
+    assert prompt_repo._CURRENT_DATETIME_PLACEHOLDER in payload["prompt_template"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_prompt_updates_existing_inactive_cache_row(
+    prompt_file, monkeypatch
+):
+    _enable_directus(monkeypatch)
+    http_client = _DirectusHttpClient(
+        {
+            "client_prompt_cache": [
+                {
+                    "id": 42,
+                    "caller_id": "+15550100",
+                    "client_id": 7,
+                    "prompt_template": "old prompt",
+                    "timezone": "Europe/Kaliningrad",
+                    "active": False,
+                }
+            ],
+            "CallerID": [{"CallerID": "+15550100", "client_id": 7}],
+            "bot_configurations": [
+                {
+                    "client_id": 7,
+                    "system_prompt": "specific strategy",
+                    "examples": "dialogue example",
+                    "skills_name": "skill_info+questions",
+                }
+            ],
+            "clients": [
+                {
+                    "id": 7,
+                    "add_info": "client knowledge",
+                    "company_website": "",
+                    "company_extra": "",
+                }
+            ],
+            "clients_prompt": [
+                {"name": "global_rules", "text": "global rules text"},
+                {"name": "skill_info+questions", "text": "skills text"},
+            ],
+            "transfer_number": [],
+        }
+    )
+
+    result = await prompt_repo.resolve_prompt_for_call(
+        sip_trunk_number="+15550100",
+        directus_client_factory=_directus_factory(http_client),
+    )
+
+    assert result.source == "directus:live"
+    assert len(http_client.writes) == 1
+    method, collection, row_id, payload = http_client.writes[0]
+    assert method == "patch"
+    assert collection == "client_prompt_cache"
+    assert row_id == "42"
+    assert payload["active"] is True
+    assert "skills text" in payload["prompt_template"]
 
 
 @pytest.mark.asyncio
