@@ -120,6 +120,7 @@ class _SberTokenManager:
                     "Authorization": authorization,
                     "RqUID": str(uuid.uuid4()),
                     "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
                 },
                 data={"scope": self._oauth_scope},
             )
