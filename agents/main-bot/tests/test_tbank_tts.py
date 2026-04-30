@@ -5,6 +5,7 @@ from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
 
 import agent
 from tbank_tts import (
+    TBankSynthesizeStream,
     TBankTTSOptions,
     TBankVoiceKitTTS,
     _grpc_channel_options,
@@ -32,6 +33,20 @@ class _Emitter:
 
     def flush(self) -> None:
         self.flush_calls += 1
+
+
+class _Sentence:
+    def __init__(self, token: str) -> None:
+        self.token = token
+
+
+class _SentenceStream:
+    def __init__(self, tokens: list[str]) -> None:
+        self._tokens = tokens
+
+    async def __aiter__(self):
+        for token in self._tokens:
+            yield _Sentence(token)
 
 
 def _secret_key() -> str:
@@ -90,6 +105,44 @@ async def test_tbank_tts_stream_pushes_audio_chunks_in_order() -> None:
     assert metadata_seen[0][0][0] == "authorization"
     assert metadata_seen[0][0][1].startswith("Bearer ")
     assert emitter.chunks == [b"one", b"two"]
+
+
+@pytest.mark.asyncio
+async def test_tbank_tts_sentence_splitting_keeps_one_livekit_segment() -> None:
+    requests = []
+
+    async def fake_streaming_synthesize(request, metadata):
+        requests.append(request)
+        yield tbank_tts_pb.StreamingSynthesizeSpeechResponse(
+            audio_chunk=f"audio-{len(requests)}".encode()
+        )
+
+    tts_obj = TBankVoiceKitTTS(
+        api_key="test-key",
+        secret_key=_secret_key(),
+        synthesize_stream_factory=fake_streaming_synthesize,
+    )
+    stream = TBankSynthesizeStream(
+        tts=tts_obj,
+        conn_options=DEFAULT_API_CONNECT_OPTIONS,
+    )
+    emitter = _Emitter()
+
+    try:
+        await stream._run_sentence_stream(
+            _SentenceStream(["Первое предложение.", "Второе предложение."]),
+            emitter,
+        )
+    finally:
+        await stream.aclose()
+
+    assert [request.input.text for request in requests] == [
+        "Первое предложение.",
+        "Второе предложение.",
+    ]
+    assert len(emitter.started_segments) == 1
+    assert emitter.ended_segments == 1
+    assert emitter.chunks == [b"audio-1", b"audio-2"]
 
 
 def test_build_tts_uses_tbank_provider(monkeypatch) -> None:

@@ -267,22 +267,27 @@ class TBankSynthesizeStream(tts.SynthesizeStream):
         sentence_stream: tokenize.SentenceStream,
         output_emitter: tts.AudioEmitter,
     ) -> None:
+        segment_started = False
         async for sentence in sentence_stream:
             text = _sanitize_text_segment(sentence.token or "")
             if not text:
                 continue
 
             self._mark_started()
-            segment_id = utils.shortuuid()
-            output_emitter.start_segment(segment_id=segment_id)
+            if not segment_started:
+                output_emitter.start_segment(segment_id=utils.shortuuid())
+                segment_started = True
+            await _stream_segment_to_emitter(
+                tts_provider=self._tts,
+                opts=self._opts,
+                text=text,
+                conn_options=self._conn_options,
+                output_emitter=output_emitter,
+            )
+            output_emitter.flush()
+
+        if segment_started:
             try:
-                await _stream_segment_to_emitter(
-                    tts_provider=self._tts,
-                    opts=self._opts,
-                    text=text,
-                    conn_options=self._conn_options,
-                    output_emitter=output_emitter,
-                )
                 output_emitter.flush()
             finally:
                 output_emitter.end_segment()
