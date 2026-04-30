@@ -124,7 +124,8 @@ SSH tunnel на `127.0.0.1:15001` сохранен только как rollback 
 
 ```console
 STT_EARLY_INTERIM_FINAL_ENABLED=true
-STT_EARLY_INTERIM_FINAL_DELAY_SEC=0.15
+STT_EARLY_INTERIM_FINAL_DELAY_SEC=0.03
+STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS=2
 ```
 
 Wrapper не привязан к Deepgram: он ставится поверх итогового STT provider или

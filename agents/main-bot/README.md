@@ -369,7 +369,8 @@ interim final wrapper:
 
 ```console
 STT_EARLY_INTERIM_FINAL_ENABLED=true
-STT_EARLY_INTERIM_FINAL_DELAY_SEC=0.15
+STT_EARLY_INTERIM_FINAL_DELAY_SEC=0.03
+STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS=2
 ```
 
 This wrapper is provider-agnostic and is applied after the selected STT or STT
