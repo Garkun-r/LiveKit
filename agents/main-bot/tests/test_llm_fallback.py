@@ -175,7 +175,6 @@ def _voice_prompt_manager(
     manager = agent.VoicePromptManager(
         session=session,
         background_audio=background_audio,
-        sample_rate=24000,
         response_delay_prompt=agent.VoicePromptSpec(
             kind="response_delay",
             audio_paths=(response_delay_audio,),
@@ -456,24 +455,22 @@ async def test_response_delay_prompt_does_not_repeat_for_same_user_turn(
 
 
 @pytest.mark.asyncio
-async def test_client_silence_prompt_uses_session_speech_queue(tmp_path) -> None:
-    manager, session, _ = _voice_prompt_manager(tmp_path=tmp_path)
+async def test_client_silence_prompt_uses_background_audio(tmp_path) -> None:
+    manager, session, background_audio = _voice_prompt_manager(tmp_path=tmp_path)
 
     manager.on_agent_finished_speaking()
     await asyncio.sleep(0.05)
     await manager.aclose()
 
-    assert len(session.say_calls) == 1
-    assert session.say_calls[0]["text"] == "Алло."
-    assert session.say_calls[0]["allow_interruptions"] is True
-    assert session.say_calls[0]["add_to_chat_ctx"] is False
+    assert background_audio.played == [str(tmp_path / "client_silence.wav")]
+    assert session.say_calls == []
 
 
 @pytest.mark.asyncio
 async def test_client_silence_prompt_does_not_repeat_without_user_activity(
     tmp_path,
 ) -> None:
-    manager, session, _ = _voice_prompt_manager(tmp_path=tmp_path)
+    manager, session, background_audio = _voice_prompt_manager(tmp_path=tmp_path)
 
     manager.on_agent_finished_speaking()
     await asyncio.sleep(0.05)
@@ -481,23 +478,25 @@ async def test_client_silence_prompt_does_not_repeat_without_user_activity(
     await asyncio.sleep(0.05)
     await manager.aclose()
 
-    assert len(session.say_calls) == 1
+    assert background_audio.played == [str(tmp_path / "client_silence.wav")]
+    assert session.say_calls == []
 
 
 @pytest.mark.asyncio
 async def test_client_silence_prompt_waits_until_agent_has_spoken(tmp_path) -> None:
-    manager, session, _ = _voice_prompt_manager(tmp_path=tmp_path)
+    manager, session, background_audio = _voice_prompt_manager(tmp_path=tmp_path)
 
     manager.start_client_silence_timer()
     await asyncio.sleep(0.05)
     await manager.aclose()
 
+    assert background_audio.played == []
     assert session.say_calls == []
 
 
 @pytest.mark.asyncio
 async def test_user_speech_clears_client_silence_wait_state(tmp_path) -> None:
-    manager, session, _ = _voice_prompt_manager(tmp_path=tmp_path)
+    manager, session, background_audio = _voice_prompt_manager(tmp_path=tmp_path)
 
     manager.on_agent_finished_speaking()
     manager.on_user_started_speaking()
@@ -505,12 +504,13 @@ async def test_user_speech_clears_client_silence_wait_state(tmp_path) -> None:
     await asyncio.sleep(0.05)
     await manager.aclose()
 
+    assert background_audio.played == []
     assert session.say_calls == []
 
 
 @pytest.mark.asyncio
 async def test_client_silence_prompt_does_not_start_during_end_call(tmp_path) -> None:
-    manager, session, _ = _voice_prompt_manager(
+    manager, session, background_audio = _voice_prompt_manager(
         tmp_path=tmp_path,
         is_end_call_scheduled=lambda: True,
     )
@@ -519,6 +519,29 @@ async def test_client_silence_prompt_does_not_start_during_end_call(tmp_path) ->
     await asyncio.sleep(0.05)
     await manager.aclose()
 
+    assert background_audio.played == []
+    assert session.say_calls == []
+
+
+@pytest.mark.asyncio
+async def test_user_speech_stops_active_client_silence_prompt(tmp_path) -> None:
+    handle = _FakePromptHandle(done=False)
+    background_audio = _FakeBackgroundAudio(handle=handle)
+    manager, session, _ = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        background_audio=background_audio,
+    )
+
+    manager.on_agent_finished_speaking()
+    await asyncio.sleep(0.05)
+    assert background_audio.played == [str(tmp_path / "client_silence.wav")]
+    assert handle.stopped is False
+
+    manager.on_user_started_speaking()
+    await asyncio.sleep(0)
+    await manager.aclose()
+
+    assert handle.stopped is True
     assert session.say_calls == []
 
 

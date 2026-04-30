@@ -309,6 +309,9 @@ STT_EARLY_INTERIM_FINAL_ENABLED = _env_bool(
 STT_EARLY_INTERIM_FINAL_DELAY_SEC = float(
     os.getenv("STT_EARLY_INTERIM_FINAL_DELAY_SEC", "0.15")
 )
+STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS = int(
+    os.getenv("STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS", "1")
+)
 
 # Google TTS runtime settings.
 # Google Cloud model formats example: gemini-3.1-flash-tts-preview, gemini-2.5-flash-tts

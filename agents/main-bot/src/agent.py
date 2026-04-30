@@ -183,6 +183,7 @@ from config import (
     STT_DEEPGRAM_MODEL,
     STT_EARLY_INTERIM_FINAL_DELAY_SEC,
     STT_EARLY_INTERIM_FINAL_ENABLED,
+    STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS,
     STT_GOOGLE_LANGUAGE,
     STT_GOOGLE_LOCATION,
     STT_GOOGLE_MODEL,
@@ -476,7 +477,6 @@ class VoicePromptManager:
         *,
         session: AgentSession,
         background_audio: BackgroundAudioPlayer,
-        sample_rate: int,
         response_delay_prompt: VoicePromptSpec,
         client_silence_prompt: VoicePromptSpec,
         response_delay_sec: float,
@@ -487,7 +487,6 @@ class VoicePromptManager:
     ) -> None:
         self._session = session
         self._background_audio = background_audio
-        self._sample_rate = sample_rate
         self._response_delay_prompt = response_delay_prompt
         self._client_silence_prompt = client_silence_prompt
         self._response_delay_sec = max(0.0, response_delay_sec)
@@ -591,6 +590,12 @@ class VoicePromptManager:
             self._active_prompt_handle = None
         if handle is None or self._handle_done(handle):
             return
+        self._stop_prompt_handle(handle)
+
+    @staticmethod
+    def _stop_prompt_handle(handle: Any | None) -> None:
+        if handle is None:
+            return
         with suppress(Exception):
             if hasattr(handle, "stop"):
                 handle.stop()
@@ -633,7 +638,7 @@ class VoicePromptManager:
             current_speech = self._session.current_speech
             if current_speech is not None and not current_speech.done():
                 return
-            played = await self._play_session_prompt(self._client_silence_prompt)
+            played = await self._play_background_prompt(self._client_silence_prompt)
             if played:
                 self._client_silence_played = True
         except asyncio.CancelledError:
@@ -667,61 +672,16 @@ class VoicePromptManager:
                 self._last_response_delay_finished_at = asyncio.get_running_loop().time()
             logger.info("voice prompt finished", extra={"kind": prompt.kind})
             return True
+        except asyncio.CancelledError:
+            self._stop_prompt_handle(handle)
+            raise
         except Exception as e:
             logger.exception(
                 "failed to play background voice prompt '%s': %s",
                 prompt.kind,
                 e,
             )
-            if handle is not None and hasattr(handle, "stop"):
-                with suppress(Exception):
-                    handle.stop()
-            return False
-        finally:
-            await self._clear_active_prompt(prompt.kind)
-
-    async def _play_session_prompt(self, prompt: VoicePromptSpec) -> bool:
-        audio_path = self._select_audio_path(prompt)
-        if audio_path is None:
-            return False
-        if not audio_path.exists():
-            logger.warning(
-                "voice prompt audio file not found",
-                extra={"kind": prompt.kind, "audio_path": str(audio_path)},
-            )
-            return False
-        if not await self._reserve_active_prompt(prompt.kind):
-            return False
-
-        handle = None
-        try:
-            handle = self._session.say(
-                prompt.phrase,
-                audio=audio_frames_from_file(
-                    str(audio_path),
-                    sample_rate=self._sample_rate,
-                    num_channels=1,
-                ),
-                allow_interruptions=True,
-                add_to_chat_ctx=False,
-            )
-            await self._set_active_prompt(prompt.kind, handle)
-            logger.info(
-                "voice prompt started",
-                extra={"kind": prompt.kind, "audio_path": str(audio_path)},
-            )
-            await handle.wait_for_playout()
-            logger.info("voice prompt finished", extra={"kind": prompt.kind})
-            return True
-        except Exception as e:
-            logger.exception(
-                "failed to play session voice prompt '%s': %s",
-                prompt.kind,
-                e,
-            )
-            if handle is not None and hasattr(handle, "interrupt"):
-                with suppress(Exception):
-                    handle.interrupt(force=True)
+            self._stop_prompt_handle(handle)
             return False
         finally:
             await self._clear_active_prompt(prompt.kind)
@@ -1884,6 +1844,7 @@ def _wrap_stt_for_early_interim_final(stt_client: lk_stt.STT) -> lk_stt.STT:
         stt_client,
         enabled=STT_EARLY_INTERIM_FINAL_ENABLED,
         delay_sec=STT_EARLY_INTERIM_FINAL_DELAY_SEC,
+        min_stable_interims=STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS,
         turn_detection_mode=TURN_DETECTION_MODE,
         logger_=logger,
     )
@@ -2881,9 +2842,10 @@ async def my_agent(ctx: JobContext):
 
     audio_output_sample_rate = resolve_audio_output_sample_rate()
     external_http_sessions: list[aiohttp.ClientSession] = []
+    stt_client = build_stt(external_http_sessions=external_http_sessions)
 
     session = AgentSession(
-        stt=build_stt(external_http_sessions=external_http_sessions),
+        stt=stt_client,
         llm=session_llm or build_llm(),
         tts=build_tts(external_http_sessions=external_http_sessions),
         turn_handling={
@@ -2901,7 +2863,6 @@ async def my_agent(ctx: JobContext):
     voice_prompts = VoicePromptManager(
         session=session,
         background_audio=background_audio,
-        sample_rate=audio_output_sample_rate,
         response_delay_prompt=VoicePromptSpec(
             kind="response_delay",
             audio_paths=_RESPONSE_DELAY_AUDIO_PATHS,
@@ -2938,6 +2899,7 @@ async def my_agent(ctx: JobContext):
             "reply_watchdog_sec": REPLY_WATCHDOG_SEC,
             "stt_early_interim_final_enabled": STT_EARLY_INTERIM_FINAL_ENABLED,
             "stt_early_interim_final_delay_sec": STT_EARLY_INTERIM_FINAL_DELAY_SEC,
+            "stt_early_interim_final_min_stable_interims": STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS,
             "voice_response_delay_sec": VOICE_RESPONSE_DELAY_SEC,
             "voice_response_delay_post_gap_sec": VOICE_RESPONSE_DELAY_POST_GAP_SEC,
             "voice_response_delay_audio_paths": [
@@ -3105,14 +3067,33 @@ async def my_agent(ctx: JobContext):
         try:
             old_state = getattr(ev, "old_state", None)
             new_state = getattr(ev, "new_state", None)
-            logger.debug(
+            old_state_value = getattr(old_state, "value", old_state)
+            new_state_value = getattr(new_state, "value", new_state)
+            logger.info(
                 "user state changed",
-                extra={"old_state": old_state, "new_state": new_state},
+                extra={"old_state": old_state_value, "new_state": new_state_value},
             )
-            if new_state == "speaking":
+            if new_state_value == "speaking":
                 voice_prompts.on_user_started_speaking()
                 return
-            if old_state == "speaking" and new_state == "listening":
+            if old_state_value == "speaking" and new_state_value == "listening":
+                ended_at = getattr(ev, "created_at", None)
+                if isinstance(ended_at, (int, float)):
+                    logger.info(
+                        "local VAD end of speech",
+                        extra={
+                            "ended_at": ended_at,
+                            "handler_lag_ms": round(
+                                max(0.0, time.time() - float(ended_at)) * 1000,
+                                1,
+                            ),
+                        },
+                    )
+                notify_local_end_of_speech = getattr(
+                    stt_client, "notify_local_end_of_speech", None
+                )
+                if callable(notify_local_end_of_speech):
+                    notify_local_end_of_speech(ended_at=ended_at)
                 voice_prompts.start_response_delay_timer()
         except Exception as e:
             logger.exception("user_state_changed handler failed: %s", e)
@@ -3150,6 +3131,8 @@ async def my_agent(ctx: JobContext):
             if new_state == "speaking":
                 tts_first_frame_ready_at = assistant._tts_first_frame_ready_at
                 tts_first_frame_yielded_at = assistant._tts_first_frame_yielded_at
+                assistant._tts_first_frame_ready_at = None
+                assistant._tts_first_frame_yielded_at = None
                 created_at = getattr(ev, "created_at", None)
                 if isinstance(created_at, (int, float)):
                     logger.info(
