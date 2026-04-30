@@ -137,6 +137,11 @@ New providers do not need a separate proxy subsystem. Use the shared helpers in
 default to `_PROVIDER_DEFAULTS` only after latency/geoblock testing shows the
 right production route.
 
+When adding provider plugins, tools, or external API modules, also follow the
+diagnostics contract in [`../../docs/robot-diagnostics.md`](../../docs/robot-diagnostics.md).
+Use `src/incident_logger.py` for best-effort incident writes instead of creating
+a separate log format. Diagnostic writes must not affect the realtime call path.
+
 Provider client wiring checklist:
 
 1. Pick a stable provider key, for example `openai`, `cartesia`, or `anthropic`.

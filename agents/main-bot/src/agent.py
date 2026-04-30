@@ -133,6 +133,8 @@ from config import (
     GOOGLE_TTS_STREAM_CONTEXT_LEN,
     GOOGLE_TTS_USE_STREAMING,
     GOOGLE_TTS_VOICE_NAME,
+    INCIDENT_ENVIRONMENT,
+    INCIDENT_SLOW_RESPONSE_MS,
     LIVEKIT_SELF_HOSTED,
     LLM_ATTEMPT_TIMEOUT_SEC,
     LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
@@ -249,6 +251,7 @@ from egress import (
     provider_proxy_url,
 )
 from eleven_v3_tts import ElevenV3TTS
+from incident_logger import IncidentLogger, classify_error, component_identity
 from prompt_repo import PromptResolution, get_active_prompt, resolve_prompt_for_call
 from robot_skills import RobotSkillContext, RobotSkillRunner
 from robot_tags import parse_robot_tags, sanitize_tagged_text_stream
@@ -284,12 +287,25 @@ _SIP_DID_ATTRIBUTE_KEYS = (
     "sip.h.X-DID",
     "sip.trunkPhoneNumber",
 )
+_SIP_TRACE_ATTRIBUTE_KEYS = (
+    "jcall.trace_id",
+    "x-traceid",
+    "X-TRACEID",
+    "X-TraceID",
+    "sip.h.X-TRACEID",
+)
+_SIP_CALL_ID_ATTRIBUTE_KEYS = (
+    "jcall.sip_call_id",
+    "sip.callID",
+    "sip.callId",
+    "sip.call_id",
+    "sip.h.Call-ID",
+)
 _WHITESPACE_RE = re.compile(r"\s+")
 _SHORT_GREETING_RE = re.compile(
     r"^(?:алло|алло алло|ало|ало ало|алё|алё алё|але|але але|доброе утро|алло доброе утро|ало доброе утро|алё доброе утро|добрый день|алло добрый день|ало добрый день|алё добрый день|здравствуйте|да здравствуйте|алло здравствуйте|ало здравствуйте|алё здравствуйте|девушка здравствуйте|алло девушка здравствуйте|здрасьте|алло здрасьте|ало здрасьте|алё здрасьте|девушка здрасьте|алло девушка здрасьте)[\.!\?, ]*$",
     re.IGNORECASE,
 )
-
 
 @dataclass(frozen=True)
 class LLMBranchMetadata:
@@ -411,6 +427,161 @@ def extract_sip_call_numbers(participant: Any | None) -> dict[str, str | None]:
         "sip_trunk_number": sip_trunk_number,
         "sip_client_number": (attributes.get("sip.phoneNumber") or "").strip() or None,
     }
+
+
+def extract_sip_diagnostic_context(participant: Any | None) -> dict[str, str | None]:
+    numbers = extract_sip_call_numbers(participant)
+    context = {
+        "did": numbers["sip_trunk_number"],
+        "caller_phone": numbers["sip_client_number"],
+        "trace_id": None,
+        "sip_call_id": None,
+    }
+    if participant is None or getattr(participant, "kind", None) != (
+        rtc.ParticipantKind.PARTICIPANT_KIND_SIP
+    ):
+        return context
+
+    attributes = getattr(participant, "attributes", None)
+    if not isinstance(attributes, dict):
+        return context
+
+    for key in _SIP_TRACE_ATTRIBUTE_KEYS:
+        value = (attributes.get(key) or "").strip()
+        if value:
+            context["trace_id"] = value
+            break
+    for key in _SIP_CALL_ID_ATTRIBUTE_KEYS:
+        value = (attributes.get(key) or "").strip()
+        if value:
+            context["sip_call_id"] = value
+            break
+    return context
+
+
+def get_job_id(ctx: JobContext) -> str | None:
+    job = getattr(ctx, "job", None)
+    for key in ("id", "job_id"):
+        value = getattr(job, key, None)
+        if value:
+            return str(value)
+    return None
+
+
+def metrics_value(metrics: Any, key: str) -> Any:
+    if isinstance(metrics, dict):
+        return metrics.get(key)
+    return getattr(metrics, key, None)
+
+
+def normalize_provider_name(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def fallback_adapter_contains_provider(component: Any, expected_provider: str) -> bool:
+    expected = normalize_provider_name(expected_provider)
+    if not expected:
+        return False
+    for attr_name in ("_stt_instances", "_llm_instances"):
+        instances = getattr(component, attr_name, None)
+        if not isinstance(instances, list):
+            continue
+        for instance in instances:
+            provider = normalize_provider_name(str(getattr(instance, "provider", "")))
+            if expected in provider:
+                return True
+    return False
+
+
+def should_log_startup_provider_fallback(
+    *,
+    component_name: str,
+    configured_provider: str,
+    actual_component: Any,
+) -> bool:
+    configured = normalize_provider_name(configured_provider)
+    actual_provider = normalize_provider_name(
+        str(getattr(actual_component, "provider", ""))
+    )
+    if not configured:
+        return False
+    if component_name == "stt" and configured == "inference":
+        return False
+    if component_name == "tts" and configured == "elevenlabs":
+        return False
+    if configured in actual_provider:
+        return False
+    return not fallback_adapter_contains_provider(actual_component, configured)
+
+
+def is_abnormal_close(reason: str | None, error: str | None) -> bool:
+    if error:
+        return True
+    normalized = (reason or "").lower()
+    if not normalized or normalized in {"none", "participant_disconnected"}:
+        return False
+    if normalized.startswith("end_call:"):
+        return False
+    return any(
+        marker in normalized
+        for marker in ("error", "failed", "cancelled", "timeout", "abnormal")
+    )
+
+
+def register_stt_fallback_incident_listener(
+    stt_client: Any,
+    incident_log: IncidentLogger,
+) -> None:
+    if not hasattr(stt_client, "on"):
+        return
+
+    def _on_availability_changed(ev: Any) -> None:
+        changed_stt = getattr(ev, "stt", None)
+        available = bool(getattr(ev, "available", False))
+        if available:
+            return
+        provider, model = component_identity(changed_stt)
+        incident_log.record_nowait(
+            "provider_fallback",
+            severity="warning",
+            component="stt",
+            provider=provider,
+            model=model,
+            description="STT provider became unavailable and fallback path was used",
+            payload={
+                "available": available,
+                "label": getattr(changed_stt, "label", None),
+            },
+        )
+
+    with suppress(Exception):
+        stt_client.on("stt_availability_changed", _on_availability_changed)
+
+
+def register_component_metrics_listener(
+    component: Any,
+    *,
+    component_name: str,
+    sink: list[dict[str, Any]],
+) -> None:
+    if not hasattr(component, "on"):
+        return
+
+    def _on_metrics_collected(*args: Any, **kwargs: Any) -> None:
+        event = args[0] if args else kwargs.get("event")
+        metrics = getattr(event, "metrics", event)
+        provider, model = component_identity(component)
+        sink.append(
+            {
+                "component": component_name,
+                "provider": provider,
+                "model": model,
+                "metrics": safe_dump(metrics),
+            }
+        )
+
+    with suppress(Exception):
+        component.on("metrics_collected", _on_metrics_collected)
 
 
 def is_short_greeting_response(text: str | None) -> bool:
@@ -2125,6 +2296,7 @@ class Assistant(Agent):
         voice_prompts: VoicePromptManager | None = None,
         tag_skill_runner: RobotSkillRunner | None = None,
         prompt: str | None = None,
+        incident_logger: IncidentLogger | None = None,
     ) -> None:
         self._model_router = model_router
         self._routed_llms = routed_llms or {}
@@ -2137,6 +2309,7 @@ class Assistant(Agent):
         self._prerecorded_audio_sample_rate = prerecorded_audio_sample_rate
         self._voice_prompts = voice_prompts
         self._tag_skill_runner = tag_skill_runner
+        self._incident_logger = incident_logger
         self._awaiting_first_user_turn = True
         self._llm_branch_started_at: dict[str, float] = {}
         self._tts_first_frame_ready_at: float | None = None
@@ -2424,6 +2597,27 @@ class Assistant(Agent):
                 "chunk_sent": None,
             },
         )
+        if not available and self._incident_logger is not None:
+            self._incident_logger.record_nowait(
+                "provider_fallback",
+                severity="warning",
+                component="llm",
+                provider=changed_provider,
+                model=changed_model,
+                latency_ms=elapsed_ms,
+                description="LLM provider became unavailable and fallback path was used",
+                payload={
+                    "branch": branch,
+                    "available": available,
+                    "primary_provider": metadata.primary_provider if metadata else None,
+                    "primary_model": metadata.primary_model if metadata else None,
+                    "backup_provider": metadata.backup_provider if metadata else None,
+                    "backup_model": metadata.backup_model if metadata else None,
+                    "final_provider": final_provider,
+                    "final_model": final_model,
+                    "elapsed_ms_before_fallback": elapsed_ms,
+                },
+            )
 
     async def _stream_llm(
         self,
@@ -2601,6 +2795,8 @@ class Assistant(Agent):
                 self._llm_branch_started_at.pop(selected_branch, None)
 
         yielded_any = False
+        fallback_reason = None
+        fallback_error_type = None
 
         try:
             async for chunk in self._tracked_robot_tag_llm_stream(
@@ -2621,6 +2817,8 @@ class Assistant(Agent):
                 "primary LLM first token timeout after %.1fs; retrying once",
                 LLM_FIRST_TOKEN_TIMEOUT_SEC,
             )
+            fallback_reason = "primary_first_token_timeout"
+            fallback_error_type = "TimeoutError"
         except APIStatusError as e:
             if yielded_any or e.status_code < 500:
                 raise
@@ -2628,12 +2826,16 @@ class Assistant(Agent):
                 "primary LLM returned %s before first token; retrying once",
                 e.status_code,
             )
+            fallback_reason = f"primary_api_{e.status_code}"
+            fallback_error_type = type(e).__name__
         except Exception as e:
             if yielded_any:
                 raise
             logger.warning(
                 "primary LLM failed before first token; retrying once: %s", e
             )
+            fallback_reason = "primary_error"
+            fallback_error_type = type(e).__name__
 
         await asyncio.sleep(max(0.0, LLM_RETRY_DELAY_SEC))
 
@@ -2657,16 +2859,49 @@ class Assistant(Agent):
                 "retry first token timeout after %.1fs; switching to fallback model",
                 LLM_FIRST_TOKEN_TIMEOUT_SEC,
             )
+            fallback_reason = "retry_first_token_timeout"
+            fallback_error_type = "TimeoutError"
         except APIStatusError as e:
             if e.status_code < 500 or self._fallback_llm is None:
                 raise
             logger.warning(
                 "retry failed with %s; switching to fallback model", e.status_code
             )
+            fallback_reason = f"retry_api_{e.status_code}"
+            fallback_error_type = type(e).__name__
         except Exception:
             if self._fallback_llm is None:
                 raise
             logger.warning("retry failed; switching to fallback model")
+            fallback_reason = "retry_error"
+            fallback_error_type = "Exception"
+
+        if self._incident_logger is not None:
+            fallback_provider, fallback_model = component_identity(self._fallback_llm)
+            primary_model_name = (
+                route_metadata.primary_model
+                if route_metadata
+                else str(getattr(primary_llm, "model", None))
+            )
+            self._incident_logger.record_nowait(
+                "provider_fallback",
+                severity="warning",
+                component="llm",
+                provider=primary_provider,
+                model=primary_model_name,
+                error_type=fallback_error_type,
+                description="Manual LLM fallback model was used",
+                payload={
+                    "branch": selected_branch,
+                    "reason": fallback_reason,
+                    "primary_provider": primary_provider,
+                    "primary_model": primary_model_name,
+                    "fallback_provider": fallback_provider,
+                    "fallback_model": fallback_model,
+                    "first_token_timeout_sec": LLM_FIRST_TOKEN_TIMEOUT_SEC,
+                    "fallback_first_token_timeout_sec": LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
+                },
+            )
 
         async for chunk in self._tracked_robot_tag_llm_stream(
             self._stream_llm_with_ttft_timeout(
@@ -2679,7 +2914,6 @@ class Assistant(Agent):
             )
         ):
             yield chunk
-
 
 def compute_server_load(agent_server: AgentServer) -> float:
     return min(len(agent_server.active_jobs) / AGENT_MAX_CONCURRENT_JOBS, 1.0)
@@ -2741,6 +2975,12 @@ async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
+    job_id = get_job_id(ctx)
+    incident_log = IncidentLogger(
+        environment=INCIDENT_ENVIRONMENT,
+        room_name=ctx.room.name,
+        job_id=job_id,
+    )
 
     session_started_at = datetime.now(timezone.utc)
 
@@ -2748,6 +2988,7 @@ async def my_agent(ctx: JobContext):
     tag_events = []
     usage_updates = []
     metrics_events = []
+    component_metrics_events = []
     close_info = {"reason": None, "error": None}
     close_event = asyncio.Event()
     user_activity_count = 0
@@ -2760,6 +3001,8 @@ async def my_agent(ctx: JobContext):
     runtime_warmup_task: asyncio.Task | None = None
     unrecoverable_error_task: asyncio.Task | None = None
     unrecoverable_error_response_started = False
+    session_started = False
+    startup_failure_recorded = False
     prompt_resolution = PromptResolution(
         prompt="",
         source="file:not_resolved",
@@ -2776,9 +3019,20 @@ async def my_agent(ctx: JobContext):
     if LLM_ROUTING_ENABLED:
         model_router = ModelRouter.from_default_config()
         router_model_names = _resolve_router_model_names(model_router)
-        routed_llms, routed_llm_providers, routed_llm_metadata = (
-            build_routed_llm_clients()
-        )
+        try:
+            routed_llms, routed_llm_providers, routed_llm_metadata = (
+                build_routed_llm_clients()
+            )
+        except Exception as e:
+            await incident_log.record_exception(
+                "session_start_failed",
+                e,
+                severity="critical",
+                component="llm",
+                description="Failed to build routed LLM clients before session start",
+                payload={"phase": "build_routed_llm_clients"},
+            )
+            raise
         logger.info(
             "model router configured",
             extra={
@@ -2803,10 +3057,22 @@ async def my_agent(ctx: JobContext):
 
     fallback_llm = None
     if not LLM_ROUTING_ENABLED:
-        session_llm, session_llm_metadata = build_llm_client_for_branch(
-            branch="complex",
-            primary_provider=LLM_PROVIDER,
-        )
+        try:
+            session_llm, session_llm_metadata = build_llm_client_for_branch(
+                branch="complex",
+                primary_provider=LLM_PROVIDER,
+            )
+        except Exception as e:
+            await incident_log.record_exception(
+                "session_start_failed",
+                e,
+                severity="critical",
+                component="llm",
+                provider=LLM_PROVIDER,
+                description="Failed to build session LLM before session start",
+                payload={"phase": "build_session_llm"},
+            )
+            raise
         routed_llms["complex"] = session_llm
         routed_llm_metadata["complex"] = session_llm_metadata
     else:
@@ -2819,7 +3085,20 @@ async def my_agent(ctx: JobContext):
         and fallback_provider.primary_provider == "google"
         and GEMINI_FALLBACK_MODEL
     ):
-        fallback_llm = build_google_llm(model_name=GEMINI_FALLBACK_MODEL)
+        try:
+            fallback_llm = build_google_llm(model_name=GEMINI_FALLBACK_MODEL)
+        except Exception as e:
+            await incident_log.record_exception(
+                "session_start_failed",
+                e,
+                severity="critical",
+                component="llm",
+                provider="google",
+                model=GEMINI_FALLBACK_MODEL,
+                description="Failed to build manual fallback LLM before session start",
+                payload={"phase": "build_manual_fallback_llm"},
+            )
+            raise
 
     min_endpointing_delay = max(0.0, TURN_MIN_ENDPOINTING_DELAY)
     max_endpointing_delay = max(min_endpointing_delay, TURN_MAX_ENDPOINTING_DELAY)
@@ -2842,12 +3121,86 @@ async def my_agent(ctx: JobContext):
 
     audio_output_sample_rate = resolve_audio_output_sample_rate()
     external_http_sessions: list[aiohttp.ClientSession] = []
-    stt_client = build_stt(external_http_sessions=external_http_sessions)
+    try:
+        stt_client = build_stt(external_http_sessions=external_http_sessions)
+        tts_client = build_tts(external_http_sessions=external_http_sessions)
+    except Exception as e:
+        await incident_log.record_exception(
+            "session_start_failed",
+            e,
+            severity="critical",
+            component="pipeline",
+            description="Failed to build STT/TTS pipeline before session start",
+            payload={
+                "phase": "build_stt_tts",
+                "stt_provider": STT_PROVIDER,
+                "tts_provider": TTS_PROVIDER,
+            },
+        )
+        raise
+
+    if should_log_startup_provider_fallback(
+        component_name="stt",
+        configured_provider=STT_PROVIDER,
+        actual_component=stt_client,
+    ):
+        provider, model = component_identity(stt_client)
+        incident_log.record_nowait(
+            "provider_fallback",
+            severity="warning",
+            component="stt",
+            provider=provider,
+            model=model,
+            description="Configured STT provider was not used at startup",
+            payload={
+                "configured_provider": STT_PROVIDER,
+                "actual_provider": provider,
+                "actual_model": model,
+            },
+        )
+
+    if should_log_startup_provider_fallback(
+        component_name="tts",
+        configured_provider=TTS_PROVIDER,
+        actual_component=tts_client,
+    ):
+        provider, model = component_identity(tts_client)
+        incident_log.record_nowait(
+            "provider_fallback",
+            severity="warning",
+            component="tts",
+            provider=provider,
+            model=model,
+            description="Configured TTS provider was not used at startup",
+            payload={
+                "configured_provider": TTS_PROVIDER,
+                "actual_provider": provider,
+                "actual_model": model,
+            },
+        )
+
+    register_stt_fallback_incident_listener(stt_client, incident_log)
+    register_component_metrics_listener(
+        stt_client,
+        component_name="stt",
+        sink=component_metrics_events,
+    )
+    register_component_metrics_listener(
+        tts_client,
+        component_name="tts",
+        sink=component_metrics_events,
+    )
+    for branch_name, llm_client in routed_llms.items():
+        register_component_metrics_listener(
+            llm_client,
+            component_name=f"llm:{branch_name}",
+            sink=component_metrics_events,
+        )
 
     session = AgentSession(
         stt=stt_client,
         llm=session_llm or build_llm(),
-        tts=build_tts(external_http_sessions=external_http_sessions),
+        tts=tts_client,
         turn_handling={
             "turn_detection": turn_detection_mode,
             "endpointing": {
@@ -2983,6 +3336,19 @@ async def my_agent(ctx: JobContext):
                     "assistant_message_count": assistant_message_count,
                 },
             )
+            incident_log.record_nowait(
+                "reply_watchdog_fired",
+                severity="warning",
+                component="turn_runtime",
+                latency_ms=REPLY_WATCHDOG_SEC * 1000,
+                description="No assistant reply appeared before reply watchdog timeout",
+                payload={
+                    "timeout_sec": REPLY_WATCHDOG_SEC,
+                    "user_activity_count": user_activity_count,
+                    "assistant_message_count": assistant_message_count,
+                    "agent_state": session.agent_state,
+                },
+            )
             # Safety path for stuck scheduling:
             # - disable tools to prevent accidental action calls
             # - nudge model to answer latest user request directly
@@ -3022,6 +3388,52 @@ async def my_agent(ctx: JobContext):
                 if reply_watchdog_task and not reply_watchdog_task.done():
                     reply_watchdog_task.cancel()
                     reply_watchdog_task = None
+                item_metrics = getattr(item, "metrics", None)
+                e2e_latency = metrics_value(item_metrics, "e2e_latency")
+                if e2e_latency is not None:
+                    latency_ms = round(float(e2e_latency) * 1000, 1)
+                    if latency_ms >= INCIDENT_SLOW_RESPONSE_MS:
+                        incident_log.record_nowait(
+                            "slow_response",
+                            severity="warning",
+                            component="voice_pipeline",
+                            latency_ms=latency_ms,
+                            description="Assistant response latency exceeded threshold",
+                            payload={
+                                "threshold_ms": INCIDENT_SLOW_RESPONSE_MS,
+                                "e2e_latency_ms": latency_ms,
+                                "llm_node_ttft_ms": (
+                                    round(
+                                        float(
+                                            metrics_value(
+                                                item_metrics,
+                                                "llm_node_ttft",
+                                            )
+                                        )
+                                        * 1000,
+                                        1,
+                                    )
+                                    if metrics_value(item_metrics, "llm_node_ttft")
+                                    is not None
+                                    else None
+                                ),
+                                "tts_node_ttfb_ms": (
+                                    round(
+                                        float(
+                                            metrics_value(
+                                                item_metrics,
+                                                "tts_node_ttfb",
+                                            )
+                                        )
+                                        * 1000,
+                                        1,
+                                    )
+                                    if metrics_value(item_metrics, "tts_node_ttfb")
+                                    is not None
+                                    else None
+                                ),
+                            },
+                        )
         except Exception as e:
             logger.exception("conversation_item_added handler failed: %s", e)
 
@@ -3176,6 +3588,24 @@ async def my_agent(ctx: JobContext):
                     "room": ctx.room.name,
                 },
             )
+            incident_log.record_nowait(
+                "agent_session_error",
+                severity="warning" if recoverable else "error",
+                component=str(
+                    getattr(err, "type", "livekit_session") or "livekit_session"
+                ),
+                provider=getattr(source, "provider", None),
+                model=getattr(source, "model", None),
+                error_type=str(getattr(err, "type", type(err).__name__)),
+                description=str(getattr(err, "label", None) or "Agent session error"),
+                payload={
+                    "recoverable": recoverable,
+                    "error_label": getattr(err, "label", None),
+                    "source_label": getattr(source, "label", None),
+                    "error": safe_dump(err),
+                    "source": safe_dump(source),
+                },
+            )
             if recoverable:
                 return
             if unrecoverable_error_task and not unrecoverable_error_task.done():
@@ -3241,11 +3671,13 @@ async def my_agent(ctx: JobContext):
             "tag_events": tag_events,
             "usage_updates": usage_updates,
             "metrics_events": metrics_events,
+            "component_metrics_events": component_metrics_events,
             "summary": {
                 "transcript_count": len(transcript_items),
                 "tag_event_count": len(tag_events),
                 "usage_update_count": len(usage_updates),
                 "metrics_count": len(metrics_events),
+                "component_metrics_count": len(component_metrics_events),
             },
         }
 
@@ -3284,10 +3716,26 @@ async def my_agent(ctx: JobContext):
             )
         except asyncio.TimeoutError:
             logger.warning("delete_room timed out; forcing local shutdown")
+            incident_log.record_nowait(
+                "abnormal_close",
+                severity="warning",
+                component="livekit_room",
+                error_type="TimeoutError",
+                description="delete_room timed out while ending call",
+                payload={"reason": reason, "room": ctx.room.name},
+            )
         except Exception as e:
             logger.exception("failed to delete room: %s", e)
             close_reason = f"tag_action_failed:{reason}"
             close_info["reason"] = close_reason
+            incident_log.record_exception_nowait(
+                "abnormal_close",
+                e,
+                severity="warning",
+                component="livekit_room",
+                description="delete_room failed while ending call",
+                payload={"reason": reason, "room": ctx.room.name},
+            )
         finally:
             # Unblock main entrypoint even if LiveKit close signal arrives late.
             close_event.set()
@@ -3324,6 +3772,15 @@ async def my_agent(ctx: JobContext):
         close_info["reason"] = str(getattr(ev, "reason", None))
         err = getattr(ev, "error", None)
         close_info["error"] = str(err) if err else None
+        if is_abnormal_close(close_info["reason"], close_info["error"]):
+            incident_log.record_nowait(
+                "abnormal_close",
+                severity="warning",
+                component="livekit_session",
+                error_type=type(err).__name__ if err else None,
+                description="LiveKit session closed with abnormal reason or error",
+                payload={"close": dict(close_info)},
+            )
         if reply_watchdog_task and not reply_watchdog_task.done():
             reply_watchdog_task.cancel()
             reply_watchdog_task = None
@@ -3341,12 +3798,28 @@ async def my_agent(ctx: JobContext):
             await asyncio.wait_for(asyncio.shield(export_task), timeout=timeout_sec)
         except asyncio.TimeoutError:
             logger.warning("n8n export timed out after %ss", timeout_sec)
+            incident_log.record_nowait(
+                "n8n_export_failed",
+                severity="warning",
+                component="n8n_export",
+                latency_ms=timeout_sec * 1000,
+                error_type="TimeoutError",
+                description="n8n session export timed out",
+                payload={"timeout_sec": timeout_sec},
+            )
         except asyncio.CancelledError:
             # Preserve cancellation semantics for outer handler, but do not lose
             # the in-flight export task. It will be awaited again in cancel path.
             raise
         except BaseException as e:
             logger.exception("n8n export failed: %s", e)
+            incident_log.record_exception_nowait(
+                "n8n_export_failed",
+                e,
+                severity="warning",
+                component="n8n_export",
+                description="n8n session export failed",
+            )
 
     try:
         await ctx.connect()
@@ -3361,6 +3834,7 @@ async def my_agent(ctx: JobContext):
             )
 
         sip_call_numbers = extract_sip_call_numbers(participant)
+        incident_log.set_context(**extract_sip_diagnostic_context(participant))
         prompt_resolution = await resolve_prompt_for_call(**sip_call_numbers)
         logger.info(
             "prompt resolved",
@@ -3381,6 +3855,20 @@ async def my_agent(ctx: JobContext):
             request_end_call=request_tag_end_call,
             record_event=tag_events.append,
         )
+        if prompt_resolution.error:
+            incident_log.record_nowait(
+                "prompt_lookup_failed",
+                severity="warning",
+                component="prompt_repo",
+                error_type=classify_error(RuntimeError(prompt_resolution.error)),
+                description="Prompt lookup failed; file prompt was used",
+                payload={
+                    "prompt_source": prompt_resolution.source,
+                    "error": prompt_resolution.error,
+                    "sip_trunk_number": prompt_resolution.sip_trunk_number,
+                    "sip_client_number": prompt_resolution.sip_client_number,
+                },
+            )
 
         assistant = Assistant(
             model_router=model_router,
@@ -3393,19 +3881,33 @@ async def my_agent(ctx: JobContext):
             voice_prompts=voice_prompts,
             tag_skill_runner=tag_skill_runner,
             prompt=prompt_resolution.prompt,
+            incident_logger=incident_log,
         )
 
-        await session.start(
-            agent=assistant,
-            room=ctx.room,
-            room_options=room_io.RoomOptions(
-                audio_input=build_audio_input_options(),
-                audio_output=room_io.AudioOutputOptions(
-                    sample_rate=audio_output_sample_rate,
-                    num_channels=1,
+        try:
+            await session.start(
+                agent=assistant,
+                room=ctx.room,
+                room_options=room_io.RoomOptions(
+                    audio_input=build_audio_input_options(),
+                    audio_output=room_io.AudioOutputOptions(
+                        sample_rate=audio_output_sample_rate,
+                        num_channels=1,
+                    ),
                 ),
-            ),
-        )
+            )
+            session_started = True
+        except Exception as e:
+            startup_failure_recorded = True
+            await incident_log.record_exception(
+                "session_start_failed",
+                e,
+                severity="critical",
+                component="livekit_session",
+                description="AgentSession.start failed",
+                payload={"phase": "session.start"},
+            )
+            raise
         await background_audio.start(room=ctx.room, agent_session=session)
 
         runtime_warmup_task = asyncio.create_task(
@@ -3456,8 +3958,31 @@ async def my_agent(ctx: JobContext):
             await asyncio.wait_for(close_event.wait(), timeout=0.8)
         if close_info["reason"] is None:
             close_info["reason"] = "entrypoint_cancelled"
+        incident_log.record_nowait(
+            "abnormal_close",
+            severity="warning",
+            component="livekit_entrypoint",
+            error_type="CancelledError",
+            description="LiveKit agent entrypoint was cancelled",
+            payload={"close": dict(close_info)},
+        )
         await export_best_effort(timeout_sec=export_wait_sec)
         await ensure_session_closed(timeout_sec=1.0)
+    except Exception as e:
+        if not startup_failure_recorded:
+            await incident_log.record_exception(
+                "agent_session_error" if session_started else "session_start_failed",
+                e,
+                severity="error" if session_started else "critical",
+                component="livekit_entrypoint",
+                description=(
+                    "LiveKit agent entrypoint failed"
+                    if session_started
+                    else "LiveKit agent failed before session start"
+                ),
+                payload={"session_started": session_started},
+            )
+        raise
     finally:
         if end_call_task and not end_call_task.done():
             end_call_task.cancel()
@@ -3486,8 +4011,26 @@ async def my_agent(ctx: JobContext):
                 logger.warning(
                     "n8n export timed out after %ss in finalizer", export_wait_sec
                 )
+                incident_log.record_nowait(
+                    "n8n_export_failed",
+                    severity="warning",
+                    component="n8n_export",
+                    latency_ms=export_wait_sec * 1000,
+                    error_type="TimeoutError",
+                    description="n8n session export timed out in finalizer",
+                    payload={"timeout_sec": export_wait_sec, "phase": "finalizer"},
+                )
             except BaseException as e:
                 logger.exception("n8n export finalizer failed: %s", e)
+                incident_log.record_exception_nowait(
+                    "n8n_export_failed",
+                    e,
+                    severity="warning",
+                    component="n8n_export",
+                    description="n8n export finalizer failed",
+                    payload={"phase": "finalizer"},
+                )
+        await incident_log.drain(timeout_sec=1.0)
 
 
 if __name__ == "__main__":

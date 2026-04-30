@@ -12,6 +12,29 @@ All app-level code is in the `src/` directory. In general, simple agents can be 
 
 Be sure to maintain code formatting. You can use the ruff formatter/linter as needed: `uv run ruff format` and `uv run ruff check`.
 
+## Diagnostics contract
+
+Before adding a plugin, tool, provider integration, or new runtime error
+handling, read `../../docs/robot-diagnostics.md`. Use the shared
+`src/incident_logger.py` contract for plugin/module incidents instead of
+creating ad hoc tables, webhooks, or log formats. Diagnostic code must be
+best-effort and must not change customer-visible voice behavior.
+
+## Business logic change control
+
+This agent is part of a production voice flow. Do not change business logic
+without explicit owner approval.
+
+Business logic includes provider/model selection, LLM/STT/TTS choice, prompts,
+agent instructions, handoffs/tasks, tool behavior, model routing, fallback
+activation, retry/timeout settings, latency guards, turn detection, customer
+flow, and any client-visible response behavior.
+
+If Gemini, xAI, Deepgram, ElevenLabs, Google, Vertex, LiveKit Inference, or any
+other provider is slow or failing, investigate the root cause first. Switching
+to a backup provider/model/service is a business decision. Present the expected
+quality, latency, cost, reliability, and rollback impact, then wait for approval.
+
 ## LiveKit Documentation
 
 LiveKit Agents is a fast-evolving project, and the documentation is updated frequently. You should always refer to the latest documentation when working with this project. For your convenience, LiveKit offers both a CLI and an MCP server that can be used to browse and search its documentation. If the developer has not yet installed the CLI, you should recommend that they install it.
