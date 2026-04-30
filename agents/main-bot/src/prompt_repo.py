@@ -1,10 +1,11 @@
 # ruff: noqa: RUF001
+import hashlib
 import logging
 import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -117,6 +118,7 @@ class DirectusPromptClient:
                     "active": True,
                 },
                 fields=[
+                    "id",
                     "caller_id",
                     "client_id",
                     "prompt_template",
@@ -142,6 +144,47 @@ class DirectusPromptClient:
             source="directus:cache",
             client_id=_relation_id(row.get("client_id")),
         )
+
+    async def save_cached_prompt(
+        self,
+        *,
+        caller_id: str,
+        prompt_template: _PromptTemplate,
+    ) -> None:
+        if self._http_client is None:
+            raise RuntimeError("Directus client is not open")
+
+        payload = {
+            "caller_id": caller_id,
+            "client_id": prompt_template.client_id,
+            "prompt_template": prompt_template.template,
+            "timezone": prompt_template.timezone,
+            "source_hash": _template_hash(prompt_template.template),
+            "active": True,
+            "last_error": None,
+            "date_updated": datetime.now(timezone.utc).isoformat(),
+        }
+
+        existing = await self._fetch_one(
+            DIRECTUS_COLLECTION_CLIENT_PROMPT_CACHE,
+            filters={"caller_id": caller_id},
+            fields=["id", "caller_id"],
+        )
+        if existing:
+            row_id = existing.get("id")
+            if row_id in (None, ""):
+                raise RuntimeError("Directus prompt cache row has no id")
+            response = await self._http_client.patch(
+                f"/items/{quote(DIRECTUS_COLLECTION_CLIENT_PROMPT_CACHE, safe='')}/"
+                f"{quote(str(row_id), safe='')}",
+                json=payload,
+            )
+        else:
+            response = await self._http_client.post(
+                f"/items/{quote(DIRECTUS_COLLECTION_CLIENT_PROMPT_CACHE, safe='')}",
+                json=payload,
+            )
+        response.raise_for_status()
 
     async def build_live_prompt(self, caller_id: str) -> _PromptTemplate | None:
         caller_row = await self._fetch_one(
@@ -472,10 +515,35 @@ async def _resolve_prompt_template(
         prompt_template = await client.fetch_cached_prompt(caller_id)
         if prompt_template is None:
             prompt_template = await client.build_live_prompt(caller_id)
+            if prompt_template is not None:
+                await _save_prompt_template_best_effort(
+                    client=client,
+                    caller_id=caller_id,
+                    prompt_template=prompt_template,
+                )
 
     if prompt_template is not None:
         _set_memory_cached_prompt(caller_id, prompt_template)
     return prompt_template
+
+
+async def _save_prompt_template_best_effort(
+    *,
+    client: Any,
+    caller_id: str,
+    prompt_template: _PromptTemplate,
+) -> None:
+    try:
+        await client.save_cached_prompt(
+            caller_id=caller_id,
+            prompt_template=prompt_template,
+        )
+    except Exception as e:
+        logger.warning(
+            "failed to save Directus prompt cache; continuing with live prompt: %s",
+            e,
+            extra={"sip_trunk_number": caller_id},
+        )
 
 
 def build_directus_client() -> DirectusPromptClient:
@@ -627,3 +695,7 @@ def _directus_filter_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+
+def _template_hash(template: str) -> str:
+    return hashlib.sha256(template.encode("utf-8")).hexdigest()
