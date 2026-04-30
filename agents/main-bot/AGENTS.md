@@ -20,6 +20,14 @@ All app-level code is in the `src/` directory. In general, simple agents can be 
 
 Be sure to maintain code formatting. You can use the ruff formatter/linter as needed: `uv run ruff format` and `uv run ruff check`.
 
+## Diagnostics contract
+
+Before adding a plugin, tool, provider integration, or new runtime error
+handling, read `../../docs/robot-diagnostics.md`. Use the shared
+`src/incident_logger.py` contract for plugin/module incidents instead of
+creating ad hoc tables, webhooks, or log formats. Diagnostic code must be
+best-effort and must not change customer-visible voice behavior.
+
 ## Business logic change control
 
 This agent is part of a production voice flow. Do not change business logic

@@ -537,3 +537,31 @@ AUDIO_INPUT_ENHANCEMENT = os.getenv(
 
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 N8N_WEBHOOK_TOKEN = os.getenv("N8N_WEBHOOK_TOKEN", "")
+
+# Best-effort robot incident log. The table is managed outside the realtime
+# call path; the agent only inserts rows when the table already exists.
+INCIDENT_LOG_ENABLED = _env_bool("INCIDENT_LOG_ENABLED", default=True)
+INCIDENT_DIRECTUS_URL = (
+    os.getenv(
+        "INCIDENT_DIRECTUS_URL",
+        os.getenv("DIRECTUS_URL", "https://jcall.io/directus"),
+    )
+    .strip()
+    .rstrip("/")
+)
+INCIDENT_DIRECTUS_TOKEN = os.getenv("INCIDENT_DIRECTUS_TOKEN", "").strip()
+INCIDENT_POSTGRES_DSN = os.getenv("INCIDENT_POSTGRES_DSN", "").strip()
+INCIDENT_LOG_TRANSPORT = (
+    os.getenv(
+        "INCIDENT_LOG_TRANSPORT",
+        "directus" if INCIDENT_DIRECTUS_TOKEN else "postgres",
+    )
+    .strip()
+    .lower()
+)
+INCIDENT_ENVIRONMENT = os.getenv(
+    "INCIDENT_ENVIRONMENT",
+    "local" if LIVEKIT_SELF_HOSTED else "cloud",
+).strip() or ("local" if LIVEKIT_SELF_HOSTED else "cloud")
+INCIDENT_DB_TIMEOUT_SEC = float(os.getenv("INCIDENT_DB_TIMEOUT_SEC", "1.5"))
+INCIDENT_SLOW_RESPONSE_MS = int(os.getenv("INCIDENT_SLOW_RESPONSE_MS", "7000"))

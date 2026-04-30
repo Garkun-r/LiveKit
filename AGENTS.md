@@ -65,6 +65,9 @@ Repository-specific rules:
 - Do not break existing working flows without necessity.
 - Reusable integrations should go into `shared/webhooks` or `shared/utils`.
 - For each new webhook, create a separate module.
+- Before adding new plugins, tools, provider integrations, or diagnostic
+  behavior, read `docs/robot-diagnostics.md` and use the shared incident log
+  contract instead of inventing a separate error table/log format.
 - Do not rename files or folders without a clear reason.
 - Preserve project structure unless a change is clearly required.
 
