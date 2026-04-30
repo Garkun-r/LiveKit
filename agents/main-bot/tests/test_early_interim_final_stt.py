@@ -220,6 +220,7 @@ async def test_local_vad_end_creates_synthetic_final_without_stt_eos() -> None:
     events = await _collect_events_with_local_vad_notify(
         wrapped,
         notify_after_sec=0.001,
+        ended_at=time.time() - 1.0,
     )
 
     assert [event.type for event in events] == [
@@ -411,6 +412,7 @@ async def test_late_interim_after_synthetic_is_suppressed() -> None:
     events = await _collect_events_with_local_vad_notify(
         wrapped,
         notify_after_sec=0.001,
+        ended_at=time.time() - 1.0,
     )
 
     assert [event.type for event in events] == [

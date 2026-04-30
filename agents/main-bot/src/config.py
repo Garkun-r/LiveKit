@@ -69,6 +69,13 @@ def _normalize_llm_provider(raw_provider: str) -> str:
     }.get(raw_provider.strip().lower(), raw_provider.strip().lower())
 
 
+def _normalize_optional_llm_provider(raw_provider: str) -> str:
+    normalized = raw_provider.strip().lower()
+    if normalized in {"", "disabled", "disable", "off", "none", "false"}:
+        return ""
+    return _normalize_llm_provider(raw_provider)
+
+
 _raw_llm_provider = os.getenv("LLM_PROVIDER", "google")
 LLM_PROVIDER = _normalize_llm_provider(_raw_llm_provider)
 
@@ -77,8 +84,12 @@ LLM_PROVIDER = _normalize_llm_provider(_raw_llm_provider)
 # - FAST_LLM_PROVIDER: provider used for "fast" route
 # - COMPLEX_LLM_PROVIDER: provider used for "complex" route
 # If either is empty, routing stays disabled and LLM_PROVIDER is used as before.
-FAST_LLM_PROVIDER = _normalize_llm_provider(os.getenv("FAST_LLM_PROVIDER", ""))
-COMPLEX_LLM_PROVIDER = _normalize_llm_provider(os.getenv("COMPLEX_LLM_PROVIDER", ""))
+FAST_LLM_PROVIDER = _normalize_optional_llm_provider(
+    os.getenv("FAST_LLM_PROVIDER", "")
+)
+COMPLEX_LLM_PROVIDER = _normalize_optional_llm_provider(
+    os.getenv("COMPLEX_LLM_PROVIDER", "")
+)
 LLM_ROUTING_ENABLED = bool(FAST_LLM_PROVIDER and COMPLEX_LLM_PROVIDER)
 MODEL_ROUTER_FAST_MODEL = os.getenv("MODEL_ROUTER_FAST_MODEL", "").strip()
 MODEL_ROUTER_COMPLEX_MODEL = os.getenv("MODEL_ROUTER_COMPLEX_MODEL", "").strip()
