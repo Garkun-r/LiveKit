@@ -104,6 +104,23 @@ Next, run this command to speak to your agent directly in your terminal:
 uv run python src/agent.py console
 ```
 
+## Environment profiles
+
+This repository uses one agent codebase with separate env profiles for Mac,
+LiveKit Cloud, and the self-hosted Asterisk LiveKit server. See
+[`../../docs/deployment-profiles.md`](../../docs/deployment-profiles.md) and
+[`env/README.md`](env/README.md).
+
+Build the Mac `.env.local` from the shared defaults and local secrets:
+
+```console
+uv run python scripts/build_env.py --profile mac --secrets env/mac.secrets.env --output .env.local
+```
+
+The Asterisk server already has a production env at
+`/etc/jcall-livekit-agent/main-bot.env`. Do not replace it without explicit
+approval and a matching SIP dispatch update if `AGENT_NAME` changes.
+
 ## Provider egress routing
 
 For the self-hosted Asterisk/LiveKit server runbook, see
