@@ -69,12 +69,14 @@ def egress_proxy_url() -> str:
     ).strip()
 
 
-def provider_egress(provider: str) -> str:
+def provider_egress(provider: str, mode_override: str | None = None) -> str:
     normalized_provider = provider.strip().lower()
     default_mode = _normalize_mode(
         os.getenv("EGRESS_DEFAULT"),
         default=_PROVIDER_DEFAULTS.get(normalized_provider, "direct"),
     )
+    if mode_override and mode_override.strip():
+        return _normalize_mode(mode_override, default=default_mode)
 
     for env_name in _PROVIDER_ENV_NAMES.get(
         normalized_provider,
@@ -86,19 +88,22 @@ def provider_egress(provider: str) -> str:
     return default_mode
 
 
-def provider_proxy_url(provider: str) -> str | None:
-    if provider_egress(provider) != "proxy":
+def provider_proxy_url(provider: str, mode_override: str | None = None) -> str | None:
+    if provider_egress(provider, mode_override=mode_override) != "proxy":
         return None
     proxy_url = egress_proxy_url()
     return proxy_url or None
 
 
-def aiohttp_proxy(provider: str) -> str | None:
-    return provider_proxy_url(provider)
+def aiohttp_proxy(provider: str, mode_override: str | None = None) -> str | None:
+    return provider_proxy_url(provider, mode_override=mode_override)
 
 
-def httpx_client_args(provider: str) -> dict[str, object]:
-    proxy_url = provider_proxy_url(provider)
+def httpx_client_args(
+    provider: str,
+    mode_override: str | None = None,
+) -> dict[str, object]:
+    proxy_url = provider_proxy_url(provider, mode_override=mode_override)
     args: dict[str, object] = {"trust_env": False}
     if proxy_url:
         args["proxy"] = proxy_url
@@ -106,7 +111,10 @@ def httpx_client_args(provider: str) -> dict[str, object]:
 
 
 @contextmanager
-def provider_egress_env(provider: str) -> Iterator[None]:
+def provider_egress_env(
+    provider: str,
+    mode_override: str | None = None,
+) -> Iterator[None]:
     old_values = {
         name: os.environ.get(name)
         for name in (*_PROXY_ENV_VARS, "NO_PROXY", "no_proxy")
@@ -115,7 +123,7 @@ def provider_egress_env(provider: str) -> Iterator[None]:
     for name in _PROXY_ENV_VARS:
         os.environ.pop(name, None)
 
-    proxy_url = provider_proxy_url(provider)
+    proxy_url = provider_proxy_url(provider, mode_override=mode_override)
     if proxy_url:
         os.environ["HTTP_PROXY"] = proxy_url
         os.environ["HTTPS_PROXY"] = proxy_url

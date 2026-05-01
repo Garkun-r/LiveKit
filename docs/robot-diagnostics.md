@@ -62,21 +62,29 @@ agents/main-bot/schema/robot_incidents_directus.sql
 Production transport:
 
 ```env
+DIRECTUS_URL=https://jcall.io/directus
+DIRECTUS_TOKEN=<livekit-service-token>
 INCIDENT_LOG_TRANSPORT=directus
-INCIDENT_DIRECTUS_URL=https://jcall.io/directus
-INCIDENT_DIRECTUS_TOKEN=<service-token>
+# Optional override only if diagnostics uses a separate Directus token:
+INCIDENT_DIRECTUS_TOKEN=
 ```
 
 Агент отправляет:
 
 ```http
 POST /items/robot_incidents
-Authorization: Bearer <service-token>
+Authorization: Bearer <DIRECTUS_TOKEN или INCIDENT_DIRECTUS_TOKEN>
 ```
 
 Directus role/policy `Livekit` должна иметь минимум `create` на collection
 `robot_incidents`. Для ручной проверки в Directus UI можно дать `read`, но
 для runtime insert достаточно `create`.
+
+Отдельный `INCIDENT_DIRECTUS_TOKEN` не обязателен. По умолчанию диагностика
+использует тот же `DIRECTUS_TOKEN`, что и prompt/cache-запросы. Это нормальный
+production path, если токен принадлежит роли `Livekit`, а самой роли добавлены
+права на `robot_incidents`. Отдельный incident-token нужен только если хочется
+жестко разделить права prompt lookup и diagnostics.
 
 На VPS это настраивается так:
 
@@ -254,7 +262,9 @@ async with incident_log.observe(
 ```env
 INCIDENT_LOG_ENABLED=true
 INCIDENT_LOG_TRANSPORT=directus
-INCIDENT_DIRECTUS_URL=https://jcall.io/directus
+DIRECTUS_URL=https://jcall.io/directus
+DIRECTUS_TOKEN=
+INCIDENT_DIRECTUS_URL=
 INCIDENT_DIRECTUS_TOKEN=
 INCIDENT_POSTGRES_DSN=
 INCIDENT_ENVIRONMENT=cloud

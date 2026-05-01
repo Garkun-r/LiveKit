@@ -104,6 +104,26 @@ Next, run this command to speak to your agent directly in your terminal:
 uv run python src/agent.py console
 ```
 
+## Runtime settings source
+
+The production robot reads LLM/TTS/STT/Turn profiles from Directus. Keep
+`.env.local` for bootstrap, secrets, Directus access, egress, n8n, incident
+logging, health, and audio safety knobs.
+
+Use `ROBOT_RUNTIME_PROFILE=base|asterisk|mac` to select the process runtime.
+`base` is the default cloud configuration. For each call the agent resolves
+settings in this order:
+
+```text
+project by DID -> runtime by ROBOT_RUNTIME_PROFILE -> base
+```
+
+Directus is cached in memory by `ROBOT_SETTINGS_CACHE_TTL_SEC`. If Directus is
+unavailable, the agent uses the last cache, then
+`config/robot_settings_snapshot.json` on cold start. See
+[`../../docs/robot-settings-directus.md`](../../docs/robot-settings-directus.md)
+for the full model and migration rules.
+
 ## Provider egress routing
 
 For the self-hosted Asterisk/LiveKit server runbook, see
@@ -157,34 +177,35 @@ Provider client wiring checklist:
 5. Test both routes from the Asterisk host under 10-call concurrency, then record
    the chosen default in `_PROVIDER_DEFAULTS` and this README.
 
-To switch LLM provider, set `LLM_PROVIDER`:
+## Provider profiles
 
-1. `LLM_PROVIDER=google` - direct Gemini API path (default).
-2. `LLM_PROVIDER=xai` - xAI Grok via `livekit.plugins.xai.responses.LLM`.
+Provider/model/tuning selection is now stored in Directus component profiles,
+not active env variables.
 
-xAI Grok example:
+LLM profiles currently support:
 
-```console
-LLM_PROVIDER=xai
-XAI_API_KEY=<your_xai_api_key>
-XAI_MODEL=grok-4-1-fast-non-reasoning-latest
-XAI_TEMPERATURE=0.3
-# Optional: force Europe region endpoint
-XAI_BASE_URL=https://eu-west-1.api.x.ai/v1
-# Tools are disabled by default for xAI in this project.
-XAI_ENABLE_TOOLS=false
-```
+1. `provider=google` - direct Gemini API path.
+2. `provider=xai` - xAI Grok via `livekit.plugins.xai.responses.LLM`.
 
-To switch TTS provider, set `TTS_PROVIDER`:
+LLM fallback also lives in each LLM profile: `fallback_provider`,
+`fallback_model`, `use_livekit_fallback_adapter`, timeout, retry, and chunk
+retry fields. `llm_routing.fast` and `llm_routing.complex` select primary
+LLM profiles; fallback is taken from the selected profile.
 
-1. `TTS_PROVIDER=elevenlabs` - ElevenLabs TTS.
-2. `TTS_PROVIDER=google` - `livekit.plugins.google.TTS` (Google Cloud streaming path).
-3. `TTS_PROVIDER=vertex` - Vertex Gemini API streaming path (`google.genai`, `vertexai=True`).
-4. `TTS_PROVIDER=minimax` - official `livekit.plugins.minimax.TTS` path (`speech-2.8-turbo`).
-5. `TTS_PROVIDER=cosyvoice` - custom Alibaba CosyVoice WebSocket path.
-6. `TTS_PROVIDER=sber` - custom Sber SaluteSpeech gRPC streaming path.
+TTS profiles currently support:
 
-ElevenLabs `eleven_v3` custom HTTP streaming path:
+1. `provider=elevenlabs` - ElevenLabs TTS.
+2. `provider=google` - `livekit.plugins.google.TTS` (Google Cloud streaming path).
+3. `provider=vertex` - Vertex Gemini API streaming path (`google.genai`, `vertexai=True`).
+4. `provider=minimax` - official `livekit.plugins.minimax.TTS` path (`speech-2.8-turbo`).
+5. `provider=cosyvoice` - custom Alibaba CosyVoice WebSocket path.
+6. `provider=sber` - custom Sber SaluteSpeech gRPC streaming path.
+
+The snippets below are legacy env fallback references. For production, put the
+same non-secret tuning values into Directus profile `config_json` and keep only
+API keys / credential refs in env.
+
+Legacy ElevenLabs `eleven_v3` env fallback:
 
 ```console
 TTS_PROVIDER=elevenlabs
@@ -219,17 +240,17 @@ Notes for `eleven_v3`:
 2. It is built for low practical latency, but `eleven_v3` is still not a Flash-class realtime model.
 3. Deploy near ElevenLabs edge region and your LiveKit workers to reduce RTT.
 
-To switch STT provider, set `STT_PROVIDER`:
+STT profiles currently support:
 
-1. `STT_PROVIDER=deepgram` - Deepgram plugin STT (default, requires `DEEPGRAM_API_KEY`).
-2. `STT_PROVIDER=inference` - LiveKit Agent Gateway STT.
-3. `STT_PROVIDER=google` - Google Cloud STT plugin (uses Google credentials).
-4. `STT_PROVIDER=yandex` - Yandex SpeechKit v3 direct gRPC STT (requires `YANDEX_SPEECHKIT_API_KEY`).
+1. `provider=deepgram` - Deepgram plugin STT (requires `DEEPGRAM_API_KEY`).
+2. `provider=inference` - LiveKit Agent Gateway STT.
+3. `provider=google` - Google Cloud STT plugin (uses Google credentials).
+4. `provider=yandex` - Yandex SpeechKit v3 direct gRPC STT.
 
 If you see `429 Too Many Requests` from `agent-gateway.livekit.cloud` for STT, either:
 
-1. Set `STT_PROVIDER=google` (recommended if Google credentials are already configured), or
-2. Keep `STT_PROVIDER=inference` and enable `STT_INFERENCE_INCLUDE_GOOGLE_FALLBACK=true`.
+1. Select a Google STT profile, or
+2. Use an inference STT profile with Google fallback configured in Directus/code.
 
 Note: switching between two inference models (`deepgram/*`, `openai/*`) still uses the same LiveKit
 gateway quota. For real protection from inference 429, use Google STT as fallback/provider.
@@ -353,7 +374,8 @@ VERTEX_TTS_MIN_SENTENCE_LEN=6
 VERTEX_TTS_STREAM_CONTEXT_LEN=2
 ```
 
-To reduce "hung" turns (long silence after user speech), tune these guards:
+To reduce "hung" turns (long silence after user speech), tune these guards in
+the Directus Turn/LLM profiles. The env form below is legacy fallback reference:
 
 ```console
 USE_LIVEKIT_FALLBACK_ADAPTER=false
@@ -446,7 +468,9 @@ This project is production-ready and includes a working `Dockerfile`. To deploy 
 
 ### Sync env to Cloud secrets
 
-If you use direct Gemini and provider keys from `.env.local`, sync them to LiveKit Cloud before deploy:
+Sync `.env.local` to LiveKit Cloud before deploy so bootstrap values and
+provider secrets are available to the worker. Provider/model/tuning settings
+are read from Directus, not from active env.
 
 ```console
 cd agents/main-bot

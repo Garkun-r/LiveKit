@@ -84,9 +84,7 @@ LLM_PROVIDER = _normalize_llm_provider(_raw_llm_provider)
 # - FAST_LLM_PROVIDER: provider used for "fast" route
 # - COMPLEX_LLM_PROVIDER: provider used for "complex" route
 # If either is empty, routing stays disabled and LLM_PROVIDER is used as before.
-FAST_LLM_PROVIDER = _normalize_optional_llm_provider(
-    os.getenv("FAST_LLM_PROVIDER", "")
-)
+FAST_LLM_PROVIDER = _normalize_optional_llm_provider(os.getenv("FAST_LLM_PROVIDER", ""))
 COMPLEX_LLM_PROVIDER = _normalize_optional_llm_provider(
     os.getenv("COMPLEX_LLM_PROVIDER", "")
 )
@@ -254,10 +252,13 @@ LLM_RETRY_DELAY_SEC = float(
 # Legacy VOICE_FILLER_* names remain as fallback env keys for existing deploys.
 _legacy_voice_filler_audio_path = os.getenv("VOICE_FILLER_AUDIO_PATH", "").strip()
 _legacy_voice_filler_phrase = os.getenv("VOICE_FILLER_PHRASE", "").strip()
-VOICE_RESPONSE_DELAY_AUDIO_PATH = os.getenv(
-    "VOICE_RESPONSE_DELAY_AUDIO_PATH",
-    _legacy_voice_filler_audio_path or "response_delay.wav",
-).strip() or "response_delay.wav"
+VOICE_RESPONSE_DELAY_AUDIO_PATH = (
+    os.getenv(
+        "VOICE_RESPONSE_DELAY_AUDIO_PATH",
+        _legacy_voice_filler_audio_path or "response_delay.wav",
+    ).strip()
+    or "response_delay.wav"
+)
 VOICE_RESPONSE_DELAY_AUDIO_PATHS = os.getenv(
     "VOICE_RESPONSE_DELAY_AUDIO_PATHS",
     (
@@ -267,31 +268,63 @@ VOICE_RESPONSE_DELAY_AUDIO_PATHS = os.getenv(
         + ",response_delay_khe_khe.wav"
     ),
 ).strip()
-VOICE_RESPONSE_DELAY_PHRASE = os.getenv(
-    "VOICE_RESPONSE_DELAY_PHRASE",
-    _legacy_voice_filler_phrase or "Секундочку.",
-).strip() or "Секундочку."
+VOICE_RESPONSE_DELAY_PHRASE = (
+    os.getenv(
+        "VOICE_RESPONSE_DELAY_PHRASE",
+        _legacy_voice_filler_phrase or "Секундочку.",
+    ).strip()
+    or "Секундочку."
+)
+VOICE_INITIAL_GREETING_PHRASE = (
+    os.getenv(
+        "VOICE_INITIAL_GREETING_PHRASE",
+        "Здравствуйте! Это компания Кофемастер! Чем могу помочь?",
+    ).strip()
+    or "Здравствуйте! Это компания Кофемастер! Чем могу помочь?"
+)
+VOICE_SHORT_GREETING_PHRASE = (
+    os.getenv(
+        "VOICE_SHORT_GREETING_PHRASE",
+        "Здравствуйте, я виртуальный ассистент. Подскажите, чем могу вам помочь?",
+    ).strip()
+    or "Здравствуйте, я виртуальный ассистент. Подскажите, чем могу вам помочь?"
+)
+VOICE_AUDIO_CACHE_ENABLED = _env_bool("VOICE_AUDIO_CACHE_ENABLED", default=True)
+VOICE_AUDIO_CACHE_DIR = os.getenv("VOICE_AUDIO_CACHE_DIR", "cache").strip() or "cache"
+VOICE_AUDIO_LEGACY_PROFILE_ID = os.getenv("VOICE_AUDIO_LEGACY_PROFILE_ID", "").strip()
 VOICE_RESPONSE_DELAY_SEC = float(os.getenv("VOICE_RESPONSE_DELAY_SEC", "3.0"))
 VOICE_RESPONSE_DELAY_POST_GAP_SEC = float(
     os.getenv("VOICE_RESPONSE_DELAY_POST_GAP_SEC", "0.0")
 )
-VOICE_CLIENT_SILENCE_AUDIO_PATH = os.getenv(
-    "VOICE_CLIENT_SILENCE_AUDIO_PATH",
-    "client_silence.wav",
-).strip() or "client_silence.wav"
-VOICE_CLIENT_SILENCE_PHRASE = os.getenv(
-    "VOICE_CLIENT_SILENCE_PHRASE",
-    "Алло.",
-).strip() or "Алло."
+VOICE_CLIENT_SILENCE_AUDIO_PATH = (
+    os.getenv(
+        "VOICE_CLIENT_SILENCE_AUDIO_PATH",
+        "client_silence.wav",
+    ).strip()
+    or "client_silence.wav"
+)
+VOICE_CLIENT_SILENCE_PHRASE = (
+    os.getenv(
+        "VOICE_CLIENT_SILENCE_PHRASE",
+        "Алло.",
+    ).strip()
+    or "Алло."
+)
 VOICE_CLIENT_SILENCE_SEC = float(os.getenv("VOICE_CLIENT_SILENCE_SEC", "8.0"))
-VOICE_EMERGENCY_AUDIO_PATH = os.getenv(
-    "VOICE_EMERGENCY_AUDIO_PATH",
-    "emergency.wav",
-).strip() or "emergency.wav"
-VOICE_EMERGENCY_PHRASE = os.getenv(
-    "VOICE_EMERGENCY_PHRASE",
-    "Извините, перезвоните ещё раз.",
-).strip() or "Извините, перезвоните ещё раз."
+VOICE_EMERGENCY_AUDIO_PATH = (
+    os.getenv(
+        "VOICE_EMERGENCY_AUDIO_PATH",
+        "emergency.wav",
+    ).strip()
+    or "emergency.wav"
+)
+VOICE_EMERGENCY_PHRASE = (
+    os.getenv(
+        "VOICE_EMERGENCY_PHRASE",
+        "Извините, перезвоните ещё раз.",
+    ).strip()
+    or "Извините, перезвоните ещё раз."
+)
 VOICE_FILLER_AUDIO_PATH = VOICE_RESPONSE_DELAY_AUDIO_PATH
 VOICE_FILLER_PHRASE = VOICE_RESPONSE_DELAY_PHRASE
 
@@ -410,9 +443,7 @@ SBER_TTS_SAMPLE_RATE = int(os.getenv("SBER_TTS_SAMPLE_RATE", "24000"))
 SBER_TTS_PAINT_PITCH = os.getenv("SBER_TTS_PAINT_PITCH", "2")
 SBER_TTS_PAINT_SPEED = os.getenv("SBER_TTS_PAINT_SPEED", "4")
 SBER_TTS_PAINT_LOUDNESS = os.getenv("SBER_TTS_PAINT_LOUDNESS", "5")
-SBER_TTS_REQUEST_TIMEOUT_SEC = float(
-    os.getenv("SBER_TTS_REQUEST_TIMEOUT_SEC", "15.0")
-)
+SBER_TTS_REQUEST_TIMEOUT_SEC = float(os.getenv("SBER_TTS_REQUEST_TIMEOUT_SEC", "15.0"))
 SBER_TTS_REBUILD_CACHE = _env_bool("SBER_TTS_REBUILD_CACHE", default=False)
 SBER_TTS_MIN_SENTENCE_LEN = int(os.getenv("SBER_TTS_MIN_SENTENCE_LEN", "4"))
 SBER_TTS_STREAM_CONTEXT_LEN = int(os.getenv("SBER_TTS_STREAM_CONTEXT_LEN", "1"))
@@ -595,9 +626,7 @@ PROMPT_LOOKUP_TIMEOUT_SEC = float(os.getenv("PROMPT_LOOKUP_TIMEOUT_SEC", "2.0"))
 DIRECTUS_URL = os.getenv("DIRECTUS_URL", "").strip().rstrip("/")
 DIRECTUS_TOKEN = os.getenv("DIRECTUS_TOKEN", "").strip()
 DIRECTUS_REQUEST_TIMEOUT_SEC = float(os.getenv("DIRECTUS_REQUEST_TIMEOUT_SEC", "2.0"))
-DIRECTUS_PROMPT_CACHE_TTL_SEC = float(
-    os.getenv("DIRECTUS_PROMPT_CACHE_TTL_SEC", "300")
-)
+DIRECTUS_PROMPT_CACHE_TTL_SEC = float(os.getenv("DIRECTUS_PROMPT_CACHE_TTL_SEC", "300"))
 DIRECTUS_DEFAULT_TIMEZONE = os.getenv(
     "DIRECTUS_DEFAULT_TIMEZONE",
     "Europe/Kaliningrad",
@@ -630,6 +659,22 @@ DIRECTUS_COLLECTION_CLIENT_PROMPT_CACHE = os.getenv(
     "DIRECTUS_COLLECTION_CLIENT_PROMPT_CACHE",
     "client_prompt_cache",
 ).strip()
+DIRECTUS_INITIAL_GREETING_FIELD = os.getenv(
+    "DIRECTUS_INITIAL_GREETING_FIELD",
+    "first_step",
+).strip()
+ROBOT_RUNTIME_PROFILE = os.getenv("ROBOT_RUNTIME_PROFILE", "base").strip() or "base"
+ROBOT_SETTINGS_CACHE_TTL_SEC = float(
+    os.getenv(
+        "ROBOT_SETTINGS_CACHE_TTL_SEC",
+        os.getenv("DIRECTUS_PROMPT_CACHE_TTL_SEC", "300"),
+    )
+)
+ROBOT_SETTINGS_SNAPSHOT_FILE = os.getenv(
+    "ROBOT_SETTINGS_SNAPSHOT_FILE",
+    "config/robot_settings_snapshot.json",
+).strip()
+ROBOT_SETTINGS_USE_DIRECTUS = _env_bool("ROBOT_SETTINGS_USE_DIRECTUS", default=True)
 AGENT_NAME = os.getenv("AGENT_NAME", "main-bot")
 LIVEKIT_SELF_HOSTED = _env_bool("LIVEKIT_SELF_HOSTED", default=False)
 AGENT_HEALTH_HOST = os.getenv(
@@ -646,10 +691,14 @@ AGENT_MAX_CONCURRENT_JOBS = max(
 AGENT_NUM_IDLE_PROCESSES = int(
     os.getenv("AGENT_NUM_IDLE_PROCESSES", "1" if LIVEKIT_SELF_HOSTED else "10")
 )
-AUDIO_INPUT_ENHANCEMENT = os.getenv(
-    "AUDIO_INPUT_ENHANCEMENT",
-    "none" if LIVEKIT_SELF_HOSTED else "livekit",
-).strip().lower()
+AUDIO_INPUT_ENHANCEMENT = (
+    os.getenv(
+        "AUDIO_INPUT_ENHANCEMENT",
+        "none" if LIVEKIT_SELF_HOSTED else "livekit",
+    )
+    .strip()
+    .lower()
+)
 
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 N8N_WEBHOOK_TOKEN = os.getenv("N8N_WEBHOOK_TOKEN", "")
@@ -665,14 +714,13 @@ SMS_LINK_SIGNATURE = os.getenv(
 # call path; the agent only inserts rows when the table already exists.
 INCIDENT_LOG_ENABLED = _env_bool("INCIDENT_LOG_ENABLED", default=True)
 INCIDENT_DIRECTUS_URL = (
-    os.getenv(
-        "INCIDENT_DIRECTUS_URL",
-        os.getenv("DIRECTUS_URL", "https://jcall.io/directus"),
-    )
+    (os.getenv("INCIDENT_DIRECTUS_URL") or DIRECTUS_URL or "https://jcall.io/directus")
     .strip()
     .rstrip("/")
 )
-INCIDENT_DIRECTUS_TOKEN = os.getenv("INCIDENT_DIRECTUS_TOKEN", "").strip()
+INCIDENT_DIRECTUS_TOKEN = (
+    os.getenv("INCIDENT_DIRECTUS_TOKEN") or DIRECTUS_TOKEN
+).strip()
 INCIDENT_POSTGRES_DSN = os.getenv("INCIDENT_POSTGRES_DSN", "").strip()
 INCIDENT_LOG_TRANSPORT = (
     os.getenv(

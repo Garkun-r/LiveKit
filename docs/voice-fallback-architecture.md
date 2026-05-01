@@ -3,14 +3,19 @@
 This document records the agreed architecture decisions before changing the
 runtime fallback code for the LiveKit voice agent.
 
+Current status: production provider/model/tuning settings are moving to
+Directus. Env variables in this document are retained as legacy fallback names
+and examples; the active source of truth for LLM fallback is the selected
+Directus LLM profile.
+
 ## General goal
 
 - Final goal: implement LLM fallback, then verify and test it locally.
 - Priority: balance stability and low latency, with latency being critical for
   live voice calls.
 - The system must not leave the caller in long silence.
-- All timeout and retry values must live in config/env, not as hardcoded runtime
-  constants.
+- All timeout and retry values must live in Directus LLM profiles or legacy
+  config/env fallback, not as hardcoded runtime constants.
 
 ## What must not break
 
@@ -85,7 +90,7 @@ Exact model IDs must come from the current config, `.env.example`, or
 
 ## Timeout / retry decisions
 
-Recommended initial defaults, to be exposed through config/env:
+Recommended initial defaults, now stored in each Directus LLM profile:
 
 ```env
 USE_LIVEKIT_FALLBACK_ADAPTER=true
@@ -99,6 +104,19 @@ FAST_LLM_BACKUP_MODEL=<from config/env>
 COMPLEX_LLM_BACKUP_PROVIDER=google
 COMPLEX_LLM_BACKUP_MODEL=<from config/env>
 ```
+
+Directus field mapping:
+
+- `fallback_provider` replaces `FAST_LLM_BACKUP_PROVIDER` /
+  `COMPLEX_LLM_BACKUP_PROVIDER` for the selected route profile.
+- `fallback_model` replaces `FAST_LLM_BACKUP_MODEL` /
+  `COMPLEX_LLM_BACKUP_MODEL`.
+- `use_livekit_fallback_adapter` replaces `USE_LIVEKIT_FALLBACK_ADAPTER`.
+- `attempt_timeout_sec`, `max_retry_per_llm`, `retry_interval_sec`, and
+  `retry_on_chunk_sent` replace the matching env tuning knobs.
+
+The separate `fallback` profile is legacy/future operational fallback. LLM
+backup model selection belongs to the LLM profile itself.
 
 For live voice, do not retry the same model before fallback. On timeout,
 API error, network error, or provider error, move directly to the backup model.
@@ -187,7 +205,8 @@ Requirements:
 3. Preserve prompt assembly.
 4. Preserve current business logic.
 5. Replace only the model substitution/fallback mechanism.
-6. Move timeout/retry settings to config/env.
+6. Move timeout/retry settings to Directus LLM profiles, with env kept only as
+   legacy fallback.
 7. Add fallback logging:
    - trace_id / room / call id, if available;
    - branch: fast or complex;

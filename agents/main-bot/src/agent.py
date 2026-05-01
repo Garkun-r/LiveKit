@@ -124,6 +124,7 @@ from config import (
     GOOGLE_TTS_CREDENTIALS_FILE,
     GOOGLE_TTS_CREDENTIALS_JSON,
     GOOGLE_TTS_FALLBACK_MODEL,
+    GOOGLE_TTS_LANGUAGE,
     GOOGLE_TTS_LOCATION,
     GOOGLE_TTS_MIN_SENTENCE_LEN,
     GOOGLE_TTS_MODEL,
@@ -165,6 +166,7 @@ from config import (
     MODEL_ROUTER_FAST_MODEL,
     PREEMPTIVE_GENERATION,
     REPLY_WATCHDOG_SEC,
+    ROBOT_RUNTIME_PROFILE,
     SBER_SALUTESPEECH_AUTH_KEY,
     SBER_TTS_CA_CERT_FILE,
     SBER_TTS_ENDPOINT,
@@ -224,16 +226,21 @@ from config import (
     USE_LIVEKIT_FALLBACK_ADAPTER,
     VERTEX_TTS_MIN_SENTENCE_LEN,
     VERTEX_TTS_STREAM_CONTEXT_LEN,
+    VOICE_AUDIO_CACHE_DIR,
+    VOICE_AUDIO_CACHE_ENABLED,
+    VOICE_AUDIO_LEGACY_PROFILE_ID,
     VOICE_CLIENT_SILENCE_AUDIO_PATH,
     VOICE_CLIENT_SILENCE_PHRASE,
     VOICE_CLIENT_SILENCE_SEC,
     VOICE_EMERGENCY_AUDIO_PATH,
     VOICE_EMERGENCY_PHRASE,
+    VOICE_INITIAL_GREETING_PHRASE,
     VOICE_RESPONSE_DELAY_AUDIO_PATH,
     VOICE_RESPONSE_DELAY_AUDIO_PATHS,
     VOICE_RESPONSE_DELAY_PHRASE,
     VOICE_RESPONSE_DELAY_POST_GAP_SEC,
     VOICE_RESPONSE_DELAY_SEC,
+    VOICE_SHORT_GREETING_PHRASE,
     XAI_API_KEY,
     XAI_BASE_URL,
     XAI_ENABLE_TOOLS,
@@ -253,6 +260,11 @@ from egress import (
 from eleven_v3_tts import ElevenV3TTS
 from incident_logger import IncidentLogger, classify_error, component_identity
 from prompt_repo import PromptResolution, get_active_prompt, resolve_prompt_for_call
+from robot_settings import (
+    ComponentSelection,
+    ResolvedRobotSettings,
+    resolve_robot_settings_for_call,
+)
 from robot_skills import RobotSkillContext, RobotSkillRunner
 from robot_tags import parse_robot_tags, sanitize_tagged_text_stream
 from routing.model_router import ModelRouter, ModelRouteResult, coerce_optional_bool
@@ -261,6 +273,7 @@ from session_export import send_session_to_n8n
 from tbank_stt import TBankVoiceKitSTT
 from tbank_tts import TBankVoiceKitTTS
 from vertex_gemini_tts import VertexGeminiTTS
+from voice_audio_cache import VoiceAudioCache
 from yandex_stt import YandexSpeechKitSTT
 
 logger = logging.getLogger("agent")
@@ -276,6 +289,7 @@ _SHORT_GREETING_AUDIO_PATH = _AUDIO_DIR / "2.wav"
 _RESPONSE_DELAY_AUDIO_PATH = None
 _CLIENT_SILENCE_AUDIO_PATH = None
 _EMERGENCY_AUDIO_PATH = None
+_VOICE_AUDIO_CACHE_DIR = None
 _WARMUP_REQUEST_TIMEOUT_SEC = 4.0
 _PROMPT_CACHE_WARMUP_USER_TEXT = (
     "Служебный запрос прогрева. Ответь строго одним словом: OK."
@@ -315,10 +329,98 @@ class LLMBranchMetadata:
     backup_provider: str | None = None
     backup_model: str | None = None
     uses_fallback_adapter: bool = False
+    attempt_timeout_sec: float = LLM_ATTEMPT_TIMEOUT_SEC
+    max_retry_per_llm: int = LLM_MAX_RETRY_PER_LLM
+    retry_interval_sec: float = LLM_RETRY_INTERVAL_SEC
+    retry_on_chunk_sent: bool = LLM_RETRY_ON_CHUNK_SENT
+    enable_tools: bool | None = None
 
     @property
     def has_backup(self) -> bool:
         return bool(self.backup_provider and self.backup_model)
+
+
+def _component_config(component: ComponentSelection | None) -> dict[str, Any]:
+    return component.config if component is not None else {}
+
+
+def _config_str(
+    config: dict[str, Any],
+    key: str,
+    default: str,
+) -> str:
+    value = config.get(key)
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def _config_optional_str(config: dict[str, Any], key: str) -> str:
+    value = config.get(key)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _config_bool(config: dict[str, Any], key: str, default: bool) -> bool:
+    value = config.get(key)
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+
+
+def _config_optional_bool(config: dict[str, Any], key: str) -> bool | None:
+    value = config.get(key)
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+
+
+def _config_float(config: dict[str, Any], key: str, default: float) -> float:
+    value = config.get(key)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _config_optional_float(config: dict[str, Any], key: str) -> float | None:
+    value = config.get(key)
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def _config_int(config: dict[str, Any], key: str, default: int) -> int:
+    value = config.get(key)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _component_provider(
+    component: ComponentSelection | None,
+    default_provider: str,
+) -> str:
+    if component is None:
+        return default_provider
+    return (
+        component.provider
+        or str(component.config.get("provider") or "").strip()
+        or default_provider
+    )
+
+
+def _component_egress(component: ComponentSelection | None) -> str:
+    config = _component_config(component)
+    return (
+        _config_optional_str(config, "egress")
+        or _config_optional_str(config, "egress_mode")
+        or _config_optional_str(config, "proxy_mode")
+    )
 
 
 def resolve_configured_audio_path(raw_path: str) -> Path | None:
@@ -344,6 +446,15 @@ def resolve_configured_audio_paths(raw_paths: str) -> tuple[Path, ...]:
     return tuple(paths)
 
 
+def resolve_voice_audio_cache_dir(raw_path: str) -> Path:
+    path = Path((raw_path or "").strip() or "cache").expanduser()
+    if path.is_absolute():
+        return path
+    if path.parts and path.parts[0] == "audio":
+        return _AUDIO_DIR.parent / path
+    return _AUDIO_DIR / path
+
+
 _RESPONSE_DELAY_AUDIO_PATH = resolve_configured_audio_path(
     VOICE_RESPONSE_DELAY_AUDIO_PATH
 )
@@ -354,6 +465,7 @@ _CLIENT_SILENCE_AUDIO_PATH = resolve_configured_audio_path(
     VOICE_CLIENT_SILENCE_AUDIO_PATH
 )
 _EMERGENCY_AUDIO_PATH = resolve_configured_audio_path(VOICE_EMERGENCY_AUDIO_PATH)
+_VOICE_AUDIO_CACHE_DIR = resolve_voice_audio_cache_dir(VOICE_AUDIO_CACHE_DIR)
 
 
 def _patch_minimax_sound_effects() -> None:
@@ -408,9 +520,17 @@ def safe_dump(value: Any) -> Any:
 
 def extract_sip_call_numbers(participant: Any | None) -> dict[str, str | None]:
     if participant is None:
-        return {"sip_trunk_number": None, "sip_client_number": None}
+        return {
+            "sip_trunk_number": None,
+            "gateway_number": None,
+            "sip_client_number": None,
+        }
     if getattr(participant, "kind", None) != rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-        return {"sip_trunk_number": None, "sip_client_number": None}
+        return {
+            "sip_trunk_number": None,
+            "gateway_number": None,
+            "sip_client_number": None,
+        }
 
     attributes = getattr(participant, "attributes", None)
     if not isinstance(attributes, dict):
@@ -425,6 +545,7 @@ def extract_sip_call_numbers(participant: Any | None) -> dict[str, str | None]:
 
     return {
         "sip_trunk_number": sip_trunk_number,
+        "gateway_number": sip_trunk_number,
         "sip_client_number": (attributes.get("sip.phoneNumber") or "").strip() or None,
     }
 
@@ -595,12 +716,16 @@ def is_short_greeting_response(text: str | None) -> bool:
     return bool(_SHORT_GREETING_RE.fullmatch(normalized))
 
 
-def resolve_audio_output_sample_rate() -> int:
-    if TTS_PROVIDER == "minimax":
-        return MINIMAX_TTS_SAMPLE_RATE
-    if TTS_PROVIDER == "cosyvoice":
-        return COSYVOICE_TTS_SAMPLE_RATE
-    if TTS_PROVIDER == "tbank":
+def resolve_audio_output_sample_rate(
+    tts_profile: ComponentSelection | None = None,
+) -> int:
+    profile_config = _component_config(tts_profile)
+    provider = _component_provider(tts_profile, TTS_PROVIDER)
+    if provider == "minimax":
+        return _config_int(profile_config, "sample_rate", MINIMAX_TTS_SAMPLE_RATE)
+    if provider == "cosyvoice":
+        return _config_int(profile_config, "sample_rate", COSYVOICE_TTS_SAMPLE_RATE)
+    if provider == "tbank":
         return TTS_TBANK_SAMPLE_RATE
     return 24000
 
@@ -612,6 +737,7 @@ async def play_prerecorded_audio(
     sample_rate: int,
     allow_interruptions: bool,
     add_to_chat_ctx: bool,
+    text: str = "",
 ) -> bool:
     if not audio_path.exists():
         logger.warning("prerecorded audio file not found: %s", audio_path)
@@ -619,7 +745,7 @@ async def play_prerecorded_audio(
 
     try:
         handle = session.say(
-            "",
+            text,
             audio=audio_frames_from_file(
                 str(audio_path),
                 sample_rate=sample_rate,
@@ -648,6 +774,7 @@ class VoicePromptManager:
         *,
         session: AgentSession,
         background_audio: BackgroundAudioPlayer,
+        voice_audio_cache: VoiceAudioCache | None,
         response_delay_prompt: VoicePromptSpec,
         client_silence_prompt: VoicePromptSpec,
         response_delay_sec: float,
@@ -658,6 +785,7 @@ class VoicePromptManager:
     ) -> None:
         self._session = session
         self._background_audio = background_audio
+        self._voice_audio_cache = voice_audio_cache
         self._response_delay_prompt = response_delay_prompt
         self._client_silence_prompt = client_silence_prompt
         self._response_delay_sec = max(0.0, response_delay_sec)
@@ -818,8 +946,12 @@ class VoicePromptManager:
             logger.exception("client silence voice prompt failed: %s", e)
 
     async def _play_background_prompt(self, prompt: VoicePromptSpec) -> bool:
-        audio_path = self._select_audio_path(prompt)
+        audio_path = await self._resolve_audio_path(prompt)
         if audio_path is None:
+            return False
+        if prompt.kind == "response_delay" and self._session.agent_state == "speaking":
+            return False
+        if prompt.kind == "client_silence" and self._session.agent_state != "listening":
             return False
         if not audio_path.exists():
             logger.warning(
@@ -917,6 +1049,16 @@ class VoicePromptManager:
         if not existing_paths:
             return random.choice(prompt.audio_paths)
         return random.choice(existing_paths)
+
+    async def _resolve_audio_path(self, prompt: VoicePromptSpec) -> Path | None:
+        legacy_path = self._select_audio_path(prompt)
+        if self._voice_audio_cache is None:
+            return legacy_path
+        return await self._voice_audio_cache.get_or_create(
+            kind=prompt.kind,
+            text=prompt.phrase,
+            legacy_path=legacy_path,
+        )
 
     @staticmethod
     def _handle_done(handle: Any) -> bool:
@@ -1032,8 +1174,9 @@ async def warmup_llm_transport(llm_client: Any, *, label: str) -> None:
 def create_external_aiohttp_session(
     provider: str,
     owned_sessions: list[aiohttp.ClientSession] | None = None,
+    egress_mode: str | None = None,
 ) -> aiohttp.ClientSession | None:
-    proxy_url = aiohttp_proxy(provider)
+    proxy_url = aiohttp_proxy(provider, mode_override=egress_mode)
     if not proxy_url:
         return None
 
@@ -1254,9 +1397,12 @@ def _gemini_http_timeout_ms() -> int:
 
 
 def _genai_http_options(
-    provider: str, *, timeout_ms: int | None = None
+    provider: str,
+    *,
+    timeout_ms: int | None = None,
+    egress_mode: str | None = None,
 ) -> genai_types.HttpOptions:
-    client_args = httpx_client_args(provider)
+    client_args = httpx_client_args(provider, mode_override=egress_mode)
     options: dict[str, Any] = {
         "client_args": client_args,
         "async_client_args": client_args,
@@ -1266,25 +1412,45 @@ def _genai_http_options(
     return genai_types.HttpOptions(**options)
 
 
-def build_google_llm(model_name: str | None = None) -> google.LLM:
+def build_google_llm(
+    model_name: str | None = None,
+    llm_profile: ComponentSelection | None = None,
+) -> google.LLM:
     if not GOOGLE_API_KEY:
         raise RuntimeError("GOOGLE_API_KEY is not set. Configure it in .env.local")
 
-    resolved_model = (model_name or GEMINI_MODEL).strip()
+    profile_config = _component_config(llm_profile)
+    resolved_model = (
+        model_name or _config_optional_str(profile_config, "model") or GEMINI_MODEL
+    ).strip()
+    temperature = _config_float(profile_config, "temperature", GEMINI_TEMPERATURE)
+    max_output_tokens = _config_int(
+        profile_config,
+        "max_output_tokens",
+        GEMINI_MAX_OUTPUT_TOKENS,
+    )
+    top_p = _config_float(profile_config, "top_p", GEMINI_TOP_P)
+    thinking_level = _config_str(
+        profile_config,
+        "thinking_level",
+        GEMINI_THINKING_LEVEL,
+    )
+    egress_mode = _component_egress(llm_profile)
     logger.info(
         "using Google LLM provider",
         extra={
             "provider": "google",
             "model": resolved_model,
-            "temperature": GEMINI_TEMPERATURE,
+            "temperature": temperature,
             "http_timeout_sec": max(GEMINI_HTTP_TIMEOUT_SEC, 10.0),
-            "egress": provider_egress("gemini"),
+            "egress": provider_egress("gemini", mode_override=egress_mode),
         },
     )
 
     http_options = _genai_http_options(
         "gemini",
         timeout_ms=_gemini_http_timeout_ms(),
+        egress_mode=egress_mode,
     )
 
     # Direct Gemini API configuration (not LiveKit Inference). LiveKit's Google
@@ -1294,10 +1460,10 @@ def build_google_llm(model_name: str | None = None) -> google.LLM:
         model=resolved_model,
         api_key=GOOGLE_API_KEY,
         vertexai=False,
-        temperature=GEMINI_TEMPERATURE,
-        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-        top_p=GEMINI_TOP_P,
-        thinking_config={"thinking_level": GEMINI_THINKING_LEVEL},
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        top_p=top_p,
+        thinking_config={"thinking_level": thinking_level},
         http_options=http_options,
     )
     llm._client = GenAIClient(
@@ -1308,50 +1474,76 @@ def build_google_llm(model_name: str | None = None) -> google.LLM:
     return llm
 
 
-def build_xai_llm(model_name: str | None = None) -> xai.responses.LLM:
+def build_xai_llm(
+    model_name: str | None = None,
+    llm_profile: ComponentSelection | None = None,
+) -> xai.responses.LLM:
     if not XAI_API_KEY:
         raise RuntimeError("XAI_API_KEY is not set. Configure it in .env.local")
 
-    resolved_model = (model_name or XAI_MODEL).strip()
-    base_url = XAI_BASE_URL if XAI_BASE_URL else NOT_GIVEN
+    profile_config = _component_config(llm_profile)
+    resolved_model = (
+        model_name or _config_optional_str(profile_config, "model") or XAI_MODEL
+    ).strip()
+    configured_base_url = _config_str(profile_config, "base_url", XAI_BASE_URL)
+    base_url = configured_base_url if configured_base_url else NOT_GIVEN
+    temperature = _config_float(profile_config, "temperature", XAI_TEMPERATURE)
+    egress_mode = _component_egress(llm_profile)
     logger.info(
         "using xAI LLM provider",
         extra={
             "provider": "xai",
             "model": resolved_model,
-            "temperature": XAI_TEMPERATURE,
-            "base_url": XAI_BASE_URL or "https://api.x.ai/v1",
-            "egress": provider_egress("xai"),
+            "temperature": temperature,
+            "base_url": configured_base_url or "https://api.x.ai/v1",
+            "egress": provider_egress("xai", mode_override=egress_mode),
         },
     )
 
-    with provider_egress_env("xai"):
+    with provider_egress_env("xai", mode_override=egress_mode):
         return xai.responses.LLM(
             model=resolved_model,
             api_key=XAI_API_KEY,
             base_url=base_url,
-            temperature=XAI_TEMPERATURE,
+            temperature=temperature,
         )
 
 
-def build_llm(model_name: str | None = None) -> Any:
-    return build_llm_for_provider(LLM_PROVIDER, model_name=model_name)
+def build_llm(
+    model_name: str | None = None,
+    llm_profile: ComponentSelection | None = None,
+) -> Any:
+    return build_llm_for_provider(
+        _component_provider(llm_profile, LLM_PROVIDER),
+        model_name=model_name,
+        llm_profile=llm_profile,
+    )
 
 
-def build_llm_for_provider(provider: str, model_name: str | None = None) -> Any:
+def build_llm_for_provider(
+    provider: str,
+    model_name: str | None = None,
+    llm_profile: ComponentSelection | None = None,
+) -> Any:
     if provider == "google":
-        return build_google_llm(model_name=model_name)
+        return build_google_llm(model_name=model_name, llm_profile=llm_profile)
     if provider == "xai":
-        return build_xai_llm(model_name=model_name)
+        return build_xai_llm(model_name=model_name, llm_profile=llm_profile)
 
     logger.warning(
         "Unknown LLM provider '%s'. Falling back to Google Gemini.",
         provider,
     )
-    return build_google_llm(model_name=model_name)
+    return build_google_llm(model_name=model_name, llm_profile=llm_profile)
 
 
-def _default_llm_model_for_provider(provider: str) -> str:
+def _default_llm_model_for_provider(
+    provider: str,
+    llm_profile: ComponentSelection | None = None,
+) -> str:
+    configured = _config_optional_str(_component_config(llm_profile), "model")
+    if configured:
+        return configured
     if provider == "google":
         return GEMINI_MODEL
     if provider == "xai":
@@ -1359,7 +1551,33 @@ def _default_llm_model_for_provider(provider: str) -> str:
     return ""
 
 
-def _backup_config_for_branch(branch: str) -> tuple[str, str]:
+def _backup_config_for_branch(
+    branch: str,
+    *,
+    primary_provider: str,
+    primary_profile: ComponentSelection | None = None,
+    robot_settings: ResolvedRobotSettings | None = None,
+) -> tuple[str, str]:
+    profile_config = _component_config(primary_profile)
+    fallback_provider = _config_optional_str(profile_config, "fallback_provider")
+    fallback_model = _config_optional_str(profile_config, "fallback_model")
+    if fallback_model:
+        return fallback_provider or ("google" if primary_provider == "google" else ""), fallback_model
+
+    fallback_profile = robot_settings.fallback if robot_settings is not None else None
+    fallback_config = _component_config(fallback_profile)
+    if fallback_config:
+        branch_provider = _config_optional_str(
+            fallback_config,
+            f"{branch}_backup_provider",
+        )
+        branch_model = _config_optional_str(
+            fallback_config,
+            f"{branch}_backup_model",
+        )
+        if branch_provider or branch_model:
+            return branch_provider, branch_model
+
     if branch == "fast":
         return FAST_LLM_BACKUP_PROVIDER, FAST_LLM_BACKUP_MODEL
     return COMPLEX_LLM_BACKUP_PROVIDER, COMPLEX_LLM_BACKUP_MODEL
@@ -1384,19 +1602,60 @@ def build_llm_client_for_branch(
     branch: str,
     primary_provider: str,
     primary_model: str | None = None,
+    primary_profile: ComponentSelection | None = None,
+    robot_settings: ResolvedRobotSettings | None = None,
 ) -> tuple[Any, LLMBranchMetadata]:
+    profile_config = _component_config(primary_profile)
     resolved_primary_model = (
-        primary_model or _default_llm_model_for_provider(primary_provider)
+        primary_model
+        or _default_llm_model_for_provider(primary_provider, primary_profile)
     ).strip()
-    primary_llm = build_llm_for_provider(
-        primary_provider,
-        model_name=resolved_primary_model or None,
-    )
+    if primary_profile is None:
+        primary_llm = build_llm_for_provider(
+            primary_provider,
+            model_name=resolved_primary_model or None,
+        )
+    else:
+        primary_llm = build_llm_for_provider(
+            primary_provider,
+            model_name=resolved_primary_model or None,
+            llm_profile=primary_profile,
+        )
     primary_provider_name, primary_model_name = _llm_identity(primary_llm)
 
-    backup_provider, backup_model = _backup_config_for_branch(branch)
+    backup_provider, backup_model = _backup_config_for_branch(
+        branch,
+        primary_provider=primary_provider,
+        primary_profile=primary_profile,
+        robot_settings=robot_settings,
+    )
     backup_provider = (backup_provider or "").strip()
     backup_model = (backup_model or "").strip()
+    use_fallback_adapter = _config_bool(
+        profile_config,
+        "use_livekit_fallback_adapter",
+        USE_LIVEKIT_FALLBACK_ADAPTER,
+    )
+    attempt_timeout_sec = _config_float(
+        profile_config,
+        "attempt_timeout_sec",
+        LLM_ATTEMPT_TIMEOUT_SEC,
+    )
+    max_retry_per_llm = _config_int(
+        profile_config,
+        "max_retry_per_llm",
+        LLM_MAX_RETRY_PER_LLM,
+    )
+    retry_interval_sec = _config_float(
+        profile_config,
+        "retry_interval_sec",
+        LLM_RETRY_INTERVAL_SEC,
+    )
+    retry_on_chunk_sent = _config_bool(
+        profile_config,
+        "retry_on_chunk_sent",
+        LLM_RETRY_ON_CHUNK_SENT,
+    )
 
     metadata = LLMBranchMetadata(
         branch=branch,
@@ -1405,9 +1664,14 @@ def build_llm_client_for_branch(
         backup_provider=backup_provider or None,
         backup_model=backup_model or None,
         uses_fallback_adapter=False,
+        attempt_timeout_sec=attempt_timeout_sec,
+        max_retry_per_llm=max_retry_per_llm,
+        retry_interval_sec=retry_interval_sec,
+        retry_on_chunk_sent=retry_on_chunk_sent,
+        enable_tools=_config_optional_bool(profile_config, "enable_tools"),
     )
 
-    if not USE_LIVEKIT_FALLBACK_ADAPTER:
+    if not use_fallback_adapter:
         logger.info(
             "LiveKit LLM fallback adapter disabled; using primary LLM only for branch",
             extra={
@@ -1452,6 +1716,11 @@ def build_llm_client_for_branch(
         backup_provider=backup_provider_name,
         backup_model=backup_model_name,
         uses_fallback_adapter=True,
+        attempt_timeout_sec=attempt_timeout_sec,
+        max_retry_per_llm=max_retry_per_llm,
+        retry_interval_sec=retry_interval_sec,
+        retry_on_chunk_sent=retry_on_chunk_sent,
+        enable_tools=metadata.enable_tools,
     )
 
     if backup_provider_name == metadata.primary_provider:
@@ -1474,32 +1743,48 @@ def build_llm_client_for_branch(
             "primary_model": fallback_metadata.primary_model,
             "backup_provider": fallback_metadata.backup_provider,
             "backup_model": fallback_metadata.backup_model,
-            "attempt_timeout_sec": LLM_ATTEMPT_TIMEOUT_SEC,
-            "max_retry_per_llm": LLM_MAX_RETRY_PER_LLM,
-            "retry_interval_sec": LLM_RETRY_INTERVAL_SEC,
-            "retry_on_chunk_sent": LLM_RETRY_ON_CHUNK_SENT,
+            "attempt_timeout_sec": attempt_timeout_sec,
+            "max_retry_per_llm": max_retry_per_llm,
+            "retry_interval_sec": retry_interval_sec,
+            "retry_on_chunk_sent": retry_on_chunk_sent,
         },
     )
     return (
         lk_llm.FallbackAdapter(
             llm=[primary_llm, backup_llm],
-            attempt_timeout=LLM_ATTEMPT_TIMEOUT_SEC,
-            max_retry_per_llm=LLM_MAX_RETRY_PER_LLM,
-            retry_interval=LLM_RETRY_INTERVAL_SEC,
-            retry_on_chunk_sent=LLM_RETRY_ON_CHUNK_SENT,
+            attempt_timeout=attempt_timeout_sec,
+            max_retry_per_llm=max_retry_per_llm,
+            retry_interval=retry_interval_sec,
+            retry_on_chunk_sent=retry_on_chunk_sent,
         ),
         fallback_metadata,
     )
 
 
-def build_routed_llm_clients() -> tuple[
+def build_routed_llm_clients(
+    robot_settings: ResolvedRobotSettings | None = None,
+) -> tuple[
     dict[str, Any],
     dict[str, str],
     dict[str, LLMBranchMetadata],
 ]:
+    fast_profile = (
+        robot_settings.component("llm_routing", "fast")
+        if robot_settings is not None
+        else None
+    )
+    complex_profile = (
+        robot_settings.component("llm_routing", "complex")
+        if robot_settings is not None
+        else None
+    )
+    route_to_profile = {
+        "fast": fast_profile,
+        "complex": complex_profile,
+    }
     route_to_provider = {
-        "fast": FAST_LLM_PROVIDER,
-        "complex": COMPLEX_LLM_PROVIDER,
+        "fast": _component_provider(fast_profile, FAST_LLM_PROVIDER),
+        "complex": _component_provider(complex_profile, COMPLEX_LLM_PROVIDER),
     }
     routed_llms: dict[str, Any] = {}
     routed_metadata: dict[str, LLMBranchMetadata] = {}
@@ -1509,25 +1794,84 @@ def build_routed_llm_clients() -> tuple[
             build_llm_client_for_branch(
                 branch=route_name,
                 primary_provider=provider,
+                primary_profile=route_to_profile[route_name],
+                robot_settings=robot_settings,
             )
         )
 
     return routed_llms, route_to_provider, routed_metadata
 
 
-def build_elevenlabs_tts() -> Any:
-    resolved_model = ELEVENLABS_MODEL.strip()
+def build_elevenlabs_tts(tts_profile: ComponentSelection | None = None) -> Any:
+    profile_config = _component_config(tts_profile)
+    egress_mode = _component_egress(tts_profile)
+    resolved_model = _config_str(profile_config, "model", ELEVENLABS_MODEL).strip()
+    voice_id = _config_str(profile_config, "voice_id", ELEVENLABS_VOICE_ID)
+    output_format = _config_str(
+        profile_config,
+        "output_format",
+        ELEVENLABS_V3_OUTPUT_FORMAT,
+    )
+    enable_logging = _config_bool(
+        profile_config,
+        "enable_logging",
+        ELEVENLABS_V3_ENABLE_LOGGING,
+    )
+    apply_text_normalization = _config_str(
+        profile_config,
+        "apply_text_normalization",
+        ELEVENLABS_V3_APPLY_TEXT_NORMALIZATION,
+    )
+    language = _config_str(profile_config, "language", ELEVENLABS_V3_LANGUAGE)
+    min_sentence_len = _config_int(
+        profile_config,
+        "min_sentence_len",
+        ELEVENLABS_V3_MIN_SENTENCE_LEN,
+    )
+    stream_context_len = _config_int(
+        profile_config,
+        "stream_context_len",
+        ELEVENLABS_V3_STREAM_CONTEXT_LEN,
+    )
     # Legacy env name kept for backward compatibility; now toggles custom HTTP stream adapter.
-    use_custom_v3 = ELEVENLABS_V3_USE_STREAM_INPUT and resolved_model == "eleven_v3"
+    use_custom_v3 = (
+        _config_bool(
+            profile_config,
+            "use_stream_input",
+            ELEVENLABS_V3_USE_STREAM_INPUT,
+        )
+        and resolved_model == "eleven_v3"
+    )
 
     voice_settings: Any = NOT_GIVEN
+    voice_stability = _config_optional_float(profile_config, "voice_stability")
+    if voice_stability is None:
+        voice_stability = ELEVENLABS_VOICE_STABILITY
+    voice_similarity_boost = _config_optional_float(
+        profile_config,
+        "voice_similarity_boost",
+    )
+    if voice_similarity_boost is None:
+        voice_similarity_boost = ELEVENLABS_VOICE_SIMILARITY_BOOST
+    voice_style = _config_optional_float(profile_config, "voice_style")
+    if voice_style is None:
+        voice_style = ELEVENLABS_VOICE_STYLE
+    voice_speed = _config_optional_float(profile_config, "voice_speed")
+    if voice_speed is None:
+        voice_speed = ELEVENLABS_VOICE_SPEED
+    voice_use_speaker_boost = _config_optional_bool(
+        profile_config,
+        "voice_use_speaker_boost",
+    )
+    if voice_use_speaker_boost is None:
+        voice_use_speaker_boost = ELEVENLABS_VOICE_USE_SPEAKER_BOOST
     if (
-        ELEVENLABS_VOICE_STABILITY is not None
-        or ELEVENLABS_VOICE_SIMILARITY_BOOST is not None
+        voice_stability is not None
+        or voice_similarity_boost is not None
     ):
         if (
-            ELEVENLABS_VOICE_STABILITY is None
-            or ELEVENLABS_VOICE_SIMILARITY_BOOST is None
+            voice_stability is None
+            or voice_similarity_boost is None
         ):
             logger.warning(
                 "ElevenLabs voice settings ignored: both ELEVENLABS_VOICE_STABILITY and "
@@ -1535,21 +1879,21 @@ def build_elevenlabs_tts() -> Any:
             )
         else:
             voice_settings = elevenlabs.VoiceSettings(
-                stability=ELEVENLABS_VOICE_STABILITY,
-                similarity_boost=ELEVENLABS_VOICE_SIMILARITY_BOOST,
+                stability=voice_stability,
+                similarity_boost=voice_similarity_boost,
                 style=(
-                    ELEVENLABS_VOICE_STYLE
-                    if ELEVENLABS_VOICE_STYLE is not None
+                    voice_style
+                    if voice_style is not None
                     else NOT_GIVEN
                 ),
                 speed=(
-                    ELEVENLABS_VOICE_SPEED
-                    if ELEVENLABS_VOICE_SPEED is not None
+                    voice_speed
+                    if voice_speed is not None
                     else NOT_GIVEN
                 ),
                 use_speaker_boost=(
-                    ELEVENLABS_VOICE_USE_SPEAKER_BOOST
-                    if ELEVENLABS_VOICE_USE_SPEAKER_BOOST is not None
+                    voice_use_speaker_boost
+                    if voice_use_speaker_boost is not None
                     else NOT_GIVEN
                 ),
             )
@@ -1559,27 +1903,27 @@ def build_elevenlabs_tts() -> Any:
             "using ElevenLabs eleven_v3 custom HTTP stream TTS provider",
             extra={
                 "model": resolved_model,
-                "voice_id": ELEVENLABS_VOICE_ID,
-                "output_format": ELEVENLABS_V3_OUTPUT_FORMAT,
-                "enable_logging": ELEVENLABS_V3_ENABLE_LOGGING,
-                "min_sentence_len": max(2, ELEVENLABS_V3_MIN_SENTENCE_LEN),
-                "stream_context_len": max(1, ELEVENLABS_V3_STREAM_CONTEXT_LEN),
+                "voice_id": voice_id,
+                "output_format": output_format,
+                "enable_logging": enable_logging,
+                "min_sentence_len": max(2, min_sentence_len),
+                "stream_context_len": max(1, stream_context_len),
                 "min_http_text_len": max(1, ELEVENLABS_V3_MIN_HTTP_TEXT_LEN),
                 "merge_hold_ms": max(0, ELEVENLABS_V3_MERGE_HOLD_MS),
                 "max_merged_text_len": max(1, ELEVENLABS_V3_MAX_MERGED_TEXT_LEN),
                 "optimize_streaming_latency": ELEVENLABS_V3_OPTIMIZE_STREAMING_LATENCY,
-                "egress": provider_egress("elevenlabs"),
+                "egress": provider_egress("elevenlabs", mode_override=egress_mode),
             },
         )
         return ElevenV3TTS(
-            voice_id=ELEVENLABS_VOICE_ID,
+            voice_id=voice_id,
             model_id=resolved_model,
             voice_settings=voice_settings,
-            output_format=ELEVENLABS_V3_OUTPUT_FORMAT,
-            enable_logging=ELEVENLABS_V3_ENABLE_LOGGING,
+            output_format=output_format,
+            enable_logging=enable_logging,
             request_timeout=ELEVENLABS_V3_REQUEST_TIMEOUT_SEC,
-            apply_text_normalization=ELEVENLABS_V3_APPLY_TEXT_NORMALIZATION,
-            language=(ELEVENLABS_V3_LANGUAGE if ELEVENLABS_V3_LANGUAGE else NOT_GIVEN),
+            apply_text_normalization=apply_text_normalization,
+            language=(language if language else NOT_GIVEN),
             optimize_streaming_latency=(
                 ELEVENLABS_V3_OPTIMIZE_STREAMING_LATENCY
                 if ELEVENLABS_V3_OPTIMIZE_STREAMING_LATENCY is not None
@@ -1588,20 +1932,23 @@ def build_elevenlabs_tts() -> Any:
             min_http_text_len=max(1, ELEVENLABS_V3_MIN_HTTP_TEXT_LEN),
             merge_hold_ms=max(0, ELEVENLABS_V3_MERGE_HOLD_MS),
             max_merged_text_len=max(1, ELEVENLABS_V3_MAX_MERGED_TEXT_LEN),
-            http_proxy=provider_proxy_url("elevenlabs"),
+            http_proxy=provider_proxy_url("elevenlabs", mode_override=egress_mode),
             tokenizer=tokenize.blingfire.SentenceTokenizer(
-                min_sentence_len=max(2, ELEVENLABS_V3_MIN_SENTENCE_LEN),
-                stream_context_len=max(1, ELEVENLABS_V3_STREAM_CONTEXT_LEN),
+                min_sentence_len=max(2, min_sentence_len),
+                stream_context_len=max(1, stream_context_len),
             ),
         )
 
     logger.info(
         "using ElevenLabs TTS provider",
-        extra={"model": resolved_model, "egress": provider_egress("elevenlabs")},
+        extra={
+            "model": resolved_model,
+            "egress": provider_egress("elevenlabs", mode_override=egress_mode),
+        },
     )
-    with provider_egress_env("elevenlabs"):
+    with provider_egress_env("elevenlabs", mode_override=egress_mode):
         return elevenlabs.TTS(
-            voice_id=ELEVENLABS_VOICE_ID,
+            voice_id=voice_id,
             model=resolved_model,
             voice_settings=voice_settings,
         )
@@ -1683,8 +2030,11 @@ def _google_tts_credentials_available() -> bool:
 
 def build_tts(
     external_http_sessions: list[aiohttp.ClientSession] | None = None,
+    tts_profile: ComponentSelection | None = None,
 ) -> Any:
-    if TTS_PROVIDER not in {
+    profile_config = _component_config(tts_profile)
+    configured_tts_provider = _component_provider(tts_profile, TTS_PROVIDER)
+    if configured_tts_provider not in {
         "google",
         "vertex",
         "minimax",
@@ -1695,11 +2045,11 @@ def build_tts(
     }:
         logger.warning(
             "Unknown TTS_PROVIDER='%s'. Falling back to ElevenLabs.",
-            TTS_PROVIDER,
+            configured_tts_provider,
         )
-        return build_elevenlabs_tts()
+        return build_elevenlabs_tts(tts_profile)
 
-    if TTS_PROVIDER == "tbank":
+    if configured_tts_provider == "tbank":
         if not TBANK_VOICEKIT_API_KEY.strip() or not TBANK_VOICEKIT_SECRET_KEY.strip():
             raise RuntimeError(
                 "T-Bank VoiceKit TTS is configured but TBANK_VOICEKIT_API_KEY "
@@ -1738,61 +2088,128 @@ def build_tts(
                 ),
             )
 
-    if TTS_PROVIDER == "cosyvoice":
-        if COSYVOICE_TTS_TRANSPORT != "websocket":
+    if configured_tts_provider == "cosyvoice":
+        cosyvoice_transport = _config_str(
+            profile_config,
+            "transport",
+            COSYVOICE_TTS_TRANSPORT,
+        )
+        if cosyvoice_transport != "websocket":
             raise RuntimeError(
                 "CosyVoice low-latency mode requires WebSocket transport. "
                 "Set COSYVOICE_TTS_TRANSPORT=websocket."
             )
 
-        resolved_api_key = (COSYVOICE_API_KEY or "").strip()
+        api_key_env_name = _config_str(
+            profile_config,
+            "api_key_env_name",
+            COSYVOICE_API_KEY_ENV_NAME,
+        )
+        resolved_api_key = (
+            os.getenv(api_key_env_name)
+            or COSYVOICE_API_KEY
+            or ""
+        ).strip()
         if not resolved_api_key:
             raise RuntimeError(
-                f"{COSYVOICE_API_KEY_ENV_NAME or 'COSYVOICE_API_KEY'} is not set. "
+                f"{api_key_env_name or 'COSYVOICE_API_KEY'} is not set. "
                 "CosyVoice provider is configured without API key."
             )
+        cosyvoice_profile = _config_str(profile_config, "profile", COSYVOICE_PROFILE)
+        cosyvoice_model = _config_str(profile_config, "model", COSYVOICE_TTS_MODEL)
+        cosyvoice_region = _config_str(profile_config, "region", COSYVOICE_TTS_REGION)
+        cosyvoice_ws_url = _config_str(profile_config, "ws_url", COSYVOICE_TTS_WS_URL)
+        cosyvoice_voice_mode = _config_str(
+            profile_config,
+            "voice_mode",
+            COSYVOICE_TTS_VOICE_MODE,
+        )
+        cosyvoice_voice_id = _config_str(
+            profile_config,
+            "voice_id",
+            COSYVOICE_TTS_VOICE_ID,
+        )
+        cosyvoice_clone_voice_id = _config_str(
+            profile_config,
+            "clone_voice_id",
+            COSYVOICE_TTS_CLONE_VOICE_ID,
+        )
+        cosyvoice_design_voice_id = _config_str(
+            profile_config,
+            "design_voice_id",
+            COSYVOICE_TTS_DESIGN_VOICE_ID,
+        )
+        cosyvoice_format = _config_str(profile_config, "format", COSYVOICE_TTS_FORMAT)
+        cosyvoice_sample_rate = _config_int(
+            profile_config,
+            "sample_rate",
+            COSYVOICE_TTS_SAMPLE_RATE,
+        )
+        cosyvoice_rate = _config_float(profile_config, "rate", COSYVOICE_TTS_RATE)
+        cosyvoice_pitch = _config_float(profile_config, "pitch", COSYVOICE_TTS_PITCH)
+        cosyvoice_volume = _config_int(profile_config, "volume", COSYVOICE_TTS_VOLUME)
+        cosyvoice_connection_reuse = _config_bool(
+            profile_config,
+            "connection_reuse",
+            COSYVOICE_TTS_CONNECTION_REUSE,
+        )
+        cosyvoice_playback_on_first_chunk = _config_bool(
+            profile_config,
+            "playback_on_first_chunk",
+            COSYVOICE_TTS_PLAYBACK_ON_FIRST_CHUNK,
+        )
+        cosyvoice_min_sentence_len = _config_int(
+            profile_config,
+            "min_sentence_len",
+            COSYVOICE_TTS_MIN_SENTENCE_LEN,
+        )
+        cosyvoice_stream_context_len = _config_int(
+            profile_config,
+            "stream_context_len",
+            COSYVOICE_TTS_STREAM_CONTEXT_LEN,
+        )
 
         logger.info(
             "using CosyVoice TTS provider",
             extra={
-                "profile": COSYVOICE_PROFILE,
-                "model": COSYVOICE_TTS_MODEL,
-                "transport": COSYVOICE_TTS_TRANSPORT,
-                "region": COSYVOICE_TTS_REGION,
-                "format": COSYVOICE_TTS_FORMAT,
-                "sample_rate": COSYVOICE_TTS_SAMPLE_RATE,
-                "voice_mode": COSYVOICE_TTS_VOICE_MODE,
-                "connection_reuse": COSYVOICE_TTS_CONNECTION_REUSE,
-                "playback_on_first_chunk": COSYVOICE_TTS_PLAYBACK_ON_FIRST_CHUNK,
-                "min_sentence_len": max(2, COSYVOICE_TTS_MIN_SENTENCE_LEN),
-                "stream_context_len": max(1, COSYVOICE_TTS_STREAM_CONTEXT_LEN),
+                "profile": cosyvoice_profile,
+                "model": cosyvoice_model,
+                "transport": cosyvoice_transport,
+                "region": cosyvoice_region,
+                "format": cosyvoice_format,
+                "sample_rate": cosyvoice_sample_rate,
+                "voice_mode": cosyvoice_voice_mode,
+                "connection_reuse": cosyvoice_connection_reuse,
+                "playback_on_first_chunk": cosyvoice_playback_on_first_chunk,
+                "min_sentence_len": max(2, cosyvoice_min_sentence_len),
+                "stream_context_len": max(1, cosyvoice_stream_context_len),
                 "egress": provider_egress("cosyvoice"),
             },
         )
         return CosyVoiceTTS(
             api_key=resolved_api_key,
-            model=COSYVOICE_TTS_MODEL.strip(),
-            region=COSYVOICE_TTS_REGION,
-            ws_url=COSYVOICE_TTS_WS_URL,
-            voice_mode=COSYVOICE_TTS_VOICE_MODE,
-            voice_id=COSYVOICE_TTS_VOICE_ID,
-            clone_voice_id=COSYVOICE_TTS_CLONE_VOICE_ID,
-            design_voice_id=COSYVOICE_TTS_DESIGN_VOICE_ID,
-            audio_format=COSYVOICE_TTS_FORMAT,
-            sample_rate=COSYVOICE_TTS_SAMPLE_RATE,
-            rate=COSYVOICE_TTS_RATE,
-            pitch=COSYVOICE_TTS_PITCH,
-            volume=COSYVOICE_TTS_VOLUME,
-            connection_reuse=COSYVOICE_TTS_CONNECTION_REUSE,
-            playback_on_first_chunk=COSYVOICE_TTS_PLAYBACK_ON_FIRST_CHUNK,
+            model=cosyvoice_model.strip(),
+            region=cosyvoice_region,
+            ws_url=cosyvoice_ws_url,
+            voice_mode=cosyvoice_voice_mode,
+            voice_id=cosyvoice_voice_id,
+            clone_voice_id=cosyvoice_clone_voice_id,
+            design_voice_id=cosyvoice_design_voice_id,
+            audio_format=cosyvoice_format,
+            sample_rate=cosyvoice_sample_rate,
+            rate=cosyvoice_rate,
+            pitch=cosyvoice_pitch,
+            volume=cosyvoice_volume,
+            connection_reuse=cosyvoice_connection_reuse,
+            playback_on_first_chunk=cosyvoice_playback_on_first_chunk,
             http_proxy=provider_proxy_url("cosyvoice"),
             tokenizer_obj=tokenize.blingfire.SentenceTokenizer(
-                min_sentence_len=max(2, COSYVOICE_TTS_MIN_SENTENCE_LEN),
-                stream_context_len=max(1, COSYVOICE_TTS_STREAM_CONTEXT_LEN),
+                min_sentence_len=max(2, cosyvoice_min_sentence_len),
+                stream_context_len=max(1, cosyvoice_stream_context_len),
             ),
         )
 
-    if TTS_PROVIDER == "sber":
+    if configured_tts_provider == "sber":
         if not SBER_SALUTESPEECH_AUTH_KEY.strip():
             raise RuntimeError(
                 "SBER_SALUTESPEECH_AUTH_KEY is not set. "
@@ -1837,16 +2254,16 @@ def build_tts(
                 ),
             )
 
-    if TTS_PROVIDER == "vertex":
+    if configured_tts_provider == "vertex":
         resolved_creds_file = _resolve_google_tts_credentials_file()
         if resolved_creds_file and not os.path.exists(resolved_creds_file):
             logger.warning(
                 "GOOGLE_TTS_CREDENTIALS_FILE does not exist: %s. Falling back to ElevenLabs TTS.",
                 resolved_creds_file,
             )
-            return build_elevenlabs_tts()
+            return build_elevenlabs_tts(tts_profile)
         if not _google_tts_credentials_available():
-            return build_elevenlabs_tts()
+            return build_elevenlabs_tts(tts_profile)
 
         if resolved_creds_file:
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = resolved_creds_file
@@ -1862,19 +2279,33 @@ def build_tts(
             },
         )
         return VertexGeminiTTS(
-            model=GOOGLE_TTS_MODEL.strip(),
-            voice_name=GOOGLE_TTS_VOICE_NAME or "Zephyr",
-            prompt=GOOGLE_TTS_PROMPT,
-            location=GOOGLE_TTS_LOCATION,
+            model=_config_str(profile_config, "model", GOOGLE_TTS_MODEL).strip(),
+            voice_name=_config_str(profile_config, "voice_name", GOOGLE_TTS_VOICE_NAME) or "Zephyr",
+            prompt=_config_str(profile_config, "prompt", GOOGLE_TTS_PROMPT),
+            location=_config_str(profile_config, "location", GOOGLE_TTS_LOCATION),
             http_proxy=provider_proxy_url("vertex_tts"),
             tokenizer_obj=tokenize.blingfire.SentenceTokenizer(
-                min_sentence_len=max(2, VERTEX_TTS_MIN_SENTENCE_LEN),
-                stream_context_len=max(1, VERTEX_TTS_STREAM_CONTEXT_LEN),
+                min_sentence_len=max(
+                    2,
+                    _config_int(
+                        profile_config,
+                        "min_sentence_len",
+                        VERTEX_TTS_MIN_SENTENCE_LEN,
+                    ),
+                ),
+                stream_context_len=max(
+                    1,
+                    _config_int(
+                        profile_config,
+                        "stream_context_len",
+                        VERTEX_TTS_STREAM_CONTEXT_LEN,
+                    ),
+                ),
             ),
         )
 
-    if TTS_PROVIDER == "google":
-        resolved_model = GOOGLE_TTS_MODEL.strip()
+    if configured_tts_provider == "google":
+        resolved_model = _config_str(profile_config, "model", GOOGLE_TTS_MODEL).strip()
         resolved_creds_file = _resolve_google_tts_credentials_file()
         # Normalize common typo/order variant to official Google TTS model id.
         if resolved_model == "gemini-tts-3.1-flash-preview":
@@ -1889,9 +2320,9 @@ def build_tts(
                 "GOOGLE_TTS_CREDENTIALS_FILE does not exist: %s. Falling back to ElevenLabs TTS.",
                 resolved_creds_file,
             )
-            return build_elevenlabs_tts()
+            return build_elevenlabs_tts(tts_profile)
         if not _google_tts_credentials_available():
-            return build_elevenlabs_tts()
+            return build_elevenlabs_tts(tts_profile)
 
         supported_google_tts_models = {
             "gemini-3.1-flash-tts-preview",
@@ -1901,7 +2332,10 @@ def build_tts(
             "chirp_3",
         }
         if resolved_model not in supported_google_tts_models:
-            fallback_model = GOOGLE_TTS_FALLBACK_MODEL or "gemini-3.1-flash-tts-preview"
+            fallback_model = (
+                _config_str(profile_config, "fallback_model", GOOGLE_TTS_FALLBACK_MODEL)
+                or "gemini-3.1-flash-tts-preview"
+            )
             if fallback_model not in supported_google_tts_models:
                 fallback_model = "gemini-3.1-flash-tts-preview"
             resolved_model = fallback_model
@@ -1915,19 +2349,44 @@ def build_tts(
         resolved_streaming = (
             True
             if resolved_model == "gemini-3.1-flash-tts-preview"
-            else GOOGLE_TTS_USE_STREAMING
+            else _config_bool(profile_config, "use_streaming", GOOGLE_TTS_USE_STREAMING)
+        )
+        google_tts_language = _config_str(
+            profile_config,
+            "language",
+            GOOGLE_TTS_LANGUAGE,
+        )
+        google_tts_speaking_rate = _config_float(
+            profile_config,
+            "speaking_rate",
+            GOOGLE_TTS_SPEAKING_RATE,
+        )
+        google_tts_pitch = _config_float(profile_config, "pitch", GOOGLE_TTS_PITCH)
+        google_tts_location = _config_str(
+            profile_config,
+            "location",
+            GOOGLE_TTS_LOCATION,
+        )
+        google_tts_min_sentence_len = _config_int(
+            profile_config,
+            "min_sentence_len",
+            GOOGLE_TTS_MIN_SENTENCE_LEN,
+        )
+        google_tts_stream_context_len = _config_int(
+            profile_config,
+            "stream_context_len",
+            GOOGLE_TTS_STREAM_CONTEXT_LEN,
         )
 
         tts_kwargs: dict[str, Any] = {
             "model_name": resolved_model,
-            "prompt": GOOGLE_TTS_PROMPT,
-            # Hard pin Russian telephony language as requested.
-            "language": "ru-RU",
-            "speaking_rate": GOOGLE_TTS_SPEAKING_RATE,
-            "pitch": GOOGLE_TTS_PITCH,
+            "prompt": _config_str(profile_config, "prompt", GOOGLE_TTS_PROMPT),
+            "language": google_tts_language,
+            "speaking_rate": google_tts_speaking_rate,
+            "pitch": google_tts_pitch,
             "use_streaming": resolved_streaming,
             # Use configured Google Cloud Text-to-Speech endpoint location.
-            "location": GOOGLE_TTS_LOCATION,
+            "location": google_tts_location,
             # Streaming-compatible encoding for Gemini TTS.
             "audio_encoding": (
                 texttospeech.AudioEncoding.PCM
@@ -1937,12 +2396,17 @@ def build_tts(
             # Shorter chunks reduce start delay for streaming TTS because
             # synthesis begins after the current chunk is half-closed.
             "tokenizer": tokenize.blingfire.SentenceTokenizer(
-                min_sentence_len=max(2, GOOGLE_TTS_MIN_SENTENCE_LEN),
-                stream_context_len=max(1, GOOGLE_TTS_STREAM_CONTEXT_LEN),
+                min_sentence_len=max(2, google_tts_min_sentence_len),
+                stream_context_len=max(1, google_tts_stream_context_len),
             ),
         }
-        if GOOGLE_TTS_VOICE_NAME:
-            tts_kwargs["voice_name"] = GOOGLE_TTS_VOICE_NAME
+        google_tts_voice_name = _config_str(
+            profile_config,
+            "voice_name",
+            GOOGLE_TTS_VOICE_NAME,
+        )
+        if google_tts_voice_name:
+            tts_kwargs["voice_name"] = google_tts_voice_name
         if resolved_creds_file:
             tts_kwargs["credentials_file"] = resolved_creds_file
         logger.info(
@@ -1950,98 +2414,160 @@ def build_tts(
             extra={
                 "model": resolved_model,
                 "streaming": resolved_streaming,
-                "location": GOOGLE_TTS_LOCATION,
-                "min_sentence_len": max(2, GOOGLE_TTS_MIN_SENTENCE_LEN),
-                "stream_context_len": max(1, GOOGLE_TTS_STREAM_CONTEXT_LEN),
+                "location": google_tts_location,
+                "min_sentence_len": max(2, google_tts_min_sentence_len),
+                "stream_context_len": max(1, google_tts_stream_context_len),
                 "egress": provider_egress("google_tts"),
             },
         )
         with provider_egress_env("google_tts"):
             return google.TTS(**tts_kwargs)
 
-    if TTS_PROVIDER == "minimax":
+    if configured_tts_provider == "minimax":
         if not MINIMAX_API_KEY.strip():
             logger.warning(
                 "MINIMAX_API_KEY is not set. Falling back to ElevenLabs TTS."
             )
-            return build_elevenlabs_tts()
+            return build_elevenlabs_tts(tts_profile)
 
         _patch_minimax_sound_effects()
+        minimax_model = _config_str(profile_config, "model", MINIMAX_TTS_MODEL)
+        minimax_voice_id = _config_str(profile_config, "voice_id", MINIMAX_TTS_VOICE_ID)
+        minimax_base_url = _config_str(profile_config, "base_url", MINIMAX_TTS_BASE_URL)
+        minimax_pitch = _config_int(profile_config, "pitch", MINIMAX_TTS_PITCH)
+        minimax_intensity_raw = profile_config.get("intensity", MINIMAX_TTS_INTENSITY)
+        minimax_intensity = (
+            int(minimax_intensity_raw)
+            if minimax_intensity_raw not in (None, "")
+            else None
+        )
+        minimax_timbre_raw = profile_config.get("timbre", MINIMAX_TTS_TIMBRE)
+        minimax_timbre = (
+            int(minimax_timbre_raw)
+            if minimax_timbre_raw not in (None, "")
+            else None
+        )
+        minimax_sound_effects = _config_str(
+            profile_config,
+            "sound_effects",
+            MINIMAX_TTS_SOUND_EFFECTS,
+        )
+        minimax_min_sentence_len = _config_int(
+            profile_config,
+            "min_sentence_len",
+            MINIMAX_TTS_MIN_SENTENCE_LEN,
+        )
+        minimax_stream_context_len = _config_int(
+            profile_config,
+            "stream_context_len",
+            MINIMAX_TTS_STREAM_CONTEXT_LEN,
+        )
         logger.info(
             "using MiniMax TTS provider",
             extra={
-                "model": MINIMAX_TTS_MODEL,
-                "voice_id": MINIMAX_TTS_VOICE_ID,
-                "base_url": MINIMAX_TTS_BASE_URL,
-                "pitch": MINIMAX_TTS_PITCH,
-                "intensity": MINIMAX_TTS_INTENSITY,
-                "timbre": MINIMAX_TTS_TIMBRE,
-                "sound_effects": MINIMAX_TTS_SOUND_EFFECTS or None,
+                "model": minimax_model,
+                "voice_id": minimax_voice_id,
+                "base_url": minimax_base_url,
+                "pitch": minimax_pitch,
+                "intensity": minimax_intensity,
+                "timbre": minimax_timbre,
+                "sound_effects": minimax_sound_effects or None,
                 "streaming": True,
                 "egress": provider_egress("minimax"),
             },
         )
         return minimax.TTS(
-            model=MINIMAX_TTS_MODEL,
-            voice=MINIMAX_TTS_VOICE_ID,
-            speed=MINIMAX_TTS_SPEED,
-            vol=MINIMAX_TTS_VOLUME,
-            pitch=MINIMAX_TTS_PITCH,
-            intensity=MINIMAX_TTS_INTENSITY,
-            timbre=MINIMAX_TTS_TIMBRE,
+            model=minimax_model,
+            voice=minimax_voice_id,
+            speed=_config_float(profile_config, "speed", MINIMAX_TTS_SPEED),
+            vol=_config_float(profile_config, "volume", MINIMAX_TTS_VOLUME),
+            pitch=minimax_pitch,
+            intensity=minimax_intensity,
+            timbre=minimax_timbre,
             text_normalization=False,
-            audio_format=MINIMAX_TTS_FORMAT,
-            sample_rate=MINIMAX_TTS_SAMPLE_RATE,
-            bitrate=MINIMAX_TTS_BITRATE,
-            language_boost=MINIMAX_TTS_LANGUAGE_BOOST,
+            audio_format=_config_str(profile_config, "format", MINIMAX_TTS_FORMAT),
+            sample_rate=_config_int(
+                profile_config,
+                "sample_rate",
+                MINIMAX_TTS_SAMPLE_RATE,
+            ),
+            bitrate=_config_int(profile_config, "bitrate", MINIMAX_TTS_BITRATE),
+            language_boost=_config_str(
+                profile_config,
+                "language_boost",
+                MINIMAX_TTS_LANGUAGE_BOOST,
+            ),
             tokenizer=tokenize.blingfire.SentenceTokenizer(
-                min_sentence_len=max(2, MINIMAX_TTS_MIN_SENTENCE_LEN),
-                stream_context_len=max(1, MINIMAX_TTS_STREAM_CONTEXT_LEN),
+                min_sentence_len=max(2, minimax_min_sentence_len),
+                stream_context_len=max(1, minimax_stream_context_len),
             ),
             text_pacing=False,
             api_key=MINIMAX_API_KEY,
-            base_url=MINIMAX_TTS_BASE_URL,
+            base_url=minimax_base_url,
             http_session=create_external_aiohttp_session(
                 "minimax",
                 external_http_sessions,
             ),
         )
 
-    return build_elevenlabs_tts()
+    return build_elevenlabs_tts(tts_profile)
 
 
-def _wrap_stt_for_early_interim_final(stt_client: lk_stt.STT) -> lk_stt.STT:
+def _wrap_stt_for_early_interim_final(
+    stt_client: lk_stt.STT,
+    *,
+    turn_profile: ComponentSelection | None = None,
+) -> lk_stt.STT:
+    turn_config = _component_config(turn_profile)
     return wrap_stt_if_enabled(
         stt_client,
-        enabled=STT_EARLY_INTERIM_FINAL_ENABLED,
-        delay_sec=STT_EARLY_INTERIM_FINAL_DELAY_SEC,
+        enabled=_config_bool(
+            turn_config,
+            "early_interim_final_enabled",
+            STT_EARLY_INTERIM_FINAL_ENABLED,
+        ),
+        delay_sec=_config_float(
+            turn_config,
+            "early_interim_final_delay_sec",
+            STT_EARLY_INTERIM_FINAL_DELAY_SEC,
+        ),
         min_stable_interims=STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS,
-        turn_detection_mode=TURN_DETECTION_MODE,
+        turn_detection_mode=_config_str(
+            turn_config,
+            "detection_mode",
+            TURN_DETECTION_MODE,
+        ),
         logger_=logger,
     )
 
 
 def build_stt(
     external_http_sessions: list[aiohttp.ClientSession] | None = None,
+    stt_profile: ComponentSelection | None = None,
+    turn_profile: ComponentSelection | None = None,
 ) -> Any:
+    profile_config = _component_config(stt_profile)
+    configured_stt_provider = _component_provider(stt_profile, STT_PROVIDER)
+
     def _build_google_stt_or_none(*, log_prefix: str) -> Any | None:
         resolved_creds_file = _resolve_google_tts_credentials_file()
         if not _google_tts_credentials_available():
             logger.warning("%s: Google STT credentials are not available", log_prefix)
             return None
 
-        if STT_GOOGLE_MODEL in ("latest_short", "telephony_short"):
+        google_stt_model = _config_str(profile_config, "model", STT_GOOGLE_MODEL)
+        if google_stt_model in ("latest_short", "telephony_short"):
             logger.warning(
                 "STT_GOOGLE_MODEL=%s closes the streaming connection after the first "
                 "utterance — multi-turn conversations will freeze after the first exchange. "
                 "Set STT_GOOGLE_MODEL=latest_long in .env.local for reliable multi-turn operation.",
-                STT_GOOGLE_MODEL,
+                google_stt_model,
             )
 
         stt_kwargs: dict[str, Any] = {
-            "languages": STT_GOOGLE_LANGUAGE,
-            "model": STT_GOOGLE_MODEL,
-            "location": STT_GOOGLE_LOCATION,
+            "languages": _config_str(profile_config, "language", STT_GOOGLE_LANGUAGE),
+            "model": google_stt_model,
+            "location": _config_str(profile_config, "location", STT_GOOGLE_LOCATION),
             "interim_results": True,
             "use_streaming": True,
         }
@@ -2052,15 +2578,19 @@ def build_stt(
             return google.STT(**stt_kwargs)
 
     # Default path: LiveKit inference STT.
-    if STT_PROVIDER == "inference":
+    if configured_stt_provider == "inference":
         with provider_egress_env("livekit_inference"):
             stt_instances: list[Any] = [
                 inference.STT(
-                    model=STT_INFERENCE_MODEL,
-                    language=STT_INFERENCE_LANGUAGE,
+                    model=_config_str(profile_config, "model", STT_INFERENCE_MODEL),
+                    language=_config_str(
+                        profile_config,
+                        "language",
+                        STT_INFERENCE_LANGUAGE,
+                    ),
                 )
             ]
-        fallback_descriptions = [STT_INFERENCE_MODEL]
+        fallback_descriptions = [_config_str(profile_config, "model", STT_INFERENCE_MODEL)]
 
         if STT_INFERENCE_INCLUDE_GOOGLE_FALLBACK:
             google_stt = _build_google_stt_or_none(
@@ -2084,7 +2614,10 @@ def build_stt(
             fallback_descriptions.append(fallback_model)
 
         if len(stt_instances) == 1:
-            return _wrap_stt_for_early_interim_final(stt_instances[0])
+            return _wrap_stt_for_early_interim_final(
+                stt_instances[0],
+                turn_profile=turn_profile,
+            )
 
         logger.info(
             "using STT fallback adapter",
@@ -2100,10 +2633,11 @@ def build_stt(
                 attempt_timeout=8.0,
                 max_retry_per_stt=0,
                 retry_interval=0.7,
-            )
+            ),
+            turn_profile=turn_profile,
         )
 
-    if STT_PROVIDER == "google":
+    if configured_stt_provider == "google":
         google_stt = _build_google_stt_or_none(log_prefix="google provider")
         if google_stt is None:
             logger.warning(
@@ -2113,11 +2647,14 @@ def build_stt(
                 inference.STT(
                     model=STT_INFERENCE_MODEL,
                     language=STT_INFERENCE_LANGUAGE,
-                )
+                ),
+                turn_profile=turn_profile,
             )
 
         stt_instances: list[Any] = [google_stt]
-        fallback_descriptions = [f"google:{STT_GOOGLE_MODEL}"]
+        fallback_descriptions = [
+            f"google:{_config_str(profile_config, 'model', STT_GOOGLE_MODEL)}"
+        ]
         fallback_model = STT_INFERENCE_MODEL.strip()
         if fallback_model:
             stt_instances.append(
@@ -2131,14 +2668,17 @@ def build_stt(
         logger.info(
             "using Google STT provider",
             extra={
-                "model": STT_GOOGLE_MODEL,
-                "language": STT_GOOGLE_LANGUAGE,
-                "location": STT_GOOGLE_LOCATION,
+                "model": _config_str(profile_config, "model", STT_GOOGLE_MODEL),
+                "language": _config_str(profile_config, "language", STT_GOOGLE_LANGUAGE),
+                "location": _config_str(profile_config, "location", STT_GOOGLE_LOCATION),
                 "egress": provider_egress("google_stt"),
             },
         )
         if len(stt_instances) == 1:
-            return _wrap_stt_for_early_interim_final(google_stt)
+            return _wrap_stt_for_early_interim_final(
+                google_stt,
+                turn_profile=turn_profile,
+            )
 
         logger.info(
             "using STT fallback adapter",
@@ -2153,10 +2693,11 @@ def build_stt(
                 attempt_timeout=8.0,
                 max_retry_per_stt=0,
                 retry_interval=0.7,
-            )
+            ),
+            turn_profile=turn_profile,
         )
 
-    if STT_PROVIDER == "yandex":
+    if configured_stt_provider == "yandex":
         if not YANDEX_SPEECHKIT_API_KEY.strip():
             logger.warning(
                 "YANDEX_SPEECHKIT_API_KEY is not set. Falling back to inference STT."
@@ -2165,20 +2706,26 @@ def build_stt(
                 inference.STT(
                     model=STT_INFERENCE_MODEL,
                     language=STT_INFERENCE_LANGUAGE,
-                )
+                ),
+                turn_profile=turn_profile,
             )
 
+        yandex_model = _config_str(profile_config, "model", STT_YANDEX_MODEL)
+        yandex_language = _config_str(profile_config, "language", STT_YANDEX_LANGUAGE)
+        yandex_max_pause = _config_int(
+            profile_config,
+            "max_pause_between_words_hint_ms",
+            STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS,
+        )
         logger.info(
             "using Yandex SpeechKit STT provider",
             extra={
-                "model": STT_YANDEX_MODEL,
-                "language": STT_YANDEX_LANGUAGE,
+                "model": yandex_model,
+                "language": yandex_language,
                 "sample_rate": STT_YANDEX_SAMPLE_RATE,
                 "chunk_ms": STT_YANDEX_CHUNK_MS,
                 "eou_sensitivity": STT_YANDEX_EOU_SENSITIVITY,
-                "max_pause_between_words_hint_ms": (
-                    STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS
-                ),
+                "max_pause_between_words_hint_ms": yandex_max_pause,
                 "egress": provider_egress("yandex_stt"),
             },
         )
@@ -2186,18 +2733,17 @@ def build_stt(
             return _wrap_stt_for_early_interim_final(
                 YandexSpeechKitSTT(
                     api_key=YANDEX_SPEECHKIT_API_KEY,
-                    model=STT_YANDEX_MODEL,
-                    language=STT_YANDEX_LANGUAGE,
+                    model=yandex_model,
+                    language=yandex_language,
                     sample_rate=STT_YANDEX_SAMPLE_RATE,
                     chunk_ms=STT_YANDEX_CHUNK_MS,
                     eou_sensitivity=STT_YANDEX_EOU_SENSITIVITY,
-                    max_pause_between_words_hint_ms=(
-                        STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS
-                    ),
-                )
+                    max_pause_between_words_hint_ms=yandex_max_pause,
+                ),
+                turn_profile=turn_profile,
             )
 
-    if STT_PROVIDER == "tbank":
+    if configured_stt_provider == "tbank":
         if not TBANK_VOICEKIT_API_KEY.strip() or not TBANK_VOICEKIT_SECRET_KEY.strip():
             raise RuntimeError(
                 "T-Bank VoiceKit STT is configured but TBANK_VOICEKIT_API_KEY "
@@ -2229,10 +2775,11 @@ def build_stt(
                     interim_interval_sec=STT_TBANK_INTERIM_INTERVAL_SEC,
                     endpoint=TBANK_VOICEKIT_ENDPOINT,
                     authority=TBANK_VOICEKIT_AUTHORITY,
-                )
+                ),
+                turn_profile=turn_profile,
             )
 
-    if STT_PROVIDER == "deepgram":
+    if configured_stt_provider == "deepgram":
         if not DEEPGRAM_API_KEY:
             logger.warning(
                 "DEEPGRAM_API_KEY is not set. Falling back to inference STT."
@@ -2241,45 +2788,61 @@ def build_stt(
                 inference.STT(
                     model=STT_INFERENCE_MODEL,
                     language=STT_INFERENCE_LANGUAGE,
-                )
+                ),
+                turn_profile=turn_profile,
             )
 
+        deepgram_model = _config_str(profile_config, "model", STT_DEEPGRAM_MODEL)
+        deepgram_language = _config_str(
+            profile_config,
+            "language",
+            STT_DEEPGRAM_LANGUAGE,
+        )
+        deepgram_endpointing_ms = _config_int(
+            profile_config,
+            "endpointing_ms",
+            STT_DEEPGRAM_ENDPOINTING_MS,
+        )
+        egress_mode = _component_egress(stt_profile)
         logger.info(
             "using Deepgram STT provider",
             extra={
-                "model": STT_DEEPGRAM_MODEL,
-                "language": STT_DEEPGRAM_LANGUAGE,
-                "egress": provider_egress("deepgram"),
+                "model": deepgram_model,
+                "language": deepgram_language,
+                "egress": provider_egress("deepgram", mode_override=egress_mode),
             },
         )
         return _wrap_stt_for_early_interim_final(
             deepgram.STT(
                 api_key=DEEPGRAM_API_KEY,
-                model=STT_DEEPGRAM_MODEL,
-                language=STT_DEEPGRAM_LANGUAGE,
+                model=deepgram_model,
+                language=deepgram_language,
                 http_session=create_external_aiohttp_session(
                     "deepgram",
                     external_http_sessions,
+                    egress_mode=egress_mode,
                 ),
                 interim_results=True,
                 no_delay=True,
-                endpointing_ms=STT_DEEPGRAM_ENDPOINTING_MS,
+                endpointing_ms=deepgram_endpointing_ms,
                 smart_format=False,
                 punctuate=True,
                 filler_words=False,
                 vad_events=True,
-            )
+            ),
+            turn_profile=turn_profile,
         )
 
     logger.warning(
         "Unknown STT_PROVIDER='%s'. Falling back to inference STT.",
-        STT_PROVIDER,
+        configured_stt_provider,
     )
     return _wrap_stt_for_early_interim_final(
         inference.STT(
             model=STT_INFERENCE_MODEL,
             language=STT_INFERENCE_LANGUAGE,
-        )
+        ),
+        turn_profile=turn_profile,
     )
 
 
@@ -2291,8 +2854,11 @@ class Assistant(Agent):
         routed_llm_providers: dict[str, str] | None = None,
         routed_llm_metadata: dict[str, LLMBranchMetadata] | None = None,
         fallback_llm: google.LLM | None = None,
+        fallback_llm_provider: str = "google",
         first_turn_short_greeting_audio_path: Path = _SHORT_GREETING_AUDIO_PATH,
+        first_turn_short_greeting_phrase: str = VOICE_SHORT_GREETING_PHRASE,
         prerecorded_audio_sample_rate: int = 24000,
+        voice_audio_cache: VoiceAudioCache | None = None,
         voice_prompts: VoicePromptManager | None = None,
         tag_skill_runner: RobotSkillRunner | None = None,
         prompt: str | None = None,
@@ -2303,10 +2869,13 @@ class Assistant(Agent):
         self._routed_llm_providers = routed_llm_providers or {}
         self._routed_llm_metadata = routed_llm_metadata or {}
         self._fallback_llm = fallback_llm
+        self._fallback_llm_provider = fallback_llm_provider
         self._first_turn_short_greeting_audio_path = (
             first_turn_short_greeting_audio_path
         )
+        self._first_turn_short_greeting_phrase = first_turn_short_greeting_phrase
         self._prerecorded_audio_sample_rate = prerecorded_audio_sample_rate
+        self._voice_audio_cache = voice_audio_cache
         self._voice_prompts = voice_prompts
         self._tag_skill_runner = tag_skill_runner
         self._incident_logger = incident_logger
@@ -2336,12 +2905,23 @@ class Assistant(Agent):
         with suppress(Exception):
             await self.session.interrupt(force=True)
 
+        audio_path = self._first_turn_short_greeting_audio_path
+        if self._voice_audio_cache is not None:
+            audio_path = await self._voice_audio_cache.get_or_create(
+                kind="short_greeting",
+                text=self._first_turn_short_greeting_phrase,
+                legacy_path=self._first_turn_short_greeting_audio_path,
+            )
+        if audio_path is None:
+            return
+
         played = await play_prerecorded_audio(
             session=self.session,
-            audio_path=self._first_turn_short_greeting_audio_path,
+            audio_path=audio_path,
             sample_rate=self._prerecorded_audio_sample_rate,
             allow_interruptions=True,
             add_to_chat_ctx=False,
+            text=self._first_turn_short_greeting_phrase,
         )
         if played:
             raise StopResponse()
@@ -2626,11 +3206,14 @@ class Assistant(Agent):
         chat_ctx: Any,
         tools: list[Any],
         model_settings: Any,
+        *,
+        enable_tools: bool | None = None,
     ) -> AsyncIterator[Any]:
         resolved_tools, tool_choice = self._resolve_tools_for_llm_call(
             tools=tools,
             model_settings=model_settings,
             llm_provider=llm_provider,
+            enable_tools=enable_tools,
         )
         activity = self._get_activity_or_raise()
         conn_options = activity.session.conn_options.llm_conn_options
@@ -2649,6 +3232,7 @@ class Assistant(Agent):
         tools: list[Any],
         model_settings: Any,
         llm_provider: str | None = None,
+        enable_tools: bool | None = None,
     ) -> tuple[list[Any], Any]:
         tool_choice = model_settings.tool_choice if model_settings else NOT_GIVEN
         resolved_tools = tools
@@ -2657,7 +3241,8 @@ class Assistant(Agent):
         # For xAI provider we keep tools disabled by default, even if declared in the agent.
         # This avoids Responses API 400 errors around tool_choice/tools coupling
         # and keeps lower TTFT for voice turns.
-        if is_xai_provider and not XAI_ENABLE_TOOLS:
+        xai_tools_enabled = XAI_ENABLE_TOOLS if enable_tools is None else enable_tools
+        if is_xai_provider and not xai_tools_enabled:
             if resolved_tools:
                 logger.info(
                     "xAI tools are disabled by default; ignoring %d configured tool(s)",
@@ -2676,6 +3261,7 @@ class Assistant(Agent):
         model_settings: Any,
         *,
         first_token_timeout: float,
+        enable_tools: bool | None = None,
     ) -> AsyncIterator[Any]:
         stream = self._stream_llm(
             llm_client,
@@ -2683,6 +3269,7 @@ class Assistant(Agent):
             chat_ctx,
             tools,
             model_settings,
+            enable_tools=enable_tools,
         )
         stream_iter = stream.__aiter__()
         try:
@@ -2751,7 +3338,15 @@ class Assistant(Agent):
                 yield chunk
             return
 
-        if USE_LIVEKIT_FALLBACK_ADAPTER:
+        selected_uses_fallback_adapter = (
+            route_metadata.uses_fallback_adapter
+            if route_metadata is not None
+            else USE_LIVEKIT_FALLBACK_ADAPTER
+        )
+        selected_enable_tools = (
+            route_metadata.enable_tools if route_metadata is not None else None
+        )
+        if selected_uses_fallback_adapter:
             self._llm_branch_started_at[selected_branch] = (
                 asyncio.get_running_loop().time()
             )
@@ -2764,6 +3359,7 @@ class Assistant(Agent):
                         chat_ctx,
                         tools,
                         model_settings,
+                        enable_tools=selected_enable_tools,
                     )
                 ):
                     yielded_any = True
@@ -2807,6 +3403,7 @@ class Assistant(Agent):
                     tools,
                     model_settings,
                     first_token_timeout=LLM_FIRST_TOKEN_TIMEOUT_SEC,
+                    enable_tools=selected_enable_tools,
                 )
             ):
                 yielded_any = True
@@ -2848,6 +3445,7 @@ class Assistant(Agent):
                     tools,
                     model_settings,
                     first_token_timeout=LLM_FIRST_TOKEN_TIMEOUT_SEC,
+                    enable_tools=selected_enable_tools,
                 )
             ):
                 yield chunk
@@ -2906,7 +3504,7 @@ class Assistant(Agent):
         async for chunk in self._tracked_robot_tag_llm_stream(
             self._stream_llm_with_ttft_timeout(
                 self._fallback_llm,
-                "google",
+                self._fallback_llm_provider,
                 chat_ctx,
                 tools,
                 model_settings,
@@ -3009,19 +3607,83 @@ async def my_agent(ctx: JobContext):
     )
     sip_call_numbers = {
         "sip_trunk_number": None,
+        "gateway_number": None,
         "sip_client_number": None,
     }
+    participant = None
+    robot_settings: ResolvedRobotSettings | None = None
+
+    try:
+        await ctx.connect()
+        try:
+            participant = await asyncio.wait_for(
+                ctx.wait_for_participant(), timeout=3.0
+            )
+        except asyncio.TimeoutError:
+            logger.info(
+                "no participant available before prompt/settings lookup; using defaults"
+            )
+
+        sip_call_numbers = extract_sip_call_numbers(participant)
+        incident_log.set_context(**extract_sip_diagnostic_context(participant))
+        prompt_resolution = await resolve_prompt_for_call(
+            sip_trunk_number=sip_call_numbers["sip_trunk_number"],
+            sip_client_number=sip_call_numbers["sip_client_number"],
+        )
+        robot_settings = await resolve_robot_settings_for_call(
+            did=sip_call_numbers["sip_trunk_number"],
+            runtime_key=ROBOT_RUNTIME_PROFILE,
+        )
+        logger.info(
+            "robot settings resolved",
+            extra={
+                "source": robot_settings.source,
+                "runtime_profile": ROBOT_RUNTIME_PROFILE,
+                "effective_runtime_profile": robot_settings.effective_runtime_key,
+                "project_key": robot_settings.project_key,
+                "did": sip_call_numbers["sip_trunk_number"],
+                "llm_profile": robot_settings.llm_primary.profile_key
+                if robot_settings.llm_primary
+                else None,
+                "tts_profile": robot_settings.tts_primary.profile_key
+                if robot_settings.tts_primary
+                else None,
+                "stt_profile": robot_settings.stt_primary.profile_key
+                if robot_settings.stt_primary
+                else None,
+            },
+        )
+    except Exception as e:
+        startup_failure_recorded = True
+        await incident_log.record_exception(
+            "session_start_failed",
+            e,
+            severity="critical",
+            component="settings",
+            description="Failed to resolve prompt or robot settings before session start",
+            payload={
+                "phase": "resolve_prompt_robot_settings",
+                "runtime_profile": ROBOT_RUNTIME_PROFILE,
+            },
+        )
+        raise
 
     model_router: ModelRouter | None = None
     routed_llms: dict[str, Any] = {}
     routed_llm_providers: dict[str, str] = {}
     routed_llm_metadata: dict[str, LLMBranchMetadata] = {}
-    if LLM_ROUTING_ENABLED:
+    directus_routing_enabled = bool(
+        robot_settings
+        and robot_settings.component("llm_routing", "fast")
+        and robot_settings.component("llm_routing", "complex")
+    )
+    llm_routing_enabled = directus_routing_enabled or LLM_ROUTING_ENABLED
+    if llm_routing_enabled:
         model_router = ModelRouter.from_default_config()
         router_model_names = _resolve_router_model_names(model_router)
         try:
             routed_llms, routed_llm_providers, routed_llm_metadata = (
-                build_routed_llm_clients()
+                build_routed_llm_clients(robot_settings)
             )
         except Exception as e:
             await incident_log.record_exception(
@@ -3045,7 +3707,10 @@ async def my_agent(ctx: JobContext):
                 "complex_route_label": router_model_names["complex"],
                 "complex_backup_model": routed_llm_metadata["complex"].backup_model,
                 "force_fast_flag_field": model_router.force_fast_flag_field,
-                "use_livekit_fallback_adapter": USE_LIVEKIT_FALLBACK_ADAPTER,
+                "use_livekit_fallback_adapter": routed_llm_metadata[
+                    "complex"
+                ].uses_fallback_adapter,
+                "settings_source": robot_settings.source if robot_settings else "env",
             },
         )
     elif FAST_LLM_PROVIDER or COMPLEX_LLM_PROVIDER:
@@ -3056,11 +3721,17 @@ async def my_agent(ctx: JobContext):
         logger.info("model routing is disabled; using single LLM_PROVIDER flow")
 
     fallback_llm = None
-    if not LLM_ROUTING_ENABLED:
+    fallback_llm_provider_name = "google"
+    session_llm_metadata: LLMBranchMetadata | None = None
+    if not llm_routing_enabled:
+        primary_llm_profile = robot_settings.llm_primary if robot_settings else None
+        primary_llm_provider = _component_provider(primary_llm_profile, LLM_PROVIDER)
         try:
             session_llm, session_llm_metadata = build_llm_client_for_branch(
                 branch="complex",
-                primary_provider=LLM_PROVIDER,
+                primary_provider=primary_llm_provider,
+                primary_profile=primary_llm_profile,
+                robot_settings=robot_settings,
             )
         except Exception as e:
             await incident_log.record_exception(
@@ -3068,7 +3739,7 @@ async def my_agent(ctx: JobContext):
                 e,
                 severity="critical",
                 component="llm",
-                provider=LLM_PROVIDER,
+                provider=primary_llm_provider,
                 description="Failed to build session LLM before session start",
                 payload={"phase": "build_session_llm"},
             )
@@ -3080,12 +3751,36 @@ async def my_agent(ctx: JobContext):
 
     fallback_provider = routed_llm_metadata.get("complex")
     if (
+        fallback_provider is not None
+        and not fallback_provider.uses_fallback_adapter
+        and fallback_provider.has_backup
+    ):
+        try:
+            fallback_llm_provider_name = fallback_provider.backup_provider or "google"
+            fallback_llm = build_llm_for_provider(
+                fallback_llm_provider_name,
+                model_name=fallback_provider.backup_model,
+            )
+        except Exception as e:
+            await incident_log.record_exception(
+                "session_start_failed",
+                e,
+                severity="critical",
+                component="llm",
+                provider=fallback_provider.backup_provider,
+                model=fallback_provider.backup_model,
+                description="Failed to build manual fallback LLM before session start",
+                payload={"phase": "build_manual_fallback_llm"},
+            )
+            raise
+    elif (
         not USE_LIVEKIT_FALLBACK_ADAPTER
         and fallback_provider is not None
         and fallback_provider.primary_provider == "google"
         and GEMINI_FALLBACK_MODEL
     ):
         try:
+            fallback_llm_provider_name = "google"
             fallback_llm = build_google_llm(model_name=GEMINI_FALLBACK_MODEL)
         except Exception as e:
             await incident_log.record_exception(
@@ -3100,15 +3795,45 @@ async def my_agent(ctx: JobContext):
             )
             raise
 
-    min_endpointing_delay = max(0.0, TURN_MIN_ENDPOINTING_DELAY)
-    max_endpointing_delay = max(min_endpointing_delay, TURN_MAX_ENDPOINTING_DELAY)
-    endpointing_mode = "dynamic" if TURN_ENDPOINTING_MODE == "dynamic" else "fixed"
+    turn_profile = robot_settings.turn if robot_settings else None
+    turn_config = _component_config(turn_profile)
+    min_endpointing_delay = max(
+        0.0,
+        _config_float(
+            turn_config,
+            "min_endpointing_delay",
+            TURN_MIN_ENDPOINTING_DELAY,
+        ),
+    )
+    max_endpointing_delay = max(
+        min_endpointing_delay,
+        _config_float(
+            turn_config,
+            "max_endpointing_delay",
+            TURN_MAX_ENDPOINTING_DELAY,
+        ),
+    )
+    configured_endpointing_mode = _config_str(
+        turn_config,
+        "endpointing_mode",
+        TURN_ENDPOINTING_MODE,
+    )
+    endpointing_mode = "dynamic" if configured_endpointing_mode == "dynamic" else "fixed"
+    configured_turn_detection_mode = _config_str(
+        turn_config,
+        "detection_mode",
+        TURN_DETECTION_MODE,
+    )
     turn_detection_mode: str | MultilingualModel
-    if TURN_DETECTION_MODE == "multilingual":
+    if configured_turn_detection_mode == "multilingual":
         turn_detection_mode = MultilingualModel()
-    elif TURN_DETECTION_MODE in ("vad", "stt", "manual"):
-        turn_detection_mode = TURN_DETECTION_MODE
-        if TURN_DETECTION_MODE == "stt" and STT_PROVIDER == "google":
+    elif configured_turn_detection_mode in ("vad", "stt", "manual"):
+        turn_detection_mode = configured_turn_detection_mode
+        configured_stt_provider = _component_provider(
+            robot_settings.stt_primary if robot_settings else None,
+            STT_PROVIDER,
+        )
+        if configured_turn_detection_mode == "stt" and configured_stt_provider == "google":
             # turn_detection="stt" with Google STT requires enable_voice_activity_events=True,
             # but that causes the streaming session to close after first utterance on latest_short.
             # VAD-based detection (Silero) is the reliable alternative: no Google stream dependency.
@@ -3118,12 +3843,26 @@ async def my_agent(ctx: JobContext):
             )
     else:
         turn_detection_mode = "vad"
+    preemptive_generation = _config_bool(
+        turn_config,
+        "preemptive_generation",
+        PREEMPTIVE_GENERATION,
+    )
 
-    audio_output_sample_rate = resolve_audio_output_sample_rate()
+    audio_output_sample_rate = resolve_audio_output_sample_rate(
+        robot_settings.tts_primary if robot_settings else None
+    )
     external_http_sessions: list[aiohttp.ClientSession] = []
     try:
-        stt_client = build_stt(external_http_sessions=external_http_sessions)
-        tts_client = build_tts(external_http_sessions=external_http_sessions)
+        stt_client = build_stt(
+            external_http_sessions=external_http_sessions,
+            stt_profile=robot_settings.stt_primary if robot_settings else None,
+            turn_profile=turn_profile,
+        )
+        tts_client = build_tts(
+            external_http_sessions=external_http_sessions,
+            tts_profile=robot_settings.tts_primary if robot_settings else None,
+        )
     except Exception as e:
         await incident_log.record_exception(
             "session_start_failed",
@@ -3133,15 +3872,31 @@ async def my_agent(ctx: JobContext):
             description="Failed to build STT/TTS pipeline before session start",
             payload={
                 "phase": "build_stt_tts",
-                "stt_provider": STT_PROVIDER,
-                "tts_provider": TTS_PROVIDER,
+                "stt_provider": _component_provider(
+                    robot_settings.stt_primary if robot_settings else None,
+                    STT_PROVIDER,
+                ),
+                "tts_provider": _component_provider(
+                    robot_settings.tts_primary if robot_settings else None,
+                    TTS_PROVIDER,
+                ),
             },
         )
         raise
 
+    voice_audio_cache = VoiceAudioCache(
+        cache_dir=_VOICE_AUDIO_CACHE_DIR,
+        tts_client=tts_client,
+        enabled=VOICE_AUDIO_CACHE_ENABLED,
+        legacy_profile_id=VOICE_AUDIO_LEGACY_PROFILE_ID,
+    )
+
     if should_log_startup_provider_fallback(
         component_name="stt",
-        configured_provider=STT_PROVIDER,
+        configured_provider=_component_provider(
+            robot_settings.stt_primary if robot_settings else None,
+            STT_PROVIDER,
+        ),
         actual_component=stt_client,
     ):
         provider, model = component_identity(stt_client)
@@ -3153,7 +3908,10 @@ async def my_agent(ctx: JobContext):
             model=model,
             description="Configured STT provider was not used at startup",
             payload={
-                "configured_provider": STT_PROVIDER,
+                "configured_provider": _component_provider(
+                    robot_settings.stt_primary if robot_settings else None,
+                    STT_PROVIDER,
+                ),
                 "actual_provider": provider,
                 "actual_model": model,
             },
@@ -3161,7 +3919,10 @@ async def my_agent(ctx: JobContext):
 
     if should_log_startup_provider_fallback(
         component_name="tts",
-        configured_provider=TTS_PROVIDER,
+        configured_provider=_component_provider(
+            robot_settings.tts_primary if robot_settings else None,
+            TTS_PROVIDER,
+        ),
         actual_component=tts_client,
     ):
         provider, model = component_identity(tts_client)
@@ -3173,7 +3934,10 @@ async def my_agent(ctx: JobContext):
             model=model,
             description="Configured TTS provider was not used at startup",
             payload={
-                "configured_provider": TTS_PROVIDER,
+                "configured_provider": _component_provider(
+                    robot_settings.tts_primary if robot_settings else None,
+                    TTS_PROVIDER,
+                ),
                 "actual_provider": provider,
                 "actual_model": model,
             },
@@ -3210,12 +3974,13 @@ async def my_agent(ctx: JobContext):
             },
         },
         vad=ctx.proc.userdata["vad"],
-        preemptive_generation=PREEMPTIVE_GENERATION,
+        preemptive_generation=preemptive_generation,
     )
     background_audio = BackgroundAudioPlayer()
     voice_prompts = VoicePromptManager(
         session=session,
         background_audio=background_audio,
+        voice_audio_cache=voice_audio_cache,
         response_delay_prompt=VoicePromptSpec(
             kind="response_delay",
             audio_paths=_RESPONSE_DELAY_AUDIO_PATHS,
@@ -3239,19 +4004,39 @@ async def my_agent(ctx: JobContext):
         extra={
             "llm_first_token_timeout_sec": LLM_FIRST_TOKEN_TIMEOUT_SEC,
             "llm_fallback_first_token_timeout_sec": LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
-            "llm_attempt_timeout_sec": LLM_ATTEMPT_TIMEOUT_SEC,
-            "llm_max_retry_per_llm": LLM_MAX_RETRY_PER_LLM,
-            "llm_retry_interval_sec": LLM_RETRY_INTERVAL_SEC,
-            "llm_retry_on_chunk_sent": LLM_RETRY_ON_CHUNK_SENT,
-            "use_livekit_fallback_adapter": USE_LIVEKIT_FALLBACK_ADAPTER,
-            "preemptive_generation": PREEMPTIVE_GENERATION,
-            "turn_detection_mode": TURN_DETECTION_MODE,
+            "llm_attempt_timeout_sec": routed_llm_metadata["complex"].attempt_timeout_sec
+            if "complex" in routed_llm_metadata
+            else LLM_ATTEMPT_TIMEOUT_SEC,
+            "llm_max_retry_per_llm": routed_llm_metadata["complex"].max_retry_per_llm
+            if "complex" in routed_llm_metadata
+            else LLM_MAX_RETRY_PER_LLM,
+            "llm_retry_interval_sec": routed_llm_metadata["complex"].retry_interval_sec
+            if "complex" in routed_llm_metadata
+            else LLM_RETRY_INTERVAL_SEC,
+            "llm_retry_on_chunk_sent": routed_llm_metadata["complex"].retry_on_chunk_sent
+            if "complex" in routed_llm_metadata
+            else LLM_RETRY_ON_CHUNK_SENT,
+            "use_livekit_fallback_adapter": routed_llm_metadata[
+                "complex"
+            ].uses_fallback_adapter
+            if "complex" in routed_llm_metadata
+            else USE_LIVEKIT_FALLBACK_ADAPTER,
+            "preemptive_generation": preemptive_generation,
+            "turn_detection_mode": configured_turn_detection_mode,
             "turn_endpointing_mode": endpointing_mode,
             "turn_min_endpointing_delay": min_endpointing_delay,
             "turn_max_endpointing_delay": max_endpointing_delay,
             "reply_watchdog_sec": REPLY_WATCHDOG_SEC,
-            "stt_early_interim_final_enabled": STT_EARLY_INTERIM_FINAL_ENABLED,
-            "stt_early_interim_final_delay_sec": STT_EARLY_INTERIM_FINAL_DELAY_SEC,
+            "stt_early_interim_final_enabled": _config_bool(
+                turn_config,
+                "early_interim_final_enabled",
+                STT_EARLY_INTERIM_FINAL_ENABLED,
+            ),
+            "stt_early_interim_final_delay_sec": _config_float(
+                turn_config,
+                "early_interim_final_delay_sec",
+                STT_EARLY_INTERIM_FINAL_DELAY_SEC,
+            ),
             "stt_early_interim_final_min_stable_interims": STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS,
             "voice_response_delay_sec": VOICE_RESPONSE_DELAY_SEC,
             "voice_response_delay_post_gap_sec": VOICE_RESPONSE_DELAY_POST_GAP_SEC,
@@ -3265,6 +4050,9 @@ async def my_agent(ctx: JobContext):
             "voice_emergency_audio_path": str(_EMERGENCY_AUDIO_PATH)
             if _EMERGENCY_AUDIO_PATH
             else None,
+            "voice_audio_cache_enabled": VOICE_AUDIO_CACHE_ENABLED,
+            "voice_audio_cache_dir": str(_VOICE_AUDIO_CACHE_DIR),
+            "voice_audio_cache_profile_id": voice_audio_cache.voice_profile_id,
         },
     )
 
@@ -3277,13 +4065,28 @@ async def my_agent(ctx: JobContext):
 
         err = getattr(ev, "error", None)
         err_type = str(getattr(err, "type", type(err).__name__))
-        if _EMERGENCY_AUDIO_PATH is not None:
+        emergency_audio_path = _EMERGENCY_AUDIO_PATH
+        if err_type == "tts_error":
+            emergency_audio_path = voice_audio_cache.get_existing(
+                kind="emergency",
+                text=VOICE_EMERGENCY_PHRASE,
+                legacy_path=_EMERGENCY_AUDIO_PATH,
+            )
+        else:
+            emergency_audio_path = await voice_audio_cache.get_or_create(
+                kind="emergency",
+                text=VOICE_EMERGENCY_PHRASE,
+                legacy_path=_EMERGENCY_AUDIO_PATH,
+            )
+
+        if emergency_audio_path is not None:
             played = await play_prerecorded_audio(
                 session=session,
-                audio_path=_EMERGENCY_AUDIO_PATH,
+                audio_path=emergency_audio_path,
                 sample_rate=audio_output_sample_rate,
                 allow_interruptions=False,
                 add_to_chat_ctx=False,
+                text=VOICE_EMERGENCY_PHRASE,
             )
             if played:
                 return
@@ -3822,25 +4625,12 @@ async def my_agent(ctx: JobContext):
             )
 
     try:
-        await ctx.connect()
-        participant = None
-        try:
-            participant = await asyncio.wait_for(
-                ctx.wait_for_participant(), timeout=3.0
-            )
-        except asyncio.TimeoutError:
-            logger.info(
-                "no participant available before prompt lookup; using file prompt"
-            )
-
-        sip_call_numbers = extract_sip_call_numbers(participant)
-        incident_log.set_context(**extract_sip_diagnostic_context(participant))
-        prompt_resolution = await resolve_prompt_for_call(**sip_call_numbers)
         logger.info(
             "prompt resolved",
             extra={
                 "source": prompt_resolution.source,
                 "sip_trunk_number": prompt_resolution.sip_trunk_number,
+                "gateway_number": sip_call_numbers["gateway_number"],
                 "sip_client_number": prompt_resolution.sip_client_number,
             },
         )
@@ -3866,6 +4656,7 @@ async def my_agent(ctx: JobContext):
                     "prompt_source": prompt_resolution.source,
                     "error": prompt_resolution.error,
                     "sip_trunk_number": prompt_resolution.sip_trunk_number,
+                    "gateway_number": sip_call_numbers["gateway_number"],
                     "sip_client_number": prompt_resolution.sip_client_number,
                 },
             )
@@ -3876,8 +4667,11 @@ async def my_agent(ctx: JobContext):
             routed_llm_providers=routed_llm_providers,
             routed_llm_metadata=routed_llm_metadata,
             fallback_llm=fallback_llm,
+            fallback_llm_provider=fallback_llm_provider_name,
             first_turn_short_greeting_audio_path=_SHORT_GREETING_AUDIO_PATH,
+            first_turn_short_greeting_phrase=VOICE_SHORT_GREETING_PHRASE,
             prerecorded_audio_sample_rate=audio_output_sample_rate,
+            voice_audio_cache=voice_audio_cache,
             voice_prompts=voice_prompts,
             tag_skill_runner=tag_skill_runner,
             prompt=prompt_resolution.prompt,
@@ -3924,13 +4718,25 @@ async def my_agent(ctx: JobContext):
             ),
             name="runtime_warmup_backends",
         )
-        played_initial_greeting = await play_prerecorded_audio(
-            session=session,
-            audio_path=_INITIAL_GREETING_AUDIO_PATH,
-            sample_rate=audio_output_sample_rate,
-            allow_interruptions=False,
-            add_to_chat_ctx=False,
+        initial_greeting = (
+            (prompt_resolution.initial_greeting or "").strip()
+            or VOICE_INITIAL_GREETING_PHRASE
         )
+        initial_greeting_audio_path = await voice_audio_cache.get_or_create(
+            kind="initial_greeting",
+            text=initial_greeting,
+            legacy_path=_INITIAL_GREETING_AUDIO_PATH,
+        )
+        played_initial_greeting = False
+        if initial_greeting_audio_path is not None:
+            played_initial_greeting = await play_prerecorded_audio(
+                session=session,
+                audio_path=initial_greeting_audio_path,
+                sample_rate=audio_output_sample_rate,
+                allow_interruptions=False,
+                add_to_chat_ctx=False,
+                text=initial_greeting,
+            )
         # Do not block call flow if warmup is still in progress.
         if runtime_warmup_task and not runtime_warmup_task.done():
             with suppress(Exception):
@@ -3941,8 +4747,8 @@ async def my_agent(ctx: JobContext):
         if not played_initial_greeting:
             await session.generate_reply(
                 instructions=(
-                    "Сразу после подключения поприветствуй клиента одной фразой: "
-                    "Здравствуйте! Это компания Кофемастер! Чем могу помочь?"
+                    "Сразу после подключения скажи клиенту ровно эту фразу: "
+                    f"{initial_greeting}"
                 )
             )
         await close_event.wait()

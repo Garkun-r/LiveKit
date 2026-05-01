@@ -24,7 +24,8 @@ grant write permissions to source client collections. Do not grant delete.
 Recommended readable fields:
 
 - `CallerID`: `CallerID`, `client_id`
-- `bot_configurations`: `client_id`, `system_prompt`, `examples`, `skills_name`
+- `bot_configurations`: `client_id`, `system_prompt`, `examples`, `skills_name`,
+  `first_step`
 - `clients`: `id`, `add_info`, `company_website`, `company_extra`
 - `clients_prompt`: `name`, `text`
 - `webparsing`: `url`, `text`
@@ -56,6 +57,7 @@ DIRECTUS_COLLECTION_CLIENTS_PROMPT=clients_prompt
 DIRECTUS_COLLECTION_WEBPARSING=webparsing
 DIRECTUS_COLLECTION_TRANSFER_NUMBER=transfer_number
 DIRECTUS_COLLECTION_CLIENT_PROMPT_CACHE=client_prompt_cache
+DIRECTUS_INITIAL_GREETING_FIELD=first_step
 ```
 
 If a collection API key differs from the display name in the Directus UI, set
@@ -79,6 +81,10 @@ Fields:
 The cached value must be a template, not a fully rendered prompt. Use
 `{{CURRENT_DATETIME_BLOCK}}` where the robot should inject fresh local company
 date and time on each call.
+
+Client-specific fixed greetings are read from `bot_configurations.first_step`
+by default. If the Directus API key differs from the UI label, set
+`DIRECTUS_INITIAL_GREETING_FIELD` to the real field key.
 
 ## Robot write-through cache
 

@@ -155,11 +155,22 @@ class _FakePromptSession:
         return self.handle
 
 
+class _FakeVoiceAudioCache:
+    def __init__(self, path) -> None:
+        self.path = path
+        self.calls: list[dict[str, object]] = []
+
+    async def get_or_create(self, *, kind: str, text: str, legacy_path=None):
+        self.calls.append({"kind": kind, "text": text, "legacy_path": legacy_path})
+        return self.path
+
+
 def _voice_prompt_manager(
     *,
     tmp_path,
     session: _FakePromptSession | None = None,
     background_audio: _FakeBackgroundAudio | None = None,
+    voice_audio_cache=None,
     response_delay_sec: float = 0.01,
     response_delay_post_gap_sec: float = 0.0,
     client_silence_sec: float = 0.01,
@@ -175,6 +186,7 @@ def _voice_prompt_manager(
     manager = agent.VoicePromptManager(
         session=session,
         background_audio=background_audio,
+        voice_audio_cache=voice_audio_cache,
         response_delay_prompt=agent.VoicePromptSpec(
             kind="response_delay",
             audio_paths=(response_delay_audio,),
@@ -406,6 +418,30 @@ async def test_response_delay_prompt_fires_after_timer(tmp_path) -> None:
     await manager.aclose()
 
     assert background_audio.played == [str(tmp_path / "response_delay.wav")]
+
+
+@pytest.mark.asyncio
+async def test_response_delay_prompt_uses_voice_audio_cache(tmp_path) -> None:
+    cached_path = tmp_path / "cached.wav"
+    cached_path.write_bytes(b"fake")
+    voice_audio_cache = _FakeVoiceAudioCache(cached_path)
+    manager, _, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        voice_audio_cache=voice_audio_cache,
+    )
+
+    manager.start_response_delay_timer()
+    await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    assert background_audio.played == [str(cached_path)]
+    assert voice_audio_cache.calls == [
+        {
+            "kind": "response_delay",
+            "text": "Секундочку.",
+            "legacy_path": tmp_path / "response_delay.wav",
+        }
+    ]
 
 
 @pytest.mark.asyncio

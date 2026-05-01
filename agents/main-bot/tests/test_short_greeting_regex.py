@@ -58,6 +58,25 @@ def test_extract_sip_call_numbers_prefers_mapped_x_did_attribute() -> None:
 
     assert result == {
         "sip_trunk_number": "9605669899",
+        "gateway_number": "9605669899",
+        "sip_client_number": "79990001122",
+    }
+
+
+def test_extract_sip_call_numbers_adds_gateway_number_from_x_did() -> None:
+    result = extract_sip_call_numbers(
+        _Participant(
+            attributes={
+                "sip.h.X-DID": "9605669899",
+                "sip.trunkPhoneNumber": "312388",
+                "sip.phoneNumber": "79990001122",
+            }
+        )
+    )
+
+    assert result == {
+        "sip_trunk_number": "9605669899",
+        "gateway_number": "9605669899",
         "sip_client_number": "79990001122",
     }
 
@@ -74,5 +93,6 @@ def test_extract_sip_call_numbers_falls_back_to_livekit_trunk_phone_number() -> 
 
     assert result == {
         "sip_trunk_number": "312388",
+        "gateway_number": "312388",
         "sip_client_number": "79990001122",
     }

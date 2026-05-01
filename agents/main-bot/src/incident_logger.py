@@ -290,7 +290,7 @@ async def insert_incident_via_directus(
     if not directus_url:
         raise RuntimeError("INCIDENT_DIRECTUS_URL is not set")
     if not directus_token:
-        raise RuntimeError("INCIDENT_DIRECTUS_TOKEN is not set")
+        raise RuntimeError("INCIDENT_DIRECTUS_TOKEN or DIRECTUS_TOKEN is not set")
 
     url = f"{directus_url.rstrip('/')}/items/robot_incidents"
     headers = {

@@ -22,6 +22,7 @@ from config import (
     DIRECTUS_COLLECTION_TRANSFER_NUMBER,
     DIRECTUS_COLLECTION_WEBPARSING,
     DIRECTUS_DEFAULT_TIMEZONE,
+    DIRECTUS_INITIAL_GREETING_FIELD,
     DIRECTUS_PROMPT_CACHE_TTL_SEC,
     DIRECTUS_REQUEST_TIMEOUT_SEC,
     DIRECTUS_TOKEN,
@@ -64,6 +65,7 @@ class PromptResolution:
     source: str
     sip_trunk_number: str | None = None
     sip_client_number: str | None = None
+    initial_greeting: str | None = None
     error: str | None = None
 
 
@@ -73,6 +75,7 @@ class _PromptTemplate:
     timezone: str
     source: str
     client_id: str | int | None = None
+    initial_greeting: str | None = None
 
 
 @dataclass
@@ -143,6 +146,9 @@ class DirectusPromptClient:
             timezone=_string_value(row.get("timezone")) or DIRECTUS_DEFAULT_TIMEZONE,
             source="directus:cache",
             client_id=_relation_id(row.get("client_id")),
+            initial_greeting=await self._fetch_initial_greeting(
+                _relation_id(row.get("client_id"))
+            ),
         )
 
     async def save_cached_prompt(
@@ -199,11 +205,7 @@ class DirectusPromptClient:
         if client_id is None:
             raise RuntimeError("Directus CallerID row has no client_id")
 
-        bot_config = await self._fetch_one(
-            DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
-            filters={"client_id": client_id},
-            fields=["client_id", "system_prompt", "examples", "skills_name"],
-        )
+        bot_config = await self._fetch_bot_config(client_id)
         if not bot_config:
             raise RuntimeError("Directus bot configuration not found")
 
@@ -244,7 +246,49 @@ class DirectusPromptClient:
             timezone=DIRECTUS_DEFAULT_TIMEZONE,
             source="directus:live",
             client_id=client_id,
+            initial_greeting=_string_value(
+                bot_config.get(DIRECTUS_INITIAL_GREETING_FIELD)
+            )
+            or None,
         )
+
+    async def _fetch_bot_config(self, client_id: str | int) -> dict[str, Any] | None:
+        fields = ["client_id", "system_prompt", "examples", "skills_name"]
+        if DIRECTUS_INITIAL_GREETING_FIELD:
+            fields.append(DIRECTUS_INITIAL_GREETING_FIELD)
+        try:
+            return await self._fetch_one(
+                DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
+                filters={"client_id": client_id},
+                fields=fields,
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code not in {400, 403} or not DIRECTUS_INITIAL_GREETING_FIELD:
+                raise
+            logger.info("Directus first-step greeting field is unavailable; retrying")
+            return await self._fetch_one(
+                DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
+                filters={"client_id": client_id},
+                fields=["client_id", "system_prompt", "examples", "skills_name"],
+            )
+
+    async def _fetch_initial_greeting(self, client_id: str | int | None) -> str | None:
+        if client_id is None or not DIRECTUS_INITIAL_GREETING_FIELD:
+            return None
+        try:
+            bot_config = await self._fetch_one(
+                DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
+                filters={"client_id": client_id},
+                fields=["client_id", DIRECTUS_INITIAL_GREETING_FIELD],
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code not in {400, 403, 404}:
+                raise
+            logger.info("Directus first-step greeting field is unavailable")
+            return None
+        if not bot_config:
+            return None
+        return _string_value(bot_config.get(DIRECTUS_INITIAL_GREETING_FIELD)) or None
 
     async def _fetch_client(self, client_id: str | int) -> dict[str, Any] | None:
         client = await self._fetch_one(
@@ -498,6 +542,7 @@ async def resolve_prompt_for_call(
         source=prompt_template.source,
         sip_trunk_number=normalized_trunk_number,
         sip_client_number=normalized_client_number,
+        initial_greeting=prompt_template.initial_greeting,
     )
 
 
@@ -623,6 +668,7 @@ def _get_memory_cached_prompt(caller_id: str) -> _PromptTemplate | None:
         timezone=entry.template.timezone,
         source="directus:memory_cache",
         client_id=entry.template.client_id,
+        initial_greeting=entry.template.initial_greeting,
     )
 
 

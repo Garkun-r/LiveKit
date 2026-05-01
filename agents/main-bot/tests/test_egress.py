@@ -38,6 +38,18 @@ def test_provider_override_and_proxy_url(monkeypatch) -> None:
     }
 
 
+def test_profile_egress_override_takes_priority(monkeypatch) -> None:
+    monkeypatch.setenv("EGRESS_PROXY_URL", "http://proxy.example:15182")
+    monkeypatch.setenv("XAI_EGRESS", "direct")
+
+    assert provider_egress("xai", mode_override="proxy") == "proxy"
+    assert provider_proxy_url("xai", mode_override="proxy") == "http://proxy.example:15182"
+    assert httpx_client_args("xai", mode_override="proxy") == {
+        "trust_env": False,
+        "proxy": "http://proxy.example:15182",
+    }
+
+
 def test_tbank_shared_egress_override(monkeypatch) -> None:
     monkeypatch.setenv("EGRESS_PROXY_URL", "http://proxy.example:15182")
     monkeypatch.setenv("TBANK_VOICEKIT_EGRESS", "proxy")

@@ -1,0 +1,2631 @@
+{
+    "source": "directus",
+    "setting_fields": [
+        {
+            "sort": 10,
+            "label": "LLM provider",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Основной провайдер языковой модели, через которого робот генерирует ответы и принимает решения в диалоге.",
+            "setting_key": "llm.provider",
+            "options_json": {
+                "choices": [
+                    "google",
+                    "xai"
+                ]
+            },
+            "default_value": "xai",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 20,
+            "label": "LLM model",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Идентификатор основной LLM-модели у выбранного провайдера. Неверное имя модели приведет к ошибке запроса к провайдеру.",
+            "setting_key": "llm.model",
+            "options_json": {
+            },
+            "default_value": "grok-4-1-fast-non-reasoning-latest",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 30,
+            "label": "LLM temperature",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Температура генерации LLM: чем выше значение, тем более вариативными могут быть ответы; чем ниже, тем они стабильнее и предсказуемее.",
+            "setting_key": "llm.temperature",
+            "options_json": {
+            },
+            "default_value": 0.3,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 2,
+                "min": 0,
+                "step": 0.1
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 40,
+            "label": "Enable tools",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Разрешает этой LLM-модели вызывать подключенные инструменты и функции. Отключайте, если модель должна только отвечать текстом.",
+            "setting_key": "llm.enable_tools",
+            "options_json": {
+            },
+            "default_value": false,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 45,
+            "label": "Global tools enabled",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Общий переключатель инструментов для LLM на уровне робота. Если он выключен, инструменты не должны использоваться даже при включении в отдельных профилях.",
+            "setting_key": "llm.global_tools_enabled",
+            "options_json": {
+            },
+            "default_value": false,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 50,
+            "label": "LLM base URL",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Базовый URL API провайдера LLM. Используется для прокси, региональных endpoint-ов или OpenAI-совместимых API.",
+            "setting_key": "llm.base_url",
+            "options_json": {
+            },
+            "default_value": "https://api.x.ai/v1",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 60,
+            "label": "Max output tokens",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "number",
+            "value_type": "integer",
+            "description": "Максимальное количество токенов, которое LLM может сгенерировать в одном ответе. Меньшее значение ограничивает длину и стоимость ответа.",
+            "setting_key": "llm.max_output_tokens",
+            "options_json": {
+            },
+            "default_value": 512,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 8192,
+                "min": 1,
+                "step": 1
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 70,
+            "label": "Top P",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Порог nucleus sampling для LLM: модель выбирает продолжение из наиболее вероятных токенов, суммарная вероятность которых не выше этого значения.",
+            "setting_key": "llm.top_p",
+            "options_json": {
+            },
+            "default_value": 1.0,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 1,
+                "min": 0,
+                "step": 0.05
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 80,
+            "label": "Thinking level",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Уровень внутреннего рассуждения для моделей Gemini, которые поддерживают thinking. Более высокий уровень может улучшить сложные ответы, но увеличивает задержку.",
+            "setting_key": "llm.thinking_level",
+            "options_json": {
+                "choices": [
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high"
+                ]
+            },
+            "default_value": "minimal",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 86,
+            "label": "Провайдер запасной модели",
+            "scope": "profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Провайдер, который используется как резерв для этого LLM-профиля. Обычно google, если основная модель xAI или Gemini.",
+            "setting_key": "llm.fallback_provider",
+            "options_json": {
+                "choices": [
+                    {
+                        "label": "Google Gemini",
+                        "value": "google"
+                    },
+                    {
+                        "label": "xAI Grok",
+                        "value": "xai"
+                    }
+                ]
+            },
+            "default_value": "google",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": true,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 87,
+            "label": "Запасная модель",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Модель, которая используется как резерв внутри этого LLM-профиля. Например, легкая Gemini-модель для быстрого восстановления ответа.",
+            "setting_key": "llm.fallback_model",
+            "options_json": {
+                "choices": [
+                    {
+                        "label": "Gemini 3.1 Flash Lite Preview",
+                        "value": "gemini-3.1-flash-lite-preview"
+                    },
+                    {
+                        "label": "Gemini 3 Flash Preview",
+                        "value": "gemini-3-flash-preview"
+                    },
+                    {
+                        "label": "Grok 4.1 Fast",
+                        "value": "grok-4-1-fast-non-reasoning-latest"
+                    }
+                ]
+            },
+            "default_value": "gemini-3.1-flash-lite-preview",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": true,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 88,
+            "label": "LiveKit FallbackAdapter",
+            "scope": "profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Если включено, LiveKit сам переключает этот LLM-профиль на запасную модель при ошибке или таймауте.",
+            "setting_key": "llm.use_livekit_fallback_adapter",
+            "options_json": {
+            },
+            "default_value": true,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": true,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 90,
+            "label": "Таймаут попытки LLM",
+            "scope": "profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Сколько секунд ждать текущую LLM-попытку перед переключением на запасную модель через LiveKit FallbackAdapter.",
+            "setting_key": "llm.attempt_timeout_sec",
+            "options_json": {
+            },
+            "default_value": 2.5,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 15,
+                "min": 0.5,
+                "step": 0.1
+            },
+            "requires_restart": true,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 92,
+            "label": "Повторы на одну LLM",
+            "scope": "profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "number",
+            "value_type": "integer",
+            "description": "Сколько повторов делать на той же LLM перед переходом дальше по fallback-цепочке. Для живого звонка обычно 0.",
+            "setting_key": "llm.max_retry_per_llm",
+            "options_json": {
+            },
+            "default_value": 0,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 3,
+                "min": 0,
+                "step": 1
+            },
+            "requires_restart": true,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 94,
+            "label": "Пауза между повторами LLM",
+            "scope": "profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Пауза между retry-попытками LLM. Используется только если повторы больше нуля.",
+            "setting_key": "llm.retry_interval_sec",
+            "options_json": {
+            },
+            "default_value": 0.3,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 3,
+                "min": 0,
+                "step": 0.1
+            },
+            "requires_restart": true,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 96,
+            "label": "Fallback после первого чанка",
+            "scope": "profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Разрешает переключаться на другую LLM даже если первая уже начала отдавать текст. Для голосового звонка безопаснее держать выключенным.",
+            "setting_key": "llm.retry_on_chunk_sent",
+            "options_json": {
+            },
+            "default_value": false,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": true,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 98,
+            "label": "Маршрут сети",
+            "scope": "profile",
+            "active": true,
+            "module": "llm",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Как LLM-провайдер должен выходить в интернет для этого профиля: напрямую или через прокси. Для Asterisk можно выбрать proxy.",
+            "setting_key": "llm.egress",
+            "options_json": {
+                "choices": [
+                    {
+                        "label": "Direct",
+                        "value": "direct"
+                    },
+                    {
+                        "label": "Proxy",
+                        "value": "proxy"
+                    }
+                ]
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": true,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 98,
+            "label": "Маршрут сети",
+            "scope": "profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Как STT-провайдер должен выходить в интернет для этого профиля: напрямую или через прокси. Для Asterisk можно выбрать proxy.",
+            "setting_key": "stt.egress",
+            "options_json": {
+                "choices": [
+                    {
+                        "label": "Direct",
+                        "value": "direct"
+                    },
+                    {
+                        "label": "Proxy",
+                        "value": "proxy"
+                    }
+                ]
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": true,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 98,
+            "label": "Маршрут сети",
+            "scope": "profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Как TTS-провайдер должен выходить в интернет для этого профиля: напрямую или через прокси. Для Asterisk можно выбрать proxy.",
+            "setting_key": "tts.egress",
+            "options_json": {
+                "choices": [
+                    {
+                        "label": "Direct",
+                        "value": "direct"
+                    },
+                    {
+                        "label": "Proxy",
+                        "value": "proxy"
+                    }
+                ]
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": true,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 100,
+            "label": "TTS provider",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Провайдер синтеза речи, который озвучивает ответы робота.",
+            "setting_key": "tts.provider",
+            "options_json": {
+                "choices": [
+                    "elevenlabs",
+                    "google",
+                    "vertex",
+                    "minimax",
+                    "cosyvoice",
+                    "tbank",
+                    "sber"
+                ]
+            },
+            "default_value": "elevenlabs",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 110,
+            "label": "Быстрая LLM",
+            "scope": "binding",
+            "active": true,
+            "module": "llm_routing",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "LLM-профиль для быстрых коротких реплик. Fallback берется из выбранного LLM-профиля.",
+            "setting_key": "llm_routing.fast_profile",
+            "options_json": {
+                "filter": {
+                    "kind": "llm"
+                },
+                "source": "robot_component_profiles"
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": true,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 110,
+            "label": "TTS model",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Идентификатор модели синтеза речи у выбранного TTS-провайдера. Влияет на качество, выразительность, задержку и доступные голоса.",
+            "setting_key": "tts.model",
+            "options_json": {
+            },
+            "default_value": "eleven_v3",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 112,
+            "label": "Умная LLM",
+            "scope": "binding",
+            "active": true,
+            "module": "llm_routing",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "LLM-профиль для сложных реплик и основного рассуждения. Fallback берется из выбранного LLM-профиля.",
+            "setting_key": "llm_routing.complex_profile",
+            "options_json": {
+                "filter": {
+                    "kind": "llm"
+                },
+                "source": "robot_component_profiles"
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": true,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 120,
+            "label": "Voice id",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Идентификатор голоса у TTS-провайдера. Это не секретный ключ, а выбранный голос или voice id для синтеза.",
+            "setting_key": "tts.voice_id",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 121,
+            "label": "Text normalization",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Режим нормализации текста перед синтезом, например преобразование чисел и дат в произносимую форму. Может влиять на задержку и произношение.",
+            "setting_key": "tts.apply_text_normalization",
+            "options_json": {
+            },
+            "default_value": "auto",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 122,
+            "label": "Enable provider logging",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Разрешает логирование запроса на стороне TTS-провайдера, если провайдер это поддерживает. Отключение может включать режим без сохранения истории, но зависит от тарифа.",
+            "setting_key": "tts.enable_logging",
+            "options_json": {
+            },
+            "default_value": false,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 123,
+            "label": "TTS language",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Язык или локаль синтеза речи. Помогает провайдеру выбрать правильное произношение и правила нормализации текста.",
+            "setting_key": "tts.language",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 124,
+            "label": "Voice name",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Имя голоса у провайдера, если провайдер использует название голоса вместо отдельного voice id.",
+            "setting_key": "tts.voice_name",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 125,
+            "label": "Voice speed override",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Скорость голоса для провайдеров, где она задается отдельно от общего speed/rate. Значение 1 обычно означает стандартную скорость.",
+            "setting_key": "tts.voice_speed",
+            "options_json": {
+            },
+            "default_value": null,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 2,
+                "min": 0.5,
+                "step": 0.05
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 126,
+            "label": "Voice style",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Степень усиления стиля или эмоциональной манеры голоса, если провайдер поддерживает такой параметр. Высокие значения могут увеличить выразительность и нестабильность.",
+            "setting_key": "tts.voice_style",
+            "options_json": {
+            },
+            "default_value": null,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 1,
+                "min": 0,
+                "step": 0.05
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 127,
+            "label": "Speaker boost",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Усиливает сходство с исходным голосом, если провайдер поддерживает speaker boost. Может немного увеличить задержку синтеза.",
+            "setting_key": "tts.voice_use_speaker_boost",
+            "options_json": {
+            },
+            "default_value": null,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 128,
+            "label": "Use stream input",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Использует потоковую отправку текста в TTS через WebSocket или аналогичный stream-input режим. Обычно снижает задержку первого аудио.",
+            "setting_key": "tts.use_stream_input",
+            "options_json": {
+            },
+            "default_value": false,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 129,
+            "label": "Use streaming",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Включает потоковый режим синтеза, чтобы робот мог начать воспроизведение до завершения генерации всего аудио.",
+            "setting_key": "tts.use_streaming",
+            "options_json": {
+            },
+            "default_value": true,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 130,
+            "label": "Fallback TTS model",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Резервная TTS-модель у того же провайдера, которую можно использовать при недоступности или неподходящем поведении основной модели.",
+            "setting_key": "tts.fallback_model",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 130,
+            "label": "Voice speed",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Общая скорость произношения для TTS-провайдера. Значение 1 обычно означает нормальную скорость; выше быстрее, ниже медленнее.",
+            "setting_key": "tts.speed",
+            "options_json": {
+            },
+            "default_value": 1.0,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 2,
+                "min": 0.5,
+                "step": 0.05
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 131,
+            "label": "Speaking rate",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Скорость речи в формате Google Cloud TTS и совместимых провайдеров. Значение 1.0 обычно означает естественную скорость выбранного голоса.",
+            "setting_key": "tts.speaking_rate",
+            "options_json": {
+            },
+            "default_value": 1.0,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 4,
+                "min": 0.25,
+                "step": 0.05
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 132,
+            "label": "Pitch",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Высота голоса или тон синтеза. Диапазон и смысл зависят от провайдера: у одних это полутона, у других множитель или условная шкала.",
+            "setting_key": "tts.pitch",
+            "options_json": {
+            },
+            "default_value": 0,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 20,
+                "min": -20,
+                "step": 0.5
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 133,
+            "label": "Audio format",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Формат аудио, который должен вернуть TTS-провайдер, например mp3, pcm, wav или opus.",
+            "setting_key": "tts.format",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 134,
+            "label": "Audio bitrate",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "number",
+            "value_type": "integer",
+            "description": "Битрейт выходного аудио, если провайдер позволяет его задавать. Влияет на размер потока и качество сжатого аудио.",
+            "setting_key": "tts.bitrate",
+            "options_json": {
+            },
+            "default_value": null,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 320000,
+                "min": 8000,
+                "step": 1000
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 135,
+            "label": "Audio channels",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "number",
+            "value_type": "integer",
+            "description": "Количество аудиоканалов в результате синтеза: обычно 1 для телефонии и голосовых роботов, 2 для стерео-сценариев.",
+            "setting_key": "tts.channel",
+            "options_json": {
+            },
+            "default_value": 1,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 2,
+                "min": 1,
+                "step": 1
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 136,
+            "label": "Intensity",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Параметр выразительности или интенсивности голоса для провайдеров, которые поддерживают модификацию тембра и подачи.",
+            "setting_key": "tts.intensity",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 137,
+            "label": "Timbre",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Параметр тембра голоса для провайдеров, которые позволяют менять окраску звучания без выбора другого voice id.",
+            "setting_key": "tts.timbre",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 138,
+            "label": "Sound effects",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Идентификатор или список звуковых эффектов, применяемых TTS-провайдером к синтезированной речи, если такая функция поддерживается.",
+            "setting_key": "tts.sound_effects",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 139,
+            "label": "Provider profile",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Внутренний пресет профиля TTS в проекте. Используется для быстрого выбора набора модели, региона, формата и параметров качества.",
+            "setting_key": "tts.profile",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 140,
+            "label": "Output format",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Формат выходного аудио в синтаксисе конкретного провайдера, например codec_sample-rate_bitrate у ElevenLabs.",
+            "setting_key": "tts.output_format",
+            "options_json": {
+            },
+            "default_value": "pcm_24000",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 140,
+            "label": "Transport",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Транспорт TTS-запросов: HTTP для обычных запросов или WebSocket для потокового синтеза с меньшей задержкой.",
+            "setting_key": "tts.transport",
+            "options_json": {
+                "choices": [
+                    "http",
+                    "websocket"
+                ]
+            },
+            "default_value": "websocket",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 141,
+            "label": "Region",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Регион TTS-провайдера или облачной платформы. Влияет на доступность модели, маршрут запроса и задержку.",
+            "setting_key": "tts.region",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 142,
+            "label": "WebSocket URL",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "WebSocket endpoint TTS-провайдера для потокового синтеза. Не является секретом, но должен соответствовать выбранному региону и провайдеру.",
+            "setting_key": "tts.ws_url",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 143,
+            "label": "Voice mode",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Режим выбора голоса у провайдера: готовый голос, клонированный голос или дизайнерский голос, если такие режимы поддерживаются.",
+            "setting_key": "tts.voice_mode",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 144,
+            "label": "Clone voice id",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Идентификатор клонированного голоса, который используется, когда voice mode выбран как clone.",
+            "setting_key": "tts.clone_voice_id",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 145,
+            "label": "Design voice id",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Идентификатор дизайнерского или созданного голосового профиля, который используется, когда voice mode выбран как design.",
+            "setting_key": "tts.design_voice_id",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 146,
+            "label": "Rate",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Скорость речи для провайдеров, где параметр называется rate. Обычно 1.0 означает стандартную скорость, выше быстрее, ниже медленнее.",
+            "setting_key": "tts.rate",
+            "options_json": {
+            },
+            "default_value": 1.0,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 4,
+                "min": 0.25,
+                "step": 0.05
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 147,
+            "label": "Volume",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Громкость синтезированной речи в шкале провайдера. Не заменяет нормализацию аудио в телефонии, но влияет на уровень результата TTS.",
+            "setting_key": "tts.volume",
+            "options_json": {
+            },
+            "default_value": 1.0,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 100,
+                "min": 0,
+                "step": 0.5
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 148,
+            "label": "Connection reuse",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Разрешает переиспользовать потоковое соединение с TTS-провайдером между фрагментами, чтобы уменьшить накладные расходы и задержку.",
+            "setting_key": "tts.connection_reuse",
+            "options_json": {
+            },
+            "default_value": true,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 149,
+            "label": "Playback on first chunk",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Разрешает начинать воспроизведение сразу после первого полученного аудиофрагмента, не дожидаясь полного ответа TTS.",
+            "setting_key": "tts.playback_on_first_chunk",
+            "options_json": {
+            },
+            "default_value": true,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 150,
+            "label": "API key env name",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Имя env-переменной, где лежит API-ключ TTS-провайдера. Здесь хранится только имя переменной, не сам секрет.",
+            "setting_key": "tts.api_key_env_name",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 150,
+            "label": "Minimum sentence length",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "integer",
+            "description": "Минимальная длина текстового фрагмента перед отправкой в потоковый TTS. Меньше значение ускоряет старт, но может ухудшить интонацию.",
+            "setting_key": "tts.min_sentence_len",
+            "options_json": {
+            },
+            "default_value": 6,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 40,
+                "min": 1,
+                "step": 1
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 151,
+            "label": "Voice",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Имя или идентификатор голоса у провайдера, если интеграция использует поле voice вместо voice_id или voice_name.",
+            "setting_key": "tts.voice",
+            "options_json": {
+            },
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 152,
+            "label": "Paint pitch",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Параметр Sber SaluteSpeech для SSML-тега paint: управляет акцентом по высоте тона в выделенном фрагменте речи.",
+            "setting_key": "tts.paint_pitch",
+            "options_json": {
+            },
+            "default_value": null,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 10,
+                "min": -10,
+                "step": 0.5
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 153,
+            "label": "Paint speed",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Параметр Sber SaluteSpeech для SSML-тега paint: управляет акцентом по скорости произношения в выделенном фрагменте речи.",
+            "setting_key": "tts.paint_speed",
+            "options_json": {
+            },
+            "default_value": null,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 10,
+                "min": 0,
+                "step": 0.5
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 154,
+            "label": "Paint loudness",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Параметр Sber SaluteSpeech для SSML-тега paint: управляет акцентом по громкости в выделенном фрагменте речи.",
+            "setting_key": "tts.paint_loudness",
+            "options_json": {
+            },
+            "default_value": null,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 10,
+                "min": 0,
+                "step": 0.5
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 160,
+            "label": "Stream context length",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "integer",
+            "description": "Сколько предыдущих фраз передавать TTS-провайдеру как контекст для более плавной интонации при склейке потоковых фрагментов.",
+            "setting_key": "tts.stream_context_len",
+            "options_json": {
+            },
+            "default_value": 2,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 10,
+                "min": 0,
+                "step": 1
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 170,
+            "label": "Voice stability",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Стабильность голоса ElevenLabs: выше значение дает более одинаковое звучание между генерациями, ниже может добавить эмоциональный разброс.",
+            "setting_key": "tts.voice_stability",
+            "options_json": {
+            },
+            "default_value": null,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 1,
+                "min": 0,
+                "step": 0.05
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 180,
+            "label": "Voice similarity boost",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Степень сходства ElevenLabs с исходным голосом. Более высокое значение сильнее удерживает voice id, но может влиять на естественность.",
+            "setting_key": "tts.voice_similarity_boost",
+            "options_json": {
+            },
+            "default_value": null,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 1,
+                "min": 0,
+                "step": 0.05
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 190,
+            "label": "TTS base URL",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Базовый URL API TTS-провайдера. Используется для региональных endpoint-ов, прокси или альтернативных совместимых API.",
+            "setting_key": "tts.base_url",
+            "options_json": {
+            },
+            "default_value": "https://api-uw.minimax.io",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 195,
+            "label": "Language boost",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Подсказка TTS-провайдеру о языке текста, например Russian. Помогает улучшить произношение и выбор языковых правил.",
+            "setting_key": "tts.language_boost",
+            "options_json": {
+            },
+            "default_value": "Russian",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 196,
+            "label": "Sample rate",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "integer",
+            "description": "Частота дискретизации выходного аудио в герцах. Для телефонии и LiveKit важно выбирать значение, совместимое с пайплайном и форматом.",
+            "setting_key": "tts.sample_rate",
+            "options_json": {
+                "choices": [
+                    16000,
+                    22050,
+                    24000,
+                    32000,
+                    44100,
+                    48000
+                ]
+            },
+            "default_value": 24000,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 197,
+            "label": "TTS prompt",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "textarea",
+            "value_type": "string",
+            "description": "Стилевой prompt для TTS-моделей, которые принимают инструкцию к манере речи: акцент, тон, темп, естественность и другие голосовые требования.",
+            "setting_key": "tts.prompt",
+            "options_json": {
+            },
+            "default_value": "Speak only in Russian. Use pure standard Russian pronunciation with no foreign accent. Sound like a real human receptionist speaking on the phone. Be natural, calm, polite, and professional. Use short, clear, conversational sentences. Keep a medium pace and clear articulation. Use subtle human-like intonation variation. Avoid sounding robotic, theatrical, salesy, or overly cheerful.",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 198,
+            "label": "TTS location",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "tts",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Локация или регион облачного TTS-сервиса. Используется провайдерами, где модель или endpoint выбираются по региону.",
+            "setting_key": "tts.location",
+            "options_json": {
+            },
+            "default_value": "global",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 200,
+            "label": "STT provider",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Провайдер распознавания речи, который превращает аудио пользователя в текст для дальнейшей обработки агентом.",
+            "setting_key": "stt.provider",
+            "options_json": {
+                "choices": [
+                    "deepgram",
+                    "inference",
+                    "google",
+                    "yandex",
+                    "tbank"
+                ]
+            },
+            "default_value": "deepgram",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 210,
+            "label": "STT model",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Идентификатор модели распознавания речи у выбранного STT-провайдера. Влияет на качество, задержку и поддержку языков.",
+            "setting_key": "stt.model",
+            "options_json": {
+            },
+            "default_value": "nova-3",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 220,
+            "label": "STT language",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Язык распознавания речи в формате провайдера, например ru или ru-RU. Неверный язык ухудшает качество транскрибации.",
+            "setting_key": "stt.language",
+            "options_json": {
+            },
+            "default_value": "ru",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 230,
+            "label": "Endpointing ms",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "integer",
+            "description": "Пауза тишины в миллисекундах, после которой STT-провайдер считает фразу завершенной. Меньше значение быстрее отвечает, больше значение лучше переживает паузы внутри фразы.",
+            "setting_key": "stt.endpointing_ms",
+            "options_json": {
+            },
+            "default_value": 90,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 1000,
+                "min": 25,
+                "step": 5
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 240,
+            "label": "STT location",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Регион или локация облачного STT-сервиса. Используется провайдерами, где endpoint или доступность модели зависят от региона.",
+            "setting_key": "stt.location",
+            "options_json": {
+            },
+            "default_value": "global",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 240,
+            "label": "Max pause hint ms",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "integer",
+            "description": "Подсказка для Yandex SpeechKit: максимальная пауза между словами в миллисекундах, которая еще считается частью одной фразы.",
+            "setting_key": "stt.max_pause_between_words_hint_ms",
+            "options_json": {
+            },
+            "default_value": 500,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 3000,
+                "min": 0,
+                "step": 50
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 250,
+            "label": "Early interim final",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Включает внутренний механизм, который может превратить последний interim-текст STT в финальный, если провайдер задерживает финализацию после конца речи.",
+            "setting_key": "stt.early_interim_final_enabled",
+            "options_json": {
+            },
+            "default_value": true,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 260,
+            "label": "Early interim delay",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Сколько секунд ждать финальный результат STT после конца речи перед использованием последнего стабильного interim-текста как финального.",
+            "setting_key": "stt.early_interim_final_delay_sec",
+            "options_json": {
+            },
+            "default_value": 0.15,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 1,
+                "min": 0,
+                "step": 0.01
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 300,
+            "label": "Turn detection mode",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "turn",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Способ определения конца реплики пользователя: VAD по тишине, STT endpointing, multilingual end-of-turn модель или ручной режим, если он поддержан кодом.",
+            "setting_key": "turn.detection_mode",
+            "options_json": {
+                "choices": [
+                    "vad",
+                    "stt",
+                    "multilingual"
+                ]
+            },
+            "default_value": "vad",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 310,
+            "label": "Endpointing mode",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "turn",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Режим задержки после конца речи: fixed использует постоянный интервал, dynamic подстраивает задержку в пределах min/max по статистике пауз.",
+            "setting_key": "turn.endpointing_mode",
+            "options_json": {
+                "choices": [
+                    "fixed",
+                    "dynamic"
+                ]
+            },
+            "default_value": "fixed",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 320,
+            "label": "Minimum endpointing delay",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "turn",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Минимальная задержка в секундах после предполагаемого конца речи перед ответом робота. Меньше значение ускоряет реакцию, но повышает риск перебить пользователя.",
+            "setting_key": "turn.min_endpointing_delay",
+            "options_json": {
+            },
+            "default_value": 0.25,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 2,
+                "min": 0,
+                "step": 0.05
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 330,
+            "label": "Maximum endpointing delay",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "turn",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Максимальная задержка в секундах, до которой робот может ждать перед ответом, если endpointing считает, что пользователь мог продолжить мысль.",
+            "setting_key": "turn.max_endpointing_delay",
+            "options_json": {
+            },
+            "default_value": 0.5,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 5,
+                "min": 0,
+                "step": 0.05
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 340,
+            "label": "Preemptive generation",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "turn",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Разрешает LiveKit начинать генерацию ответа до окончательной фиксации пользовательской реплики. Это снижает задержку, но может давать ошибки при неверном определении конца речи.",
+            "setting_key": "turn.preemptive_generation",
+            "options_json": {
+            },
+            "default_value": true,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 350,
+            "label": "Early interim final",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "turn",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Включает проектный механизм ранней финализации: при VAD-режиме робот может принять последний стабильный interim STT как финальный текст после конца речи.",
+            "setting_key": "turn.early_interim_final_enabled",
+            "options_json": {
+            },
+            "default_value": true,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 360,
+            "label": "Early interim final delay",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "turn",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Задержка в секундах перед ранней финализацией interim STT после END_OF_SPEECH. Больше значение дает шанс дождаться настоящего final от провайдера.",
+            "setting_key": "turn.early_interim_final_delay_sec",
+            "options_json": {
+            },
+            "default_value": 0.15,
+            "schema_version": 1,
+            "validation_json": {
+                "max": 2,
+                "min": 0,
+                "step": 0.05
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 400,
+            "label": "Use LiveKit fallback adapter",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "fallback",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Включает встроенный LiveKit fallback для LLM: при ошибке основной модели агент может использовать заранее указанный резервный профиль вместо ручного обходного пути.",
+            "setting_key": "fallback.use_livekit_adapter",
+            "options_json": {
+            },
+            "default_value": true,
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 410,
+            "label": "Fast backup provider",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "fallback",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Провайдер резервной быстрой LLM-ветки, которая используется для коротких и срочных ответов при отказе основной быстрой модели.",
+            "setting_key": "fallback.fast_backup_provider",
+            "options_json": {
+                "choices": [
+                    "disabled",
+                    "google",
+                    "xai"
+                ]
+            },
+            "default_value": "google",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 420,
+            "label": "Fast backup model",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "fallback",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Имя модели у резервного провайдера для быстрой LLM-ветки. Должно соответствовать формату выбранного провайдера.",
+            "setting_key": "fallback.fast_backup_model",
+            "options_json": {
+            },
+            "default_value": "gemini-3.1-flash-lite-preview",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 430,
+            "label": "Complex backup provider",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "fallback",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Провайдер резервной сложной LLM-ветки, которая используется для более тяжелых рассуждений при отказе основной сложной модели.",
+            "setting_key": "fallback.complex_backup_provider",
+            "options_json": {
+                "choices": [
+                    "disabled",
+                    "google",
+                    "xai"
+                ]
+            },
+            "default_value": "google",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        },
+        {
+            "sort": 440,
+            "label": "Complex backup model",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "fallback",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Имя модели у резервного провайдера для сложной LLM-ветки. Должно соответствовать формату выбранного провайдера.",
+            "setting_key": "fallback.complex_backup_model",
+            "options_json": {
+            },
+            "default_value": "gemini-3.1-flash-lite-preview",
+            "schema_version": 1,
+            "validation_json": {
+            },
+            "requires_restart": false,
+            "visible_when_json": {
+            }
+        }
+    ],
+    "profile_bindings": [
+        {
+            "note": "Asterisk primary LLM through proxy.",
+            "slot": "primary",
+            "sort": 10,
+            "active": true,
+            "category": "llm",
+            "owner_key": "asterisk",
+            "owner_type": "runtime",
+            "profile_key": "llm_xai_proxy"
+        },
+        {
+            "note": "Asterisk complex LLM through proxy.",
+            "slot": "complex",
+            "sort": 30,
+            "active": true,
+            "category": "llm_routing",
+            "owner_key": "asterisk",
+            "owner_type": "runtime",
+            "profile_key": "llm_google_proxy"
+        },
+        {
+            "note": "Asterisk fast LLM through proxy.",
+            "slot": "fast",
+            "sort": 20,
+            "active": true,
+            "category": "llm_routing",
+            "owner_key": "asterisk",
+            "owner_type": "runtime",
+            "profile_key": "llm_xai_proxy"
+        },
+        {
+            "note": "Asterisk primary STT through proxy.",
+            "slot": "primary",
+            "sort": 50,
+            "active": true,
+            "category": "stt",
+            "owner_key": "asterisk",
+            "owner_type": "runtime",
+            "profile_key": "stt_deepgram_proxy"
+        },
+        {
+            "note": "Asterisk primary TTS through proxy.",
+            "slot": "primary",
+            "sort": 40,
+            "active": true,
+            "category": "tts",
+            "owner_key": "asterisk",
+            "owner_type": "runtime",
+            "profile_key": "tts_elevenlabs_v3_proxy"
+        },
+        {
+            "note": "Профиль fallback из текущего env",
+            "slot": "selected",
+            "sort": 70,
+            "active": true,
+            "category": "fallback",
+            "owner_key": "base",
+            "owner_type": "runtime",
+            "profile_key": "fallback_google_lite"
+        },
+        {
+            "note": "Основной LLM-профиль из текущего env",
+            "slot": "primary",
+            "sort": 10,
+            "active": true,
+            "category": "llm",
+            "owner_key": "base",
+            "owner_type": "runtime",
+            "profile_key": "llm_xai"
+        },
+        {
+            "note": "Основной STT-профиль из текущего env",
+            "slot": "primary",
+            "sort": 50,
+            "active": true,
+            "category": "stt",
+            "owner_key": "base",
+            "owner_type": "runtime",
+            "profile_key": "stt_deepgram_ru_phone"
+        },
+        {
+            "note": "Основной TTS-профиль из текущего env",
+            "slot": "primary",
+            "sort": 40,
+            "active": true,
+            "category": "tts",
+            "owner_key": "base",
+            "owner_type": "runtime",
+            "profile_key": "tts_elevenlabs_v3"
+        },
+        {
+            "note": "Профиль пауз и перебиваний из текущего env",
+            "slot": "selected",
+            "sort": 60,
+            "active": true,
+            "category": "turn",
+            "owner_key": "base",
+            "owner_type": "runtime",
+            "profile_key": "turn_fast_phone"
+        }
+    ],
+    "project_profiles": [
+    ],
+    "runtime_profiles": [
+        {
+            "active": true,
+            "status": "draft",
+            "agent_name": "main-bot",
+            "environment": "asterisk",
+            "llm_profile": null,
+            "runtime_key": "asterisk",
+            "stt_profile": null,
+            "tts_profile": null,
+            "display_name": "Asterisk",
+            "turn_profile": null,
+            "override_json": {
+            },
+            "fallback_profile": null,
+            "fast_llm_profile": null,
+            "complex_llm_profile": null
+        },
+        {
+            "active": true,
+            "status": "draft",
+            "agent_name": "main-bot",
+            "environment": "base",
+            "llm_profile": null,
+            "runtime_key": "base",
+            "stt_profile": null,
+            "tts_profile": null,
+            "display_name": "Основная",
+            "turn_profile": null,
+            "override_json": {
+            },
+            "fallback_profile": null,
+            "fast_llm_profile": null,
+            "complex_llm_profile": null
+        },
+        {
+            "active": true,
+            "status": "draft",
+            "agent_name": "main-bot",
+            "environment": "livekit_cloud",
+            "llm_profile": null,
+            "runtime_key": "livekit_cloud",
+            "stt_profile": null,
+            "tts_profile": null,
+            "display_name": "LiveKit Cloud",
+            "turn_profile": null,
+            "override_json": {
+            },
+            "fallback_profile": null,
+            "fast_llm_profile": null,
+            "complex_llm_profile": null
+        },
+        {
+            "active": true,
+            "status": "draft",
+            "agent_name": "main-bot",
+            "environment": "mac",
+            "llm_profile": null,
+            "runtime_key": "mac",
+            "stt_profile": null,
+            "tts_profile": null,
+            "display_name": "Mac",
+            "turn_profile": null,
+            "override_json": {
+            },
+            "fallback_profile": null,
+            "fast_llm_profile": null,
+            "complex_llm_profile": null
+        }
+    ],
+    "snapshot_version": 1,
+    "component_profiles": [
+        {
+            "kind": "fallback",
+            "active": true,
+            "provider": "livekit",
+            "config_json": {
+                "fast_backup_model": "gemini-3.1-flash-lite-preview",
+                "use_livekit_adapter": true,
+                "complex_backup_model": "gemini-3.1-flash-lite-preview",
+                "fast_backup_provider": "google",
+                "complex_backup_provider": "google"
+            },
+            "description": "LLM fallback settings synchronized from current .env.local.",
+            "profile_key": "fallback_google_lite",
+            "display_name": "LLM fallback current env",
+            "schema_version": 1
+        },
+        {
+            "kind": "llm",
+            "active": true,
+            "provider": "google",
+            "config_json": {
+                "model": "gemini-3-flash-preview",
+                "top_p": 1.0,
+                "provider": "google",
+                "api_key_ref": "GOOGLE_API_KEY",
+                "temperature": 0.7,
+                "fallback_model": "gemini-3.1-flash-lite-preview",
+                "thinking_level": "minimal",
+                "fallback_provider": "google",
+                "max_output_tokens": 512,
+                "max_retry_per_llm": 0,
+                "retry_interval_sec": 0.3,
+                "attempt_timeout_sec": 2.5,
+                "retry_on_chunk_sent": false,
+                "use_livekit_fallback_adapter": true
+            },
+            "description": "Non-secret Gemini LLM profile synchronized from current .env.local.",
+            "profile_key": "llm_gemini",
+            "display_name": "Google Gemini current env",
+            "schema_version": 1
+        },
+        {
+            "kind": "llm",
+            "active": true,
+            "provider": "google",
+            "config_json": {
+                "model": "gemini-3-flash-preview",
+                "top_p": 1.0,
+                "egress": "proxy",
+                "provider": "google",
+                "api_key_ref": "GOOGLE_API_KEY",
+                "temperature": 0.7,
+                "fallback_model": "gemini-3.1-flash-lite-preview",
+                "thinking_level": "minimal",
+                "fallback_provider": "google",
+                "max_output_tokens": 512,
+                "max_retry_per_llm": 0,
+                "retry_interval_sec": 0.3,
+                "attempt_timeout_sec": 2.5,
+                "retry_on_chunk_sent": false,
+                "use_livekit_fallback_adapter": true
+            },
+            "description": "Google Gemini LLM profile routed through proxy for the Asterisk runtime.",
+            "profile_key": "llm_google_proxy",
+            "display_name": "Google Gemini · Proxy",
+            "schema_version": 1
+        },
+        {
+            "kind": "llm",
+            "active": true,
+            "provider": "xai",
+            "config_json": {
+                "model": "grok-4-1-fast-non-reasoning-latest",
+                "base_url": "https://api.x.ai/v1",
+                "provider": "xai",
+                "api_key_ref": "XAI_API_KEY",
+                "temperature": 0.3,
+                "enable_tools": false,
+                "fallback_model": "gemini-3.1-flash-lite-preview",
+                "fallback_provider": "google",
+                "max_retry_per_llm": 0,
+                "retry_interval_sec": 0.3,
+                "attempt_timeout_sec": 2.5,
+                "retry_on_chunk_sent": false,
+                "global_tools_enabled": false,
+                "use_livekit_fallback_adapter": true
+            },
+            "description": "Non-secret xAI LLM profile synchronized from current .env.local.",
+            "profile_key": "llm_xai",
+            "display_name": "xAI Grok current env",
+            "schema_version": 1
+        },
+        {
+            "kind": "llm",
+            "active": true,
+            "provider": "xai",
+            "config_json": {
+                "model": "grok-4-1-fast-non-reasoning-latest",
+                "egress": "proxy",
+                "base_url": "https://api.x.ai/v1",
+                "provider": "xai",
+                "api_key_ref": "XAI_API_KEY",
+                "temperature": 0.3,
+                "enable_tools": false,
+                "fallback_model": "gemini-3.1-flash-lite-preview",
+                "fallback_provider": "google",
+                "max_retry_per_llm": 0,
+                "retry_interval_sec": 0.3,
+                "attempt_timeout_sec": 2.5,
+                "retry_on_chunk_sent": false,
+                "global_tools_enabled": false,
+                "use_livekit_fallback_adapter": true
+            },
+            "description": "xAI LLM profile routed through proxy for the Asterisk runtime.",
+            "profile_key": "llm_xai_proxy",
+            "display_name": "xAI Grok · Proxy",
+            "schema_version": 1
+        },
+        {
+            "kind": "stt",
+            "active": true,
+            "provider": "deepgram",
+            "config_json": {
+                "model": "nova-3",
+                "egress": "proxy",
+                "language": "ru",
+                "provider": "deepgram",
+                "api_key_ref": "DEEPGRAM_API_KEY",
+                "endpointing_ms": 90
+            },
+            "description": "Deepgram STT profile routed through proxy for the Asterisk runtime.",
+            "profile_key": "stt_deepgram_proxy",
+            "display_name": "Deepgram RU Phone · Proxy",
+            "schema_version": 1
+        },
+        {
+            "kind": "stt",
+            "active": true,
+            "provider": "deepgram",
+            "config_json": {
+                "model": "nova-3",
+                "language": "ru",
+                "provider": "deepgram",
+                "api_key_ref": "DEEPGRAM_API_KEY",
+                "endpointing_ms": 90
+            },
+            "description": "Non-secret Deepgram STT profile synchronized from current .env.local.",
+            "profile_key": "stt_deepgram_ru_phone",
+            "display_name": "Deepgram current env",
+            "schema_version": 1
+        },
+        {
+            "kind": "stt",
+            "active": true,
+            "provider": "google",
+            "config_json": {
+                "model": "latest_long",
+                "language": "ru-RU",
+                "location": "global",
+                "provider": "google",
+                "credentials_ref": "GOOGLE_TTS_CREDENTIALS_B64"
+            },
+            "description": "Non-secret Google STT profile synchronized from current .env.local.",
+            "profile_key": "stt_google_ru",
+            "display_name": "Google STT current env",
+            "schema_version": 1
+        },
+        {
+            "kind": "stt",
+            "active": true,
+            "provider": "yandex",
+            "config_json": {
+                "provider": "yandex",
+                "api_key_ref": "YANDEX_SPEECHKIT_API_KEY",
+                "max_pause_between_words_hint_ms": 500
+            },
+            "description": "Non-secret Yandex STT profile synchronized from current .env.local where present.",
+            "profile_key": "stt_yandex_ru",
+            "display_name": "Yandex STT current env",
+            "schema_version": 1
+        },
+        {
+            "kind": "tts",
+            "active": true,
+            "provider": "cosyvoice",
+            "config_json": {
+                "rate": 1.1,
+                "model": "cosyvoice-v3.5-plus",
+                "pitch": 1.0,
+                "format": "pcm",
+                "region": "cn-beijing",
+                "volume": 50,
+                "ws_url": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
+                "profile": "cosyvoice_cn_plus_quality",
+                "provider": "cosyvoice",
+                "voice_id": "cosyvoice-v3.5-plus-v35p0001-576e62b254ea4eafb6c184dc43f7674a",
+                "transport": "websocket",
+                "voice_mode": "preset",
+                "api_key_ref": "COSYVOICE_API_KEY",
+                "sample_rate": 24000,
+                "clone_voice_id": "cosyvoice-v3.5-plus-v35p0001-576e62b254ea4eafb6c184dc43f7674a",
+                "design_voice_id": "cosyvoice-v3.5-plus-v35p0001-576e62b254ea4eafb6c184dc43f7674a",
+                "api_key_env_name": "COSYVOICE_API_KEY",
+                "connection_reuse": true,
+                "min_sentence_len": 4,
+                "stream_context_len": 1,
+                "playback_on_first_chunk": true
+            },
+            "description": "Non-secret CosyVoice TTS profile synchronized from current .env.local.",
+            "profile_key": "tts_cosyvoice_plus",
+            "display_name": "CosyVoice current env",
+            "schema_version": 1
+        },
+        {
+            "kind": "tts",
+            "active": true,
+            "provider": "elevenlabs",
+            "config_json": {
+                "model": "eleven_v3",
+                "language": "",
+                "provider": "elevenlabs",
+                "voice_id": "wF58OrxELqJ5nFJxXiva",
+                "api_key_ref": "ELEVENLABS_API_KEY",
+                "voice_speed": null,
+                "voice_style": null,
+                "output_format": "pcm_24000",
+                "enable_logging": true,
+                "voice_stability": null,
+                "min_sentence_len": 6,
+                "use_stream_input": true,
+                "legacy_api_key_ref": "ELEVEN_API_KEY",
+                "stream_context_len": 2,
+                "voice_similarity_boost": null,
+                "voice_use_speaker_boost": null,
+                "apply_text_normalization": "auto"
+            },
+            "description": "Non-secret ElevenLabs TTS profile synchronized from current .env.local.",
+            "profile_key": "tts_elevenlabs_v3",
+            "display_name": "ElevenLabs v3 current env",
+            "schema_version": 1
+        },
+        {
+            "kind": "tts",
+            "active": true,
+            "provider": "elevenlabs",
+            "config_json": {
+                "model": "eleven_v3",
+                "egress": "proxy",
+                "language": "",
+                "provider": "elevenlabs",
+                "voice_id": "wF58OrxELqJ5nFJxXiva",
+                "api_key_ref": "ELEVENLABS_API_KEY",
+                "voice_speed": null,
+                "voice_style": null,
+                "output_format": "pcm_24000",
+                "enable_logging": true,
+                "voice_stability": null,
+                "min_sentence_len": 6,
+                "use_stream_input": true,
+                "legacy_api_key_ref": "ELEVEN_API_KEY",
+                "stream_context_len": 2,
+                "voice_similarity_boost": null,
+                "voice_use_speaker_boost": null,
+                "apply_text_normalization": "auto"
+            },
+            "description": "ElevenLabs v3 TTS profile routed through proxy for the Asterisk runtime.",
+            "profile_key": "tts_elevenlabs_v3_proxy",
+            "display_name": "ElevenLabs v3 · Proxy",
+            "schema_version": 1
+        },
+        {
+            "kind": "tts",
+            "active": true,
+            "provider": "google",
+            "config_json": {
+                "model": "gemini-3-flash-preview",
+                "pitch": 0,
+                "prompt": "Speak only in Russian. Use pure standard Russian pronunciation with no foreign accent. Sound like a real human receptionist speaking on the phone. Be natural, calm, polite, and professional. Use short, clear, conversational sentences. Keep a medium pace and clear articulation. Use subtle human-like intonation variation. Avoid sounding robotic, theatrical, salesy, or overly cheerful.",
+                "language": "ru-RU",
+                "location": "global",
+                "provider": "google",
+                "voice_name": "Zephyr",
+                "speaking_rate": 1.0,
+                "use_streaming": true,
+                "fallback_model": "gemini-2.5-flash-tts",
+                "credentials_ref": "GOOGLE_TTS_CREDENTIALS_B64",
+                "min_sentence_len": 4,
+                "stream_context_len": 1
+            },
+            "description": "Non-secret Google Cloud/Gemini TTS profile synchronized from current .env.local.",
+            "profile_key": "tts_google_gemini",
+            "display_name": "Google TTS current env",
+            "schema_version": 1
+        },
+        {
+            "kind": "tts",
+            "active": true,
+            "provider": "minimax",
+            "config_json": {
+                "model": "speech-2.8-turbo",
+                "pitch": 0,
+                "speed": 1.2,
+                "format": "mp3",
+                "timbre": null,
+                "volume": 1.0,
+                "bitrate": 128000,
+                "channel": 1,
+                "base_url": "https://api-uw.minimax.io",
+                "provider": "minimax",
+                "voice_id": "moss_audio_43d3c43e-3a2d-11f1-b47e-928b88df9451",
+                "intensity": null,
+                "api_key_ref": "MINIMAX_API_KEY",
+                "sample_rate": 24000,
+                "sound_effects": "",
+                "language_boost": "Russian",
+                "min_sentence_len": 4,
+                "stream_context_len": 1
+            },
+            "description": "Non-secret MiniMax TTS profile synchronized from current .env.local.",
+            "profile_key": "tts_minimax_ru",
+            "display_name": "MiniMax current env",
+            "schema_version": 1
+        },
+        {
+            "kind": "tts",
+            "active": true,
+            "provider": "sber",
+            "config_json": {
+                "voice": "Ost_24000",
+                "provider": "sber",
+                "paint_pitch": "2",
+                "paint_speed": "4",
+                "auth_key_ref": "SBER_SALUTESPEECH_AUTH_KEY",
+                "paint_loudness": "5"
+            },
+            "description": "Non-secret Sber TTS profile synchronized from current .env.local.",
+            "profile_key": "tts_sber_ru",
+            "display_name": "Sber TTS current env",
+            "schema_version": 1
+        },
+        {
+            "kind": "tts",
+            "active": true,
+            "provider": "vertex",
+            "config_json": {
+                "model": "gemini-3-flash-preview",
+                "prompt": "Speak only in Russian. Use pure standard Russian pronunciation with no foreign accent. Sound like a real human receptionist speaking on the phone. Be natural, calm, polite, and professional. Use short, clear, conversational sentences. Keep a medium pace and clear articulation. Use subtle human-like intonation variation. Avoid sounding robotic, theatrical, salesy, or overly cheerful.",
+                "location": "global",
+                "provider": "vertex",
+                "voice_name": "Zephyr",
+                "credentials_ref": "GOOGLE_TTS_CREDENTIALS_B64",
+                "min_sentence_len": 6,
+                "stream_context_len": 2
+            },
+            "description": "Non-secret Vertex Gemini TTS buffering profile synchronized from current .env.local.",
+            "profile_key": "tts_vertex_gemini",
+            "display_name": "Vertex Gemini TTS current env",
+            "schema_version": 1
+        },
+        {
+            "kind": "turn",
+            "active": true,
+            "provider": "livekit",
+            "config_json": {
+                "detection_mode": "vad",
+                "endpointing_mode": "fixed",
+                "max_endpointing_delay": 0.5,
+                "min_endpointing_delay": 0.25,
+                "preemptive_generation": true,
+                "early_interim_final_enabled": true,
+                "early_interim_final_delay_sec": 0.15
+            },
+            "description": "Turn detection and endpointing settings synchronized from current .env.local.",
+            "profile_key": "turn_fast_phone",
+            "display_name": "Turn handling current env",
+            "schema_version": 1
+        }
+    ]
+}
