@@ -108,6 +108,16 @@ COSYVOICE_TTS_EGRESS=direct
 LIVEKIT_INFERENCE_EGRESS=proxy
 ```
 
+The repository now includes env profile templates for the single-codebase
+deployment model:
+
+- `agents/main-bot/env/common.env.example`
+- `agents/main-bot/env/asterisk.env.example`
+
+The current server file `/etc/jcall-livekit-agent/main-bot.env` remains the
+production source of truth. Use the profile templates to review future changes,
+not to overwrite the server automatically.
+
 Текущий выбор основан на тестах задержки и geoblock:
 
 - `proxy`: ElevenLabs, Gemini/Google LLM, Google TTS/STT, Vertex TTS, LiveKit Inference.

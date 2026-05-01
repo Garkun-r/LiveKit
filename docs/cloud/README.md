@@ -19,6 +19,8 @@ This folder is the project runbook for LiveKit Cloud work. Read it before touchi
 - Local env template: `agents/main-bot/.env.example`
 - Local secret source for sync/deploy: `agents/main-bot/.env.local`
 - Cloud secret sync helper: `agents/main-bot/scripts/sync_cloud_secrets.py`
+- Env profile templates: `agents/main-bot/env/common.env.example` and
+  `agents/main-bot/env/cloud.env.example`
 
 ## Required first checks
 
@@ -53,7 +55,8 @@ Use the repository's existing workflow unless the task explicitly requires somet
 
 ```bash
 cd /Users/romangarkun/Documents/LiveKit/agents/main-bot
-uv run python scripts/sync_cloud_secrets.py --env-file .env.local
+uv run python scripts/build_env.py --profile cloud --secrets env/cloud.secrets.env --output .env.cloud.local
+uv run python scripts/sync_cloud_secrets.py --env-file .env.cloud.local
 lk agent deploy
 lk agent status
 ```
