@@ -152,8 +152,9 @@ class DiagnosticRule:
 
     @classmethod
     def from_directus(cls, row: dict[str, Any]) -> DiagnosticRule:
+        rule_id = row.get("id")
         return cls(
-            id=row.get("id"),
+            id=int(rule_id) if rule_id is not None else None,
             enabled=bool(row.get("enabled", True)),
             target=str(row.get("target") or "both").strip().lower(),
             trigger_mode=str(row.get("trigger_mode") or "incidents").strip().lower(),

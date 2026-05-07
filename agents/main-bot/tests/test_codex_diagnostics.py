@@ -81,6 +81,19 @@ def test_incident_mode_respects_min_severity() -> None:
     )
 
 
+def test_directus_rule_casts_string_id_to_int() -> None:
+    rule = DiagnosticRule.from_directus(
+        {
+            "id": "7",
+            "enabled": True,
+            "target": "cloud",
+            "trigger_mode": "all_calls",
+        }
+    )
+
+    assert rule.id == 7
+
+
 def test_xdid_and_caller_modes_normalize_digits() -> None:
     xdid_rule = DiagnosticRule(
         id=1,
