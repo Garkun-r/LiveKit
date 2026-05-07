@@ -78,6 +78,18 @@ CODEX_DIAGNOSTICS_LK_CLOUD_API_SECRET=
 CODEX_DIAGNOSTICS_LK_LOCAL_URL=http://127.0.0.1:7880
 CODEX_DIAGNOSTICS_LK_LOCAL_API_KEY=
 CODEX_DIAGNOSTICS_LK_LOCAL_API_SECRET=
+
+# When the worker runs on vm-pico next to n8n/Directus/Codex, use SSH to read
+# the local Asterisk LiveKit from the Asterisk host. The remote command reads
+# local LiveKit credentials from the Asterisk env file and runs only lk list
+# commands.
+CODEX_DIAGNOSTICS_LK_LOCAL_SSH_TARGET=root@87.226.145.66
+CODEX_DIAGNOSTICS_LK_LOCAL_SSH_PORT=39001
+CODEX_DIAGNOSTICS_LK_LOCAL_SSH_KEY=/root/.ssh/id_rsa_n8n
+CODEX_DIAGNOSTICS_LK_LOCAL_REMOTE_ENV=/etc/jcall-livekit-agent/main-bot.env
+CODEX_DIAGNOSTICS_LK_LOCAL_REMOTE_WORKDIR=/opt/jcall-livekit-agent/source/agents/main-bot
+CODEX_DIAGNOSTICS_LK_LOCAL_REMOTE_FALLBACK_WORKDIR=/opt/jcall-livekit-agent/main-bot
+CODEX_DIAGNOSTICS_LK_LOCAL_REMOTE_LK_BIN=/usr/local/bin/lk
 ```
 
 Codex auth uses the current ChatGPT Pro account on the VPS:
@@ -124,9 +136,10 @@ POST http://127.0.0.1:18181/aftercall?target=local
 Use `target=cloud` for LiveKit Cloud calls and `target=local` for the
 self-hosted/Asterisk LiveKit path. This target controls which LiveKit endpoint
 the read-only `lk` snapshot uses. Cloud can use either `lk --project ...` or
-explicit `CODEX_DIAGNOSTICS_LK_CLOUD_*` credentials. Local uses
-`CODEX_DIAGNOSTICS_LK_LOCAL_*` or falls back to the existing `LIVEKIT_*` env on
-the Asterisk server.
+explicit `CODEX_DIAGNOSTICS_LK_CLOUD_*` credentials. Local can run directly on
+the Asterisk host with `CODEX_DIAGNOSTICS_LK_LOCAL_*`; when the worker runs on
+vm-pico, set `CODEX_DIAGNOSTICS_LK_LOCAL_SSH_TARGET` so the snapshot is run on
+the Asterisk host and reads the existing `LIVEKIT_*` env there.
 
 The worker sends the final Telegram brief to n8n through
 `CODEX_DIAGNOSTICS_N8N_WEBHOOK_URL`; Telegram credentials remain owned by n8n.

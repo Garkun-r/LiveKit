@@ -203,6 +203,7 @@ def test_redact_command_hides_secret_flag_values() -> None:
 
 
 def test_local_livekit_snapshot_uses_existing_livekit_env(monkeypatch) -> None:
+    monkeypatch.delenv("CODEX_DIAGNOSTICS_LK_LOCAL_SSH_TARGET", raising=False)
     monkeypatch.delenv("CODEX_DIAGNOSTICS_LK_LOCAL_URL", raising=False)
     monkeypatch.delenv("CODEX_DIAGNOSTICS_LK_LOCAL_API_KEY", raising=False)
     monkeypatch.delenv("CODEX_DIAGNOSTICS_LK_LOCAL_API_SECRET", raising=False)
@@ -222,6 +223,31 @@ def test_local_livekit_snapshot_uses_existing_livekit_env(monkeypatch) -> None:
         "--api-secret",
         "local-secret",
     ]
+
+
+def test_local_livekit_snapshot_can_run_through_asterisk_ssh(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "CODEX_DIAGNOSTICS_LK_LOCAL_SSH_TARGET", "root@87.226.145.66"
+    )
+    monkeypatch.setenv("CODEX_DIAGNOSTICS_LK_LOCAL_SSH_PORT", "39001")
+    monkeypatch.setenv("CODEX_DIAGNOSTICS_LK_LOCAL_SSH_KEY", "/root/.ssh/id_rsa_n8n")
+
+    commands, missing = build_livekit_snapshot_commands("local")
+
+    assert missing == []
+    assert commands[0][:7] == [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-i",
+        "/root/.ssh/id_rsa_n8n",
+    ]
+    assert "-p" in commands[0]
+    assert "39001" in commands[0]
+    assert "root@87.226.145.66" in commands[0]
+    assert "LIVEKIT_API_KEY" in commands[0][-1]
 
 
 def test_cloud_livekit_snapshot_prefers_explicit_cloud_credentials(monkeypatch) -> None:

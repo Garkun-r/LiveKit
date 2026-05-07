@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -414,6 +415,10 @@ def run_snapshot_command(
 
 def build_livekit_snapshot_commands(target: str) -> tuple[list[list[str]], list[str]]:
     if target == "local":
+        ssh_target = os.getenv("CODEX_DIAGNOSTICS_LK_LOCAL_SSH_TARGET", "").strip()
+        if ssh_target:
+            return build_remote_local_livekit_snapshot_commands(ssh_target), []
+
         url = (
             os.getenv("CODEX_DIAGNOSTICS_LK_LOCAL_URL")
             or os.getenv("LIVEKIT_URL")
@@ -469,6 +474,79 @@ def build_livekit_snapshot_commands(target: str) -> tuple[list[list[str]], list[
         [*prefix, "room", "list"],
         [*prefix, "egress", "list"],
     ], []
+
+
+def env_value_shell_function() -> str:
+    return r"""
+read_env() {
+  key="$1"
+  awk -v key="$key" '
+    BEGIN { FS = "=" }
+    $1 == key {
+      sub(/^[^=]*=/, "")
+      gsub(/^"/, "")
+      gsub(/"$/, "")
+      print
+      exit
+    }
+  ' "$env_file"
+}
+"""
+
+
+def build_remote_local_livekit_snapshot_commands(ssh_target: str) -> list[list[str]]:
+    ssh_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    ssh_key = os.getenv("CODEX_DIAGNOSTICS_LK_LOCAL_SSH_KEY", "").strip()
+    ssh_port = os.getenv("CODEX_DIAGNOSTICS_LK_LOCAL_SSH_PORT", "").strip()
+    if ssh_key:
+        ssh_cmd.extend(["-i", ssh_key])
+    if ssh_port:
+        ssh_cmd.extend(["-p", ssh_port])
+    ssh_cmd.append(ssh_target)
+
+    env_file = os.getenv(
+        "CODEX_DIAGNOSTICS_LK_LOCAL_REMOTE_ENV",
+        "/etc/jcall-livekit-agent/main-bot.env",
+    )
+    workdir = os.getenv(
+        "CODEX_DIAGNOSTICS_LK_LOCAL_REMOTE_WORKDIR",
+        "/opt/jcall-livekit-agent/source/agents/main-bot",
+    )
+    fallback_workdir = os.getenv(
+        "CODEX_DIAGNOSTICS_LK_LOCAL_REMOTE_FALLBACK_WORKDIR",
+        "/opt/jcall-livekit-agent/main-bot",
+    )
+    lk_bin = os.getenv("CODEX_DIAGNOSTICS_LK_LOCAL_REMOTE_LK_BIN", "/usr/local/bin/lk")
+
+    def remote_command(args: list[str]) -> list[str]:
+        args_text = " ".join(shlex.quote(item) for item in args)
+        script = (
+            "set -eu\n"
+            f"env_file={shlex.quote(env_file)}\n"
+            f"{env_value_shell_function()}\n"
+            "url=\"$(read_env CODEX_DIAGNOSTICS_LK_LOCAL_URL || true)\"\n"
+            "if [ -z \"$url\" ]; then url=\"$(read_env LIVEKIT_URL || true)\"; fi\n"
+            "if [ -z \"$url\" ]; then url=\"http://127.0.0.1:7880\"; fi\n"
+            "key=\"$(read_env CODEX_DIAGNOSTICS_LK_LOCAL_API_KEY || true)\"\n"
+            "if [ -z \"$key\" ]; then key=\"$(read_env LIVEKIT_API_KEY || true)\"; fi\n"
+            "secret=\"$(read_env CODEX_DIAGNOSTICS_LK_LOCAL_API_SECRET || true)\"\n"
+            "if [ -z \"$secret\" ]; then secret=\"$(read_env LIVEKIT_API_SECRET || true)\"; fi\n"
+            "if [ -z \"$key\" ] || [ -z \"$secret\" ]; then\n"
+            "  echo 'missing local LiveKit API key/secret' >&2\n"
+            "  exit 2\n"
+            "fi\n"
+            f"cd {shlex.quote(workdir)} 2>/dev/null || cd {shlex.quote(fallback_workdir)}\n"
+            f"exec {shlex.quote(lk_bin)} --url \"$url\" --api-key \"$key\" "
+            f"--api-secret \"$secret\" {args_text}\n"
+        )
+        return [*ssh_cmd, "sh -lc " + shlex.quote(script)]
+
+    return [
+        remote_command(["room", "list"]),
+        remote_command(["egress", "list"]),
+        remote_command(["sip", "inbound", "list"]),
+        remote_command(["sip", "dispatch", "list"]),
+    ]
 
 
 def collect_livekit_snapshot(target: str, *, repo_dir: Path) -> dict[str, Any]:
