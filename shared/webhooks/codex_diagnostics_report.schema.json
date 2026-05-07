@@ -16,7 +16,14 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["title", "severity", "evidence", "confidence"],
+        "required": [
+          "title",
+          "severity",
+          "evidence",
+          "confidence",
+          "suspected_cause",
+          "recommendation"
+        ],
         "properties": {
           "title": {"type": "string"},
           "severity": {
