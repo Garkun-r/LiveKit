@@ -66,7 +66,15 @@ CODEX_DIAGNOSTICS_PORT=18181
 # Optional cloud project override. If unset, lk uses livekit.toml/default config.
 CODEX_DIAGNOSTICS_LK_CLOUD_PROJECT=jcallio
 
-# Local/self-hosted LiveKit diagnostic access.
+# Optional cloud API access. Use this instead of CLI project auth when the VPS
+# should connect directly to LiveKit Cloud with diagnostic-scoped credentials.
+CODEX_DIAGNOSTICS_LK_CLOUD_URL=wss://jcallio-g451240m.livekit.cloud
+CODEX_DIAGNOSTICS_LK_CLOUD_API_KEY=
+CODEX_DIAGNOSTICS_LK_CLOUD_API_SECRET=
+
+# Local/self-hosted LiveKit diagnostic access. If these are unset, the worker
+# falls back to LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET from the
+# existing Asterisk agent env.
 CODEX_DIAGNOSTICS_LK_LOCAL_URL=http://127.0.0.1:7880
 CODEX_DIAGNOSTICS_LK_LOCAL_API_KEY=
 CODEX_DIAGNOSTICS_LK_LOCAL_API_SECRET=
@@ -114,9 +122,14 @@ POST http://127.0.0.1:18181/aftercall?target=local
 ```
 
 Use `target=cloud` for LiveKit Cloud calls and `target=local` for the
-self-hosted/Asterisk LiveKit path. The worker sends the final Telegram brief to
-n8n through `CODEX_DIAGNOSTICS_N8N_WEBHOOK_URL`; Telegram credentials remain
-owned by n8n.
+self-hosted/Asterisk LiveKit path. This target controls which LiveKit endpoint
+the read-only `lk` snapshot uses. Cloud can use either `lk --project ...` or
+explicit `CODEX_DIAGNOSTICS_LK_CLOUD_*` credentials. Local uses
+`CODEX_DIAGNOSTICS_LK_LOCAL_*` or falls back to the existing `LIVEKIT_*` env on
+the Asterisk server.
+
+The worker sends the final Telegram brief to n8n through
+`CODEX_DIAGNOSTICS_N8N_WEBHOOK_URL`; Telegram credentials remain owned by n8n.
 
 ## Safety Rules
 

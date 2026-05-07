@@ -412,40 +412,76 @@ def run_snapshot_command(
         }
 
 
+def build_livekit_snapshot_commands(target: str) -> tuple[list[list[str]], list[str]]:
+    if target == "local":
+        url = (
+            os.getenv("CODEX_DIAGNOSTICS_LK_LOCAL_URL")
+            or os.getenv("LIVEKIT_URL")
+            or "http://127.0.0.1:7880"
+        )
+        key = os.getenv("CODEX_DIAGNOSTICS_LK_LOCAL_API_KEY") or os.getenv(
+            "LIVEKIT_API_KEY"
+        )
+        secret = os.getenv("CODEX_DIAGNOSTICS_LK_LOCAL_API_SECRET") or os.getenv(
+            "LIVEKIT_API_SECRET"
+        )
+        missing = []
+        if not key:
+            missing.append("CODEX_DIAGNOSTICS_LK_LOCAL_API_KEY or LIVEKIT_API_KEY")
+        if not secret:
+            missing.append(
+                "CODEX_DIAGNOSTICS_LK_LOCAL_API_SECRET or LIVEKIT_API_SECRET"
+            )
+        if missing:
+            return [], missing
+        prefix = ["lk", "--url", url, "--api-key", key, "--api-secret", secret]
+        return [
+            [*prefix, "room", "list"],
+            [*prefix, "egress", "list"],
+            [*prefix, "sip", "inbound", "list"],
+            [*prefix, "sip", "dispatch", "list"],
+        ], []
+
+    cloud_url = os.getenv("CODEX_DIAGNOSTICS_LK_CLOUD_URL")
+    cloud_key = os.getenv("CODEX_DIAGNOSTICS_LK_CLOUD_API_KEY")
+    cloud_secret = os.getenv("CODEX_DIAGNOSTICS_LK_CLOUD_API_SECRET")
+    if cloud_url and cloud_key and cloud_secret:
+        prefix = [
+            "lk",
+            "--url",
+            cloud_url,
+            "--api-key",
+            cloud_key,
+            "--api-secret",
+            cloud_secret,
+        ]
+        return [
+            [*prefix, "room", "list"],
+            [*prefix, "egress", "list"],
+            [*prefix, "sip", "inbound", "list"],
+            [*prefix, "sip", "dispatch", "list"],
+        ], []
+
+    project = os.getenv("CODEX_DIAGNOSTICS_LK_CLOUD_PROJECT")
+    prefix = ["lk", "--project", project] if project else ["lk"]
+    return [
+        [*prefix, "agent", "status"],
+        [*prefix, "room", "list"],
+        [*prefix, "egress", "list"],
+    ], []
+
+
 def collect_livekit_snapshot(target: str, *, repo_dir: Path) -> dict[str, Any]:
     main_bot_dir = repo_dir / "agents" / "main-bot"
-    base_commands = [
-        ["lk", "agent", "status"],
-        ["lk", "room", "list"],
-        ["lk", "egress", "list"],
-    ]
     snapshot: dict[str, Any] = {
         "target": target,
         "collected_at": utc_now_iso(),
         "commands": [],
     }
-    if target == "local":
-        url = os.getenv("CODEX_DIAGNOSTICS_LK_LOCAL_URL")
-        key = os.getenv("CODEX_DIAGNOSTICS_LK_LOCAL_API_KEY")
-        secret = os.getenv("CODEX_DIAGNOSTICS_LK_LOCAL_API_SECRET")
-        if not (url and key and secret):
-            snapshot["config_missing"] = [
-                "CODEX_DIAGNOSTICS_LK_LOCAL_URL",
-                "CODEX_DIAGNOSTICS_LK_LOCAL_API_KEY",
-                "CODEX_DIAGNOSTICS_LK_LOCAL_API_SECRET",
-            ]
-            return snapshot
-        prefix = ["lk", "--url", url, "--api-key", key, "--api-secret", secret]
-        commands = [
-            [*prefix, "room", "list"],
-            [*prefix, "egress", "list"],
-            [*prefix, "sip", "inbound", "list"],
-            [*prefix, "sip", "dispatch", "list"],
-        ]
-    else:
-        project = os.getenv("CODEX_DIAGNOSTICS_LK_CLOUD_PROJECT")
-        prefix = ["lk", "--project", project] if project else ["lk"]
-        commands = [prefix + command[1:] for command in base_commands]
+    commands, missing = build_livekit_snapshot_commands(target)
+    if missing:
+        snapshot["config_missing"] = missing
+        return snapshot
 
     for argv in commands:
         snapshot["commands"].append(run_snapshot_command(argv, cwd=main_bot_dir))

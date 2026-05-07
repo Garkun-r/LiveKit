@@ -12,6 +12,7 @@ from shared.webhooks.codex_diagnostics import (  # noqa: E402
     DiagnosticRule,
     audit_dedupe_key,
     build_codex_prompt,
+    build_livekit_snapshot_commands,
     extract_final_codex_message,
     parse_codex_report,
     redact_command,
@@ -199,6 +200,49 @@ def test_redact_command_hides_secret_flag_values() -> None:
         "--api-secret",
         "[redacted]",
     ]
+
+
+def test_local_livekit_snapshot_uses_existing_livekit_env(monkeypatch) -> None:
+    monkeypatch.delenv("CODEX_DIAGNOSTICS_LK_LOCAL_URL", raising=False)
+    monkeypatch.delenv("CODEX_DIAGNOSTICS_LK_LOCAL_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_DIAGNOSTICS_LK_LOCAL_API_SECRET", raising=False)
+    monkeypatch.setenv("LIVEKIT_URL", "http://127.0.0.1:7880")
+    monkeypatch.setenv("LIVEKIT_API_KEY", "local-key")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "local-secret")
+
+    commands, missing = build_livekit_snapshot_commands("local")
+
+    assert missing == []
+    assert commands[0][:7] == [
+        "lk",
+        "--url",
+        "http://127.0.0.1:7880",
+        "--api-key",
+        "local-key",
+        "--api-secret",
+        "local-secret",
+    ]
+
+
+def test_cloud_livekit_snapshot_prefers_explicit_cloud_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_DIAGNOSTICS_LK_CLOUD_URL", "wss://cloud.livekit")
+    monkeypatch.setenv("CODEX_DIAGNOSTICS_LK_CLOUD_API_KEY", "cloud-key")
+    monkeypatch.setenv("CODEX_DIAGNOSTICS_LK_CLOUD_API_SECRET", "cloud-secret")
+    monkeypatch.setenv("CODEX_DIAGNOSTICS_LK_CLOUD_PROJECT", "jcallio")
+
+    commands, missing = build_livekit_snapshot_commands("cloud")
+
+    assert missing == []
+    assert commands[0][:7] == [
+        "lk",
+        "--url",
+        "wss://cloud.livekit",
+        "--api-key",
+        "cloud-key",
+        "--api-secret",
+        "cloud-secret",
+    ]
+    assert "--project" not in commands[0]
 
 
 def test_telegram_payload_reuses_n8n_friendly_brief_shape() -> None:
