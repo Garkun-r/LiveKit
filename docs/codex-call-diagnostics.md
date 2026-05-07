@@ -60,7 +60,9 @@ CODEX_DIAGNOSTICS_N8N_WEBHOOK_TOKEN=
 CODEX_DIAGNOSTICS_REPO_DIR=/opt/jcall-livekit-agent/source
 CODEX_DIAGNOSTICS_CODEX_BIN=codex
 CODEX_DIAGNOSTICS_CODEX_TIMEOUT_SEC=900
-CODEX_DIAGNOSTICS_HOST=127.0.0.1
+# On vm-pico, n8n runs inside the n8n_default Docker network. Bind to that
+# bridge gateway so n8n can reach the host worker without exposing it publicly.
+CODEX_DIAGNOSTICS_HOST=172.18.0.1
 CODEX_DIAGNOSTICS_PORT=18181
 
 # Optional cloud project override. If unset, lk uses livekit.toml/default config.
@@ -129,8 +131,8 @@ uv run python ../../shared/webhooks/codex_diagnostics.py aftercall \
 The aftercall workflow should call:
 
 ```http
-POST http://127.0.0.1:18181/aftercall?target=cloud
-POST http://127.0.0.1:18181/aftercall?target=local
+POST http://172.18.0.1:18181/aftercall?target=cloud
+POST http://172.18.0.1:18181/aftercall?target=local
 ```
 
 Use `target=cloud` for LiveKit Cloud calls and `target=local` for the
