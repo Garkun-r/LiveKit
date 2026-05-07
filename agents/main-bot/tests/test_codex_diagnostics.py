@@ -157,17 +157,18 @@ def test_codex_runner_command_is_read_only_ephemeral_json() -> None:
 
     command = runner.build_command("diagnose")
 
-    assert command[:7] == [
+    assert command[:5] == [
         "codex",
         "exec",
         "--sandbox",
         "read-only",
         "--ephemeral",
-        "--json",
-        "--output-schema",
     ]
+    assert "--json" in command
+    assert "--output-schema" in command
     assert "-C" in command
     assert "/repo" in command
+    assert "--skip-git-repo-check" in command
     assert "--model" in command
     assert "gpt-test" in command
 

@@ -342,6 +342,7 @@ class CodexRunner:
             "--sandbox",
             "read-only",
             "--ephemeral",
+            "--skip-git-repo-check",
             "--json",
             "--output-schema",
             str(self.schema_path),
