@@ -17,3 +17,4 @@
 - [Asterisk E2E Voice Test](./docs/asterisk-e2e-voice-test.md)
 - [Парсер тегов и навыки робота](./docs/robot-tags-and-skills.md)
 - [Диагностика и журнал инцидентов робота](./docs/robot-diagnostics.md)
+- [Post-call Codex диагностика звонков](./docs/codex-call-diagnostics.md)

@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "findings", "recommendations", "telegram_brief", "markdown"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["ok", "watch", "needs_attention", "critical"]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "severity", "evidence", "confidence"],
+        "properties": {
+          "title": {"type": "string"},
+          "severity": {
+            "type": "string",
+            "enum": ["info", "warning", "error", "critical"]
+          },
+          "evidence": {"type": "string"},
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "suspected_cause": {"type": "string"},
+          "recommendation": {"type": "string"}
+        }
+      }
+    },
+    "recommendations": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "telegram_brief": {
+      "type": "string"
+    },
+    "markdown": {
+      "type": "string"
+    }
+  }
+}
