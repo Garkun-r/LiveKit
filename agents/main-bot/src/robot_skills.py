@@ -94,7 +94,12 @@ class RobotSkillRunner:
         return result
 
     async def _run_selected(self, tag: RobotTag) -> RobotSkillResult:
-        if tag.action in {"status_end", "status_spam"}:
+        if tag.action in {
+            "status_end",
+            "status_info_close",
+            "status_lead",
+            "status_spam",
+        }:
             reason = tag.action
             scheduler_result = await self._request_end_call(reason)
             return RobotSkillResult(

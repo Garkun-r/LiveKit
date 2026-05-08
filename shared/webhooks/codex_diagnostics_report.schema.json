@@ -19,10 +19,16 @@
         "required": [
           "title",
           "severity",
+          "stage",
+          "event_time_or_turn",
+          "exact_detail",
           "evidence",
+          "why_it_matters",
           "confidence",
           "suspected_cause",
-          "recommendation"
+          "recommendation",
+          "implementation_idea",
+          "missing_evidence"
         ],
         "properties": {
           "title": {"type": "string"},
@@ -30,14 +36,20 @@
             "type": "string",
             "enum": ["info", "warning", "error", "critical"]
           },
+          "stage": {"type": "string"},
+          "event_time_or_turn": {"type": "string"},
+          "exact_detail": {"type": "string"},
           "evidence": {"type": "string"},
+          "why_it_matters": {"type": "string"},
           "confidence": {
             "type": "number",
             "minimum": 0,
             "maximum": 1
           },
           "suspected_cause": {"type": "string"},
-          "recommendation": {"type": "string"}
+          "recommendation": {"type": "string"},
+          "implementation_idea": {"type": "string"},
+          "missing_evidence": {"type": "string"}
         }
       }
     },

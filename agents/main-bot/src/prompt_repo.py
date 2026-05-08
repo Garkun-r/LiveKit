@@ -33,6 +33,7 @@ logger = logging.getLogger("prompt_repo")
 PROMPT_FILE = Path(__file__).with_name("prompt.txt")
 
 _CURRENT_DATETIME_PLACEHOLDER = "{{CURRENT_DATETIME_BLOCK}}"
+_BOT_CONFIG_INITIAL_GREETING_FIELD = "first_step_text"
 _URL_PROTOCOL_RE = re.compile(r"^https?://", re.IGNORECASE)
 _MONTH_NAMES = (
     "января",
@@ -246,49 +247,63 @@ class DirectusPromptClient:
             timezone=DIRECTUS_DEFAULT_TIMEZONE,
             source="directus:live",
             client_id=client_id,
-            initial_greeting=_string_value(
-                bot_config.get(DIRECTUS_INITIAL_GREETING_FIELD)
-            )
-            or None,
+            initial_greeting=await self._fetch_initial_greeting(client_id),
         )
 
     async def _fetch_bot_config(self, client_id: str | int) -> dict[str, Any] | None:
-        fields = ["client_id", "system_prompt", "examples", "skills_name"]
-        if DIRECTUS_INITIAL_GREETING_FIELD:
-            fields.append(DIRECTUS_INITIAL_GREETING_FIELD)
-        try:
-            return await self._fetch_one(
-                DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
-                filters={"client_id": client_id},
-                fields=fields,
-            )
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code not in {400, 403} or not DIRECTUS_INITIAL_GREETING_FIELD:
-                raise
-            logger.info("Directus first-step greeting field is unavailable; retrying")
-            return await self._fetch_one(
-                DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
-                filters={"client_id": client_id},
-                fields=["client_id", "system_prompt", "examples", "skills_name"],
-            )
+        return await self._fetch_one(
+            DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
+            filters={"client_id": client_id},
+            fields=["client_id", "system_prompt", "examples", "skills_name"],
+        )
 
     async def _fetch_initial_greeting(self, client_id: str | int | None) -> str | None:
         if client_id is None or not DIRECTUS_INITIAL_GREETING_FIELD:
             return None
+
+        greeting = await self._fetch_initial_greeting_from_collection(
+            DIRECTUS_COLLECTION_CLIENTS,
+            filters={"id": client_id},
+            fields=["id", DIRECTUS_INITIAL_GREETING_FIELD],
+            source_label="clients",
+        )
+        if greeting:
+            return greeting
+
+        return await self._fetch_initial_greeting_from_collection(
+            DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
+            filters={"client_id": client_id},
+            fields=["client_id", _BOT_CONFIG_INITIAL_GREETING_FIELD],
+            value_field=_BOT_CONFIG_INITIAL_GREETING_FIELD,
+            source_label="bot_configurations",
+        )
+
+    async def _fetch_initial_greeting_from_collection(
+        self,
+        collection: str,
+        *,
+        filters: dict[str, Any],
+        fields: list[str],
+        value_field: str | None = None,
+        source_label: str,
+    ) -> str | None:
+        value_field = value_field or DIRECTUS_INITIAL_GREETING_FIELD
         try:
-            bot_config = await self._fetch_one(
-                DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
-                filters={"client_id": client_id},
-                fields=["client_id", DIRECTUS_INITIAL_GREETING_FIELD],
-            )
+            row = await self._fetch_one(collection, filters=filters, fields=fields)
         except httpx.HTTPStatusError as e:
             if e.response.status_code not in {400, 403, 404}:
                 raise
-            logger.info("Directus first-step greeting field is unavailable")
+            logger.info(
+                "Directus initial greeting field is unavailable",
+                extra={
+                    "collection": source_label,
+                    "field": value_field,
+                },
+            )
             return None
-        if not bot_config:
+        if not row:
             return None
-        return _string_value(bot_config.get(DIRECTUS_INITIAL_GREETING_FIELD)) or None
+        return _string_value(row.get(value_field)) or None
 
     async def _fetch_client(self, client_id: str | int) -> dict[str, Any] | None:
         client = await self._fetch_one(

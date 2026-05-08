@@ -14,6 +14,8 @@ LiveKit Agent Insights и логи полезны для разбора конк
 - собирает объективные ошибки и нестандартные ситуации во время звонка;
 - не меняет voice flow, провайдеров, prompts, fallback, таймауты или поведение
   клиента;
+- не правит robot prompt, system prompt или источники prompt во время
+  диагностики, но может отдельно предлагать идеи по prompt как рекомендации;
 - позже станет источником для Telegram-уведомлений.
 
 В этом MVP логируются только события внутри LiveKit agent и смежных API.
@@ -169,7 +171,10 @@ LLM, TTS и session runtime.
 configured STT/TTS provider не был использован на старте.
 
 `slow_response`
-: `ChatMessage.metrics.e2e_latency` превысил `INCIDENT_SLOW_RESPONSE_MS`.
+: фактическое время от конца фразы клиента до начала фразы робота превысило
+  `INCIDENT_SLOW_RESPONSE_MS`. Основной источник конца фразы клиента -
+  `user_state_changed: speaking -> listening`; если VAD-события не было,
+  используется время final transcript как fallback.
 
 `reply_watchdog_fired`
 : после финального user transcript не появилась реплика агента до watchdog
@@ -269,7 +274,7 @@ INCIDENT_DIRECTUS_TOKEN=
 INCIDENT_POSTGRES_DSN=
 INCIDENT_ENVIRONMENT=cloud
 INCIDENT_DB_TIMEOUT_SEC=1.5
-INCIDENT_SLOW_RESPONSE_MS=7000
+INCIDENT_SLOW_RESPONSE_MS=4000
 ```
 
 `INCIDENT_DB_TIMEOUT_SEC` должен быть коротким. Если VPS/Directus/Postgres

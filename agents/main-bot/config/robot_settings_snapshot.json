@@ -1850,6 +1850,213 @@
             "validation_json": {},
             "requires_restart": false,
             "visible_when_json": {}
+        },
+        {
+            "sort": 205,
+            "label": "STT API version",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "select",
+            "value_type": "string",
+            "description": "Deepgram API generation for STT. Use v2 for Flux conversational STT.",
+            "setting_key": "stt.api_version",
+            "options_json": {
+                "choices": [
+                    {
+                        "label": "Deepgram v1",
+                        "value": "v1"
+                    },
+                    {
+                        "label": "Deepgram v2 Flux",
+                        "value": "v2"
+                    }
+                ]
+            },
+            "default_value": "v1",
+            "schema_version": 1,
+            "validation_json": {},
+            "requires_restart": false,
+            "visible_when_json": {}
+        },
+        {
+            "sort": 225,
+            "label": "Language hints",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "textarea",
+            "value_type": "string",
+            "description": "Comma-separated Flux language_hint values. For Russian calls use ru.",
+            "setting_key": "stt.language_hints",
+            "options_json": {},
+            "default_value": "ru",
+            "schema_version": 1,
+            "validation_json": {},
+            "requires_restart": false,
+            "visible_when_json": {}
+        },
+        {
+            "sort": 226,
+            "label": "Sample rate",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "number",
+            "value_type": "integer",
+            "description": "Audio sample rate sent to streaming STT.",
+            "setting_key": "stt.sample_rate",
+            "options_json": {},
+            "default_value": 16000,
+            "schema_version": 1,
+            "validation_json": {
+                "min": 8000,
+                "max": 48000,
+                "step": 1000
+            },
+            "requires_restart": false,
+            "visible_when_json": {}
+        },
+        {
+            "sort": 232,
+            "label": "Flux EOT threshold",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Deepgram Flux end-of-turn confidence threshold.",
+            "setting_key": "stt.eot_threshold",
+            "options_json": {},
+            "default_value": 0.7,
+            "schema_version": 1,
+            "validation_json": {
+                "min": 0.5,
+                "max": 0.9,
+                "step": 0.01
+            },
+            "requires_restart": false,
+            "visible_when_json": {}
+        },
+        {
+            "sort": 233,
+            "label": "Flux EOT timeout ms",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "integer",
+            "description": "Deepgram Flux timeout after speech before finalizing a turn.",
+            "setting_key": "stt.eot_timeout_ms",
+            "options_json": {},
+            "default_value": 5000,
+            "schema_version": 1,
+            "validation_json": {
+                "min": 0,
+                "max": 10000,
+                "step": 100
+            },
+            "requires_restart": false,
+            "visible_when_json": {}
+        },
+        {
+            "sort": 234,
+            "label": "Flux eager EOT threshold",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "slider",
+            "value_type": "number",
+            "description": "Optional Deepgram Flux eager end-of-turn threshold for preemptive generation.",
+            "setting_key": "stt.eager_eot_threshold",
+            "options_json": {},
+            "default_value": null,
+            "schema_version": 1,
+            "validation_json": {
+                "min": 0.3,
+                "max": 0.9,
+                "step": 0.01
+            },
+            "requires_restart": false,
+            "visible_when_json": {}
+        },
+        {
+            "sort": 235,
+            "label": "Key terms",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "textarea",
+            "value_type": "string",
+            "description": "Comma-separated Deepgram keyterms for recognition bias.",
+            "setting_key": "stt.keyterm",
+            "options_json": {},
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {},
+            "requires_restart": false,
+            "visible_when_json": {}
+        },
+        {
+            "sort": 236,
+            "label": "Deepgram tags",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "textarea",
+            "value_type": "string",
+            "description": "Comma-separated Deepgram usage-report tags.",
+            "setting_key": "stt.tags",
+            "options_json": {},
+            "default_value": "",
+            "schema_version": 1,
+            "validation_json": {},
+            "requires_restart": false,
+            "visible_when_json": {}
+        },
+        {
+            "sort": 237,
+            "label": "Deepgram base URL",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "input",
+            "value_type": "string",
+            "description": "Optional Deepgram WebSocket endpoint override for direct Flux.",
+            "setting_key": "stt.base_url",
+            "options_json": {},
+            "default_value": "wss://api.deepgram.com/v2/listen",
+            "schema_version": 1,
+            "validation_json": {},
+            "requires_restart": false,
+            "visible_when_json": {}
+        },
+        {
+            "sort": 238,
+            "label": "Deepgram MIP opt-out",
+            "scope": "provider_profile",
+            "active": true,
+            "module": "stt",
+            "sensitive": false,
+            "ui_control": "toggle",
+            "value_type": "boolean",
+            "description": "Opt out Deepgram requests from the model improvement program.",
+            "setting_key": "stt.mip_opt_out",
+            "options_json": {},
+            "default_value": false,
+            "schema_version": 1,
+            "validation_json": {},
+            "requires_restart": false,
+            "visible_when_json": {}
         }
     ],
     "profile_bindings": [
@@ -1934,14 +2141,14 @@
             "profile_key": "llm_xai"
         },
         {
-            "note": "Base/cloud: основной STT Deepgram",
+            "note": "Base/cloud: прямой Deepgram Flux Multilingual",
             "slot": "primary",
             "sort": 50,
             "active": true,
             "category": "stt",
             "owner_key": "base",
             "owner_type": "runtime",
-            "profile_key": "stt_deepgram_ru_phone"
+            "profile_key": "stt_deepgram_flux_multilingual_direct"
         },
         {
             "note": "Base/cloud: основной TTS ElevenLabs v3",
@@ -2405,6 +2612,28 @@
             "description": "Turn detection and endpointing settings synchronized from current .env.local.",
             "profile_key": "turn_fast_phone",
             "display_name": "Turn handling current env",
+            "schema_version": 1
+        },
+        {
+            "kind": "stt",
+            "active": true,
+            "provider": "deepgram",
+            "config_json": {
+                "model": "flux-general-multi",
+                "language": "ru",
+                "provider": "deepgram",
+                "api_key_ref": "DEEPGRAM_API_KEY",
+                "api_version": "v2",
+                "sample_rate": 16000,
+                "eot_threshold": 0.7,
+                "eot_timeout_ms": 5000,
+                "language_hints": [
+                    "ru"
+                ]
+            },
+            "description": "Direct Deepgram /v2/listen Flux Multilingual profile with Russian language hint.",
+            "profile_key": "stt_deepgram_flux_multilingual_direct",
+            "display_name": "Deepgram Flux Multilingual Direct",
             "schema_version": 1
         }
     ]

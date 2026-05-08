@@ -237,7 +237,11 @@ async def test_resolve_prompt_uses_memory_cache_without_second_http_call(
 
     assert first.source == "directus:cache"
     assert second.source == "directus:memory_cache"
-    assert len(http_client.requests) == 2
+    assert [request[0] for request in http_client.requests] == [
+        "client_prompt_cache",
+        "clients",
+        "bot_configurations",
+    ]
 
 
 @pytest.mark.asyncio
@@ -319,7 +323,7 @@ async def test_resolve_prompt_reads_initial_greeting_from_bot_config(
                     "system_prompt": "specific strategy",
                     "examples": "dialogue example",
                     "skills_name": "skill_info+questions",
-                    "first_step": "Здравствуйте, вы позвонили в компанию X.",
+                    "first_step_text": "Здравствуйте, вы позвонили в компанию X.",
                 }
             ],
             "clients": [
@@ -348,6 +352,50 @@ async def test_resolve_prompt_reads_initial_greeting_from_bot_config(
 
 
 @pytest.mark.asyncio
+async def test_resolve_prompt_prefers_initial_greeting_from_client(
+    prompt_file, monkeypatch
+):
+    _enable_directus(monkeypatch)
+    http_client = _DirectusHttpClient(
+        {
+            "client_prompt_cache": [],
+            "CallerID": [{"CallerID": "+15550100", "client_id": 7}],
+            "bot_configurations": [
+                {
+                    "client_id": 7,
+                    "system_prompt": "specific strategy",
+                    "examples": "dialogue example",
+                    "skills_name": "skill_info+questions",
+                    "first_step_text": "Здравствуйте из bot_configurations.",
+                }
+            ],
+            "clients": [
+                {
+                    "id": 7,
+                    "add_info": "client knowledge",
+                    "company_website": "",
+                    "company_extra": "",
+                    "first_step": "Здравствуйте из clients.",
+                }
+            ],
+            "clients_prompt": [
+                {"name": "global_rules", "text": "global rules text"},
+                {"name": "skill_info+questions", "text": "skills text"},
+            ],
+            "transfer_number": [],
+        }
+    )
+
+    result = await prompt_repo.resolve_prompt_for_call(
+        sip_trunk_number="+15550100",
+        directus_client_factory=_directus_factory(http_client),
+    )
+
+    assert result.source == "directus:live"
+    assert result.initial_greeting == "Здравствуйте из clients."
+
+
+@pytest.mark.asyncio
 async def test_cached_prompt_reads_initial_greeting_from_bot_config(
     prompt_file, monkeypatch
 ):
@@ -366,7 +414,7 @@ async def test_cached_prompt_reads_initial_greeting_from_bot_config(
             "bot_configurations": [
                 {
                     "client_id": 7,
-                    "first_step": "Здравствуйте, вы позвонили в компанию X.",
+                    "first_step_text": "Здравствуйте, вы позвонили в компанию X.",
                 }
             ],
         }
@@ -379,6 +427,46 @@ async def test_cached_prompt_reads_initial_greeting_from_bot_config(
 
     assert result.source == "directus:cache"
     assert result.initial_greeting == "Здравствуйте, вы позвонили в компанию X."
+
+
+@pytest.mark.asyncio
+async def test_cached_prompt_prefers_initial_greeting_from_client(
+    prompt_file, monkeypatch
+):
+    _enable_directus(monkeypatch)
+    http_client = _DirectusHttpClient(
+        {
+            "client_prompt_cache": [
+                {
+                    "caller_id": "+15550100",
+                    "client_id": 7,
+                    "prompt_template": "cached prompt",
+                    "timezone": "Europe/Kaliningrad",
+                    "active": True,
+                }
+            ],
+            "clients": [
+                {
+                    "id": 7,
+                    "first_step": "Здравствуйте из clients.",
+                }
+            ],
+            "bot_configurations": [
+                {
+                    "client_id": 7,
+                    "first_step_text": "Здравствуйте из bot_configurations.",
+                }
+            ],
+        }
+    )
+
+    result = await prompt_repo.resolve_prompt_for_call(
+        sip_trunk_number="+15550100",
+        directus_client_factory=_directus_factory(http_client),
+    )
+
+    assert result.source == "directus:cache"
+    assert result.initial_greeting == "Здравствуйте из clients."
 
 
 @pytest.mark.asyncio

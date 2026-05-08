@@ -278,16 +278,16 @@ VOICE_RESPONSE_DELAY_PHRASE = (
 VOICE_INITIAL_GREETING_PHRASE = (
     os.getenv(
         "VOICE_INITIAL_GREETING_PHRASE",
-        "Здравствуйте! Это компания Кофемастер! Чем могу помочь?",
+        "Алло, здравствуйте.",
     ).strip()
-    or "Здравствуйте! Это компания Кофемастер! Чем могу помочь?"
+    or "Алло, здравствуйте."
 )
 VOICE_SHORT_GREETING_PHRASE = (
     os.getenv(
         "VOICE_SHORT_GREETING_PHRASE",
-        "Здравствуйте, я виртуальный ассистент. Подскажите, чем могу вам помочь?",
+        "Да, слушаю.",
     ).strip()
-    or "Здравствуйте, я виртуальный ассистент. Подскажите, чем могу вам помочь?"
+    or "Да, слушаю."
 )
 VOICE_AUDIO_CACHE_ENABLED = _env_bool("VOICE_AUDIO_CACHE_ENABLED", default=True)
 VOICE_AUDIO_CACHE_DIR = os.getenv("VOICE_AUDIO_CACHE_DIR", "cache").strip() or "cache"
@@ -735,4 +735,4 @@ INCIDENT_ENVIRONMENT = os.getenv(
     "local" if LIVEKIT_SELF_HOSTED else "cloud",
 ).strip() or ("local" if LIVEKIT_SELF_HOSTED else "cloud")
 INCIDENT_DB_TIMEOUT_SEC = float(os.getenv("INCIDENT_DB_TIMEOUT_SEC", "1.5"))
-INCIDENT_SLOW_RESPONSE_MS = int(os.getenv("INCIDENT_SLOW_RESPONSE_MS", "7000"))
+INCIDENT_SLOW_RESPONSE_MS = int(os.getenv("INCIDENT_SLOW_RESPONSE_MS", "4000"))

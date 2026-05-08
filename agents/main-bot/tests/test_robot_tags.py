@@ -26,6 +26,8 @@ def test_parse_status_end_selects_action_and_cleans_text() -> None:
 
 def test_parse_supported_tags() -> None:
     cases = [
+        ("Рада была помочь. [STATUS: INFO_CLOSE]", "status_info_close"),
+        ("Заявка принята. [STATUS: LEAD]", "status_lead"),
         ("Сейчас отправлю ссылку. [STATUS: SMS_LINK]", "status_sms_link"),
         ("Хорошо, перевожу. [TRANSFER: TR5]", "transfer"),
         (
@@ -64,7 +66,7 @@ def test_question_before_tag_ignores_action() -> None:
 
 
 def test_unknown_tags_are_hidden_but_not_selected() -> None:
-    parsed = parse_robot_tags("Заявка принята. [STATUS: LEAD] [вздыхает]")
+    parsed = parse_robot_tags("Заявка принята. [STATUS: CALLBACK] [вздыхает]")
 
     assert parsed.clean_text == "Заявка принята."
     assert parsed.selected is None

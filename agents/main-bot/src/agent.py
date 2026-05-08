@@ -249,6 +249,12 @@ from config import (
     YANDEX_SPEECHKIT_API_KEY,
 )
 from cosyvoice_tts import CosyVoiceTTS
+from deepgram_flux_stt import (
+    DeepgramFluxSTT,
+    is_deepgram_flux_model,
+    normalize_deepgram_flux_model,
+    normalize_language_hints,
+)
 from early_interim_final_stt import wrap_stt_if_enabled
 from egress import (
     aiohttp_proxy,
@@ -399,6 +405,17 @@ def _config_int(config: dict[str, Any], key: str, default: int) -> int:
     if value is None or value == "":
         return default
     return int(value)
+
+
+def _config_optional_int(config: dict[str, Any], key: str) -> int | None:
+    value = config.get(key)
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def _config_str_list(config: dict[str, Any], key: str) -> list[str]:
+    return normalize_language_hints(config.get(key))
 
 
 def _component_provider(
@@ -589,10 +606,23 @@ def get_job_id(ctx: JobContext) -> str | None:
     return None
 
 
-def metrics_value(metrics: Any, key: str) -> Any:
-    if isinstance(metrics, dict):
-        return metrics.get(key)
-    return getattr(metrics, key, None)
+def event_timestamp_seconds(event: Any, *, default: float | None = None) -> float | None:
+    created_at = getattr(event, "created_at", None)
+    if isinstance(created_at, datetime):
+        return created_at.timestamp()
+    if isinstance(created_at, (int, float)):
+        return float(created_at)
+    return default
+
+
+def turn_response_latency_ms(
+    *,
+    user_phrase_ended_at: float | None,
+    assistant_started_at: float | None,
+) -> float | None:
+    if user_phrase_ended_at is None or assistant_started_at is None:
+        return None
+    return round(max(0.0, assistant_started_at - user_phrase_ended_at) * 1000, 1)
 
 
 def normalize_provider_name(value: str | None) -> str:
@@ -714,6 +744,50 @@ def is_short_greeting_response(text: str | None) -> bool:
         return False
 
     return bool(_SHORT_GREETING_RE.fullmatch(normalized))
+
+
+def _existing_prerecorded_audio_path(audio_path: Path) -> Path | None:
+    return audio_path if audio_path.exists() else None
+
+
+async def resolve_short_greeting_audio_path(
+    *,
+    voice_audio_cache: VoiceAudioCache | None,
+    phrase: str,
+    prerecorded_path: Path,
+) -> Path | None:
+    existing_path = _existing_prerecorded_audio_path(prerecorded_path)
+    if existing_path is not None:
+        return existing_path
+    if voice_audio_cache is None:
+        return None
+    return await voice_audio_cache.get_or_create(
+        kind="short_greeting",
+        text=phrase,
+    )
+
+
+async def resolve_initial_greeting_audio(
+    *,
+    voice_audio_cache: VoiceAudioCache | None,
+    client_greeting: str | None,
+    default_greeting: str,
+    prerecorded_path: Path,
+) -> tuple[str, Path | None]:
+    resolved_client_greeting = (client_greeting or "").strip()
+    if resolved_client_greeting:
+        if voice_audio_cache is None:
+            return resolved_client_greeting, None
+        return resolved_client_greeting, await voice_audio_cache.get_or_create(
+            kind="initial_greeting",
+            text=resolved_client_greeting,
+        )
+
+    resolved_default_greeting = default_greeting.strip()
+    return (
+        resolved_default_greeting,
+        _existing_prerecorded_audio_path(prerecorded_path),
+    )
 
 
 def resolve_audio_output_sample_rate(
@@ -2793,17 +2867,72 @@ def build_stt(
             )
 
         deepgram_model = _config_str(profile_config, "model", STT_DEEPGRAM_MODEL)
+        deepgram_api_version = _config_optional_str(
+            profile_config,
+            "api_version",
+        ).lower()
         deepgram_language = _config_str(
             profile_config,
             "language",
             STT_DEEPGRAM_LANGUAGE,
         )
+        egress_mode = _component_egress(stt_profile)
+
+        if deepgram_api_version in {"2", "v2"} or is_deepgram_flux_model(
+            deepgram_model
+        ):
+            flux_model = normalize_deepgram_flux_model(deepgram_model)
+            flux_kwargs: dict[str, Any] = {
+                "api_key": DEEPGRAM_API_KEY,
+                "model": flux_model,
+                "language": deepgram_language,
+                "language_hints": _config_str_list(profile_config, "language_hints"),
+                "sample_rate": _config_int(profile_config, "sample_rate", 16000),
+                "mip_opt_out": _config_bool(profile_config, "mip_opt_out", False),
+                "http_session": create_external_aiohttp_session(
+                    "deepgram",
+                    external_http_sessions,
+                    egress_mode=egress_mode,
+                ),
+            }
+            eager_eot_threshold = _config_optional_float(
+                profile_config,
+                "eager_eot_threshold",
+            )
+            if eager_eot_threshold is not None:
+                flux_kwargs["eager_eot_threshold"] = eager_eot_threshold
+            eot_threshold = _config_optional_float(profile_config, "eot_threshold")
+            if eot_threshold is not None:
+                flux_kwargs["eot_threshold"] = eot_threshold
+            eot_timeout_ms = _config_optional_int(profile_config, "eot_timeout_ms")
+            if eot_timeout_ms is not None:
+                flux_kwargs["eot_timeout_ms"] = eot_timeout_ms
+            if keyterm := _config_str_list(profile_config, "keyterm"):
+                flux_kwargs["keyterm"] = keyterm
+            if tags := _config_str_list(profile_config, "tags"):
+                flux_kwargs["tags"] = tags
+            if base_url := _config_optional_str(profile_config, "base_url"):
+                flux_kwargs["base_url"] = base_url
+
+            logger.info(
+                "using Deepgram Flux STT provider",
+                extra={
+                    "model": flux_model,
+                    "language": deepgram_language,
+                    "language_hints": flux_kwargs["language_hints"],
+                    "egress": provider_egress("deepgram", mode_override=egress_mode),
+                },
+            )
+            return _wrap_stt_for_early_interim_final(
+                DeepgramFluxSTT(**flux_kwargs),
+                turn_profile=turn_profile,
+            )
+
         deepgram_endpointing_ms = _config_int(
             profile_config,
             "endpointing_ms",
             STT_DEEPGRAM_ENDPOINTING_MS,
         )
-        egress_mode = _component_egress(stt_profile)
         logger.info(
             "using Deepgram STT provider",
             extra={
@@ -2905,13 +3034,11 @@ class Assistant(Agent):
         with suppress(Exception):
             await self.session.interrupt(force=True)
 
-        audio_path = self._first_turn_short_greeting_audio_path
-        if self._voice_audio_cache is not None:
-            audio_path = await self._voice_audio_cache.get_or_create(
-                kind="short_greeting",
-                text=self._first_turn_short_greeting_phrase,
-                legacy_path=self._first_turn_short_greeting_audio_path,
-            )
+        audio_path = await resolve_short_greeting_audio_path(
+            voice_audio_cache=self._voice_audio_cache,
+            phrase=self._first_turn_short_greeting_phrase,
+            prerecorded_path=self._first_turn_short_greeting_audio_path,
+        )
         if audio_path is None:
             return
 
@@ -3590,6 +3717,8 @@ async def my_agent(ctx: JobContext):
     close_info = {"reason": None, "error": None}
     close_event = asyncio.Event()
     user_activity_count = 0
+    pending_user_phrase_end_at: float | None = None
+    pending_user_phrase_end_source: str | None = None
     assistant_message_count = 0
     end_call_task: asyncio.Task | None = None
     reply_watchdog_task: asyncio.Task | None = None
@@ -4191,57 +4320,12 @@ async def my_agent(ctx: JobContext):
                 if reply_watchdog_task and not reply_watchdog_task.done():
                     reply_watchdog_task.cancel()
                     reply_watchdog_task = None
-                item_metrics = getattr(item, "metrics", None)
-                e2e_latency = metrics_value(item_metrics, "e2e_latency")
-                if e2e_latency is not None:
-                    latency_ms = round(float(e2e_latency) * 1000, 1)
-                    if latency_ms >= INCIDENT_SLOW_RESPONSE_MS:
-                        incident_log.record_nowait(
-                            "slow_response",
-                            severity="warning",
-                            component="voice_pipeline",
-                            latency_ms=latency_ms,
-                            description="Assistant response latency exceeded threshold",
-                            payload={
-                                "threshold_ms": INCIDENT_SLOW_RESPONSE_MS,
-                                "e2e_latency_ms": latency_ms,
-                                "llm_node_ttft_ms": (
-                                    round(
-                                        float(
-                                            metrics_value(
-                                                item_metrics,
-                                                "llm_node_ttft",
-                                            )
-                                        )
-                                        * 1000,
-                                        1,
-                                    )
-                                    if metrics_value(item_metrics, "llm_node_ttft")
-                                    is not None
-                                    else None
-                                ),
-                                "tts_node_ttfb_ms": (
-                                    round(
-                                        float(
-                                            metrics_value(
-                                                item_metrics,
-                                                "tts_node_ttfb",
-                                            )
-                                        )
-                                        * 1000,
-                                        1,
-                                    )
-                                    if metrics_value(item_metrics, "tts_node_ttfb")
-                                    is not None
-                                    else None
-                                ),
-                            },
-                        )
         except Exception as e:
             logger.exception("conversation_item_added handler failed: %s", e)
 
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(ev):
+        nonlocal pending_user_phrase_end_at, pending_user_phrase_end_source
         nonlocal user_activity_count, end_call_task, reply_watchdog_task
         try:
             transcript_items.append(
@@ -4265,7 +4349,14 @@ async def my_agent(ctx: JobContext):
                 )
                 # Any new user speech cancels a pending auto-hangup timer.
                 user_activity_count += 1
-                if bool(getattr(ev, "is_final", False)) and REPLY_WATCHDOG_SEC > 0:
+                is_final = bool(getattr(ev, "is_final", False))
+                if is_final and pending_user_phrase_end_at is None:
+                    pending_user_phrase_end_at = event_timestamp_seconds(
+                        ev,
+                        default=time.time(),
+                    )
+                    pending_user_phrase_end_source = "final_transcript"
+                if is_final and REPLY_WATCHDOG_SEC > 0:
                     if reply_watchdog_task and not reply_watchdog_task.done():
                         reply_watchdog_task.cancel()
                     reply_watchdog_task = asyncio.create_task(
@@ -4279,6 +4370,7 @@ async def my_agent(ctx: JobContext):
 
     @session.on("user_state_changed")
     def on_user_state_changed(ev):
+        nonlocal pending_user_phrase_end_at, pending_user_phrase_end_source
         try:
             old_state = getattr(ev, "old_state", None)
             new_state = getattr(ev, "new_state", None)
@@ -4289,10 +4381,14 @@ async def my_agent(ctx: JobContext):
                 extra={"old_state": old_state_value, "new_state": new_state_value},
             )
             if new_state_value == "speaking":
+                pending_user_phrase_end_at = None
+                pending_user_phrase_end_source = None
                 voice_prompts.on_user_started_speaking()
                 return
             if old_state_value == "speaking" and new_state_value == "listening":
-                ended_at = getattr(ev, "created_at", None)
+                ended_at = event_timestamp_seconds(ev, default=time.time())
+                pending_user_phrase_end_at = ended_at
+                pending_user_phrase_end_source = "user_state_changed"
                 if isinstance(ended_at, (int, float)):
                     logger.info(
                         "local VAD end of speech",
@@ -4322,6 +4418,7 @@ async def my_agent(ctx: JobContext):
 
     @session.on("agent_state_changed")
     def on_agent_state_changed(ev):
+        nonlocal pending_user_phrase_end_at, pending_user_phrase_end_source
         nonlocal reply_watchdog_task
         try:
             old_state = getattr(ev, "old_state", None)
@@ -4348,7 +4445,32 @@ async def my_agent(ctx: JobContext):
                 tts_first_frame_yielded_at = assistant._tts_first_frame_yielded_at
                 assistant._tts_first_frame_ready_at = None
                 assistant._tts_first_frame_yielded_at = None
-                created_at = getattr(ev, "created_at", None)
+                created_at = event_timestamp_seconds(ev, default=time.time())
+                latency_ms = turn_response_latency_ms(
+                    user_phrase_ended_at=pending_user_phrase_end_at,
+                    assistant_started_at=created_at,
+                )
+                if latency_ms is not None:
+                    if latency_ms >= INCIDENT_SLOW_RESPONSE_MS:
+                        incident_log.record_nowait(
+                            "slow_response",
+                            severity="warning",
+                            component="voice_pipeline",
+                            latency_ms=latency_ms,
+                            description=(
+                                "Assistant speech started after response latency "
+                                "threshold"
+                            ),
+                            payload={
+                                "threshold_ms": INCIDENT_SLOW_RESPONSE_MS,
+                                "measured_from": pending_user_phrase_end_source,
+                                "user_phrase_ended_at": pending_user_phrase_end_at,
+                                "assistant_started_speaking_at": created_at,
+                                "user_activity_count": user_activity_count,
+                            },
+                        )
+                    pending_user_phrase_end_at = None
+                    pending_user_phrase_end_source = None
                 if isinstance(created_at, (int, float)):
                     logger.info(
                         "agent playback started latency",
@@ -4718,14 +4840,13 @@ async def my_agent(ctx: JobContext):
             ),
             name="runtime_warmup_backends",
         )
-        initial_greeting = (
-            (prompt_resolution.initial_greeting or "").strip()
-            or VOICE_INITIAL_GREETING_PHRASE
-        )
-        initial_greeting_audio_path = await voice_audio_cache.get_or_create(
-            kind="initial_greeting",
-            text=initial_greeting,
-            legacy_path=_INITIAL_GREETING_AUDIO_PATH,
+        initial_greeting, initial_greeting_audio_path = (
+            await resolve_initial_greeting_audio(
+                voice_audio_cache=voice_audio_cache,
+                client_greeting=prompt_resolution.initial_greeting,
+                default_greeting=VOICE_INITIAL_GREETING_PHRASE,
+                prerecorded_path=_INITIAL_GREETING_AUDIO_PATH,
+            )
         )
         played_initial_greeting = False
         if initial_greeting_audio_path is not None:

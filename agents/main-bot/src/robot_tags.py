@@ -3,6 +3,8 @@
 Supported action tags:
 - [STATUS: END]: speak cleaned text, then end the call.
 - [STATUS: SPAM]: speak cleaned text, then end the call.
+- [STATUS: INFO_CLOSE]: speak cleaned text, then end the call after info close.
+- [STATUS: LEAD]: speak cleaned text, then end the call after a lead handoff.
 - [STATUS: SMS_LINK]: speak cleaned text, then run the SMS link placeholder skill.
 - [TRANSFER: ID]: speak cleaned text, then record a transfer placeholder event.
 - [GEO_SEARCH: city, object/street]: speak cleaned text, then record a geo placeholder event.
@@ -23,7 +25,7 @@ _BRACKETED_RE = re.compile(r"\[[^\[\]]*\]")
 _STATUS_RE = re.compile(r"^STATUS\s*:\s*(?P<status>[A-Z_]+)\s*$", re.IGNORECASE)
 _TRANSFER_RE = re.compile(r"^TRANSFER\s*:\s*(?P<target>.+)$", re.IGNORECASE)
 _GEO_SEARCH_RE = re.compile(r"^GEO_SEARCH\s*:\s*(?P<query>.+)$", re.IGNORECASE)
-_SUPPORTED_STATUSES = {"END", "SPAM", "SMS_LINK"}
+_SUPPORTED_STATUSES = {"END", "SPAM", "INFO_CLOSE", "LEAD", "SMS_LINK"}
 
 
 @dataclass(frozen=True)

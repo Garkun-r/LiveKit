@@ -1,13 +1,34 @@
 import pytest
 from livekit import rtc
 
-from agent import extract_sip_call_numbers, is_short_greeting_response
+from agent import (
+    extract_sip_call_numbers,
+    is_short_greeting_response,
+    resolve_initial_greeting_audio,
+    resolve_short_greeting_audio_path,
+)
 
 
 class _Participant:
     def __init__(self, *, attributes, kind=rtc.ParticipantKind.PARTICIPANT_KIND_SIP):
         self.attributes = attributes
         self.kind = kind
+
+
+class _VoiceAudioCache:
+    def __init__(self, audio_path):
+        self.audio_path = audio_path
+        self.calls = []
+
+    async def get_or_create(self, *, kind, text, legacy_path=None):
+        self.calls.append(
+            {
+                "kind": kind,
+                "text": text,
+                "legacy_path": legacy_path,
+            }
+        )
+        return self.audio_path
 
 
 @pytest.mark.parametrize(
@@ -43,6 +64,63 @@ def test_is_short_greeting_response_rejects_questions_and_other_phrases(
     text: str | None,
 ) -> None:
     assert is_short_greeting_response(text) is False
+
+
+@pytest.mark.asyncio
+async def test_default_initial_greeting_uses_prerecorded_audio(tmp_path) -> None:
+    audio_path = tmp_path / "1.wav"
+    audio_path.write_bytes(b"wav")
+    cache = _VoiceAudioCache(tmp_path / "cached.wav")
+
+    greeting, resolved_audio_path = await resolve_initial_greeting_audio(
+        voice_audio_cache=cache,
+        client_greeting=None,
+        default_greeting="Алло, здравствуйте.",
+        prerecorded_path=audio_path,
+    )
+
+    assert greeting == "Алло, здравствуйте."
+    assert resolved_audio_path == audio_path
+    assert cache.calls == []
+
+
+@pytest.mark.asyncio
+async def test_client_initial_greeting_uses_voice_cache(tmp_path) -> None:
+    cached_path = tmp_path / "client.wav"
+    cache = _VoiceAudioCache(cached_path)
+
+    greeting, resolved_audio_path = await resolve_initial_greeting_audio(
+        voice_audio_cache=cache,
+        client_greeting="Здравствуйте, это компания X.",
+        default_greeting="Алло, здравствуйте.",
+        prerecorded_path=tmp_path / "1.wav",
+    )
+
+    assert greeting == "Здравствуйте, это компания X."
+    assert resolved_audio_path == cached_path
+    assert cache.calls == [
+        {
+            "kind": "initial_greeting",
+            "text": "Здравствуйте, это компания X.",
+            "legacy_path": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_short_greeting_uses_prerecorded_audio(tmp_path) -> None:
+    audio_path = tmp_path / "2.wav"
+    audio_path.write_bytes(b"wav")
+    cache = _VoiceAudioCache(tmp_path / "cached.wav")
+
+    resolved_audio_path = await resolve_short_greeting_audio_path(
+        voice_audio_cache=cache,
+        phrase="Да, слушаю.",
+        prerecorded_path=audio_path,
+    )
+
+    assert resolved_audio_path == audio_path
+    assert cache.calls == []
 
 
 def test_extract_sip_call_numbers_prefers_mapped_x_did_attribute() -> None:

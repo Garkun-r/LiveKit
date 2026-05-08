@@ -58,6 +58,9 @@ Repository-specific rules:
 - Before adding new plugins, tools, provider integrations, or diagnostic
   behavior, read `docs/robot-diagnostics.md` and use the shared incident log
   contract instead of inventing a separate error table/log format.
+- During diagnostics, do not edit the robot prompt, system prompt, or prompt
+  sources unless the user explicitly asks for prompt changes. You may propose
+  prompt ideas separately as recommendations.
 - Do not rename files or folders without a clear reason.
 - Preserve project structure unless a change is clearly required.
 

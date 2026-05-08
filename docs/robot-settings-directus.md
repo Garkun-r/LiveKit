@@ -62,6 +62,17 @@ Asterisk-профилей, где тот же провайдер может ид
    применяться без ручного добавления через UI;
 3. чтение этого ключа в коде сборки компонента.
 
+Если runtime начинает читать новый столбец или таблицу Directus, нужно отдельно
+обновить права роли `Livekit`. Это нормальная часть изменения, а не обход
+безопасности. Правило: агенту даются только нужные `read`-поля, `create/update`
+только для runtime-owned таблиц вроде cache/incident log, без `delete` и без
+admin-token в LiveKit Cloud. Для prompt/cache доступа актуальная миграция лежит
+в `agents/main-bot/schema/directus_prompt_permissions.sql`.
+
+Если поля или таблицы еще нет в БД, сначала нужна явная SQL-миграция схемы,
+затем Directus metadata/permissions, затем проверка тем же service-token,
+который используется в Cloud.
+
 Секретные значения в Directus не хранятся. В профилях используются ссылки:
 `api_key_ref`, `credentials_ref`, `auth_key_ref`, `api_key_env_name`.
 

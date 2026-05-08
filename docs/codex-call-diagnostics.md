@@ -12,7 +12,8 @@ The realtime LiveKit agent remains unchanged. Diagnostics run after the call:
 2. n8n calls the VPS worker endpoint:
    `POST /aftercall?target=cloud` or `POST /aftercall?target=local`.
 3. The worker loads enabled `robot_diagnostic_rules` from Directus.
-4. The worker loads matching `robot_incidents` rows by room, caller, or DID.
+4. The worker loads matching `robot_incidents` rows by target, call window,
+   room, caller, or DID.
 5. The worker creates a `robot_call_audits` row.
 6. The worker collects a small read-only LiveKit CLI snapshot.
 7. The worker runs:
@@ -22,9 +23,40 @@ The realtime LiveKit agent remains unchanged. Diagnostics run after the call:
    ```
 
 8. The worker writes the full report back to Directus.
-9. The worker calls the n8n audit-notification webhook. n8n sends Telegram to
-   the same chat and through the same bot/token path as low-score aftercall
-   alerts.
+9. If the matched rule's `telegram_policy` allows it, the worker calls the n8n
+   audit-notification webhook. n8n sends a Russian Telegram brief to the same
+   chat and through the same bot/token path as low-score aftercall alerts. The
+   brief includes a link to the specific `robot_call_audits` item in Directus
+   and an inline button labeled `отправить полный отчет`. The brief also shows
+   the call start/end time and, when n8n passes it, a link to the exact
+   `AFTER CALL` execution that launched diagnostics. Each top finding must
+   name the dialog stage, approximate turn/time, exact tag/value/event when
+   relevant, concrete evidence, and an implementation idea.
+10. When that button is pressed, n8n receives the Telegram callback, asks the
+    worker for the full report by `audit_id`, and sends the full Russian report
+    back to the same chat. The full report is chunked for Telegram limits and
+    includes the sections for timeline, pauses/delays, errors/incidents,
+    anomalies, suspected cause, recommendations, implementation ideas, missing
+    evidence, and the no-auto-fix guarantee.
+
+## Report Quality Contract
+
+Reports should reduce follow-up questions from a non-technical owner. A finding
+is not acceptable if it only says "long pause" or "tag mismatch". It must say:
+
+- where in the dialog it happened: greeting, qualification, main request,
+  closing, or after the conversation looked finished;
+- the approximate timestamp/turn and adjacent phrases, especially for pauses;
+- the exact object: tag name/value/action, event name, metric, node, code path,
+  or "not visible in supplied data";
+- evidence versus inference;
+- what evidence is still missing if the cause is uncertain;
+- the concrete implementation idea: what to inspect or change next.
+
+For example, a tag finding should name the exact tag and explain whether the
+current repository logic hides it, ignores it, or still routes it to an action.
+If the exact tag is not present in the aftercall payload or logs, the report
+must say that explicitly instead of guessing.
 
 ## Directus Tables
 
@@ -41,8 +73,11 @@ agents/main-bot/schema/robot_codex_diagnostics_directus.sql
 - `trigger_mode`: `all_calls`, `incidents`, `xdid`, `caller`, or `manual`.
 - `scope_value`: xDID/DID/caller value for scoped modes.
 - `min_severity`: minimum incident severity for `incidents` mode.
-- `telegram_policy`: `anomaly_brief`, `critical_only`, or `silent`.
-- `cooldown_sec`: reserved for n8n/worker duplicate control.
+- `telegram_policy`: `anomaly_brief` always sends a brief, `critical_only`
+  sends only for `critical` verdicts, and `silent` writes Directus only.
+- `cooldown_sec`: skips new audits for the same rule and target while a recent
+  audit is still inside the cooldown window. Exact duplicate calls are also
+  skipped by `dedupe_key`.
 
 `robot_call_audits` stores queued/running/completed/failed audit jobs and the
 Codex report.
@@ -55,6 +90,9 @@ server-side secret store:
 ```env
 CODEX_DIAGNOSTICS_DIRECTUS_URL=https://jcall.io/directus
 CODEX_DIAGNOSTICS_DIRECTUS_TOKEN=
+# Optional override for the browser UI base. If unset, the worker derives
+# https://.../directus/admin/content/robot_call_audits/<id> from DIRECTUS_URL.
+CODEX_DIAGNOSTICS_DIRECTUS_APP_URL=https://jcall.io/directus
 CODEX_DIAGNOSTICS_N8N_WEBHOOK_URL=
 CODEX_DIAGNOSTICS_N8N_WEBHOOK_TOKEN=
 CODEX_DIAGNOSTICS_REPO_DIR=/opt/jcall-livekit-agent/source
@@ -112,7 +150,7 @@ spawned Codex process.
 From the repository root or a checked-out copy on the VPS:
 
 ```console
-uv run python ../../shared/webhooks/codex_diagnostics.py serve
+uv run python shared/webhooks/codex_diagnostics.py serve
 ```
 
 If running outside `agents/main-bot`, use the Python environment that has
@@ -126,14 +164,47 @@ uv run python ../../shared/webhooks/codex_diagnostics.py aftercall \
   --payload-file /tmp/aftercall-payload.json
 ```
 
+Manual fixture run from `agents/main-bot`:
+
+```console
+uv run python ../../shared/webhooks/codex_diagnostics.py manual \
+  --target cloud \
+  --payload-file /tmp/aftercall-payload.json
+```
+
 ## n8n Integration
 
 The aftercall workflow should call:
 
 ```http
-POST http://172.18.0.1:18181/aftercall?target=cloud
-POST http://172.18.0.1:18181/aftercall?target=local
+POST http://172.18.0.1:18181/aftercall?target=cloud&async=1
+POST http://172.18.0.1:18181/aftercall?target=local&async=1
 ```
+
+Manual audit jobs use a separate endpoint and only match rules where
+`trigger_mode=manual`:
+
+```http
+POST http://172.18.0.1:18181/manual?target=cloud&async=1
+POST http://172.18.0.1:18181/manual?target=local&async=1
+```
+
+Use `async=1` from n8n so the aftercall webhook responds immediately while the
+Codex audit continues in the worker background thread. Omit `async=1` only for
+local one-shot debugging where it is acceptable to wait for `codex exec`.
+The n8n HTTP node should merge execution metadata into the JSON body before
+calling the worker:
+
+```json
+{
+  "...original aftercall payload": "...",
+  "codex_diagnostics_aftercall_execution_id": "$execution.id",
+  "codex_diagnostics_aftercall_workflow_id": "$workflow.id",
+  "codex_diagnostics_aftercall_url": "https://n8n.jcall.io/workflow/<workflowId>/executions/<executionId>"
+}
+```
+
+This metadata is non-secret and is used only for report links.
 
 Use `target=cloud` for LiveKit Cloud calls and `target=local` for the
 self-hosted/Asterisk LiveKit path. This target controls which LiveKit endpoint
@@ -145,6 +216,18 @@ the Asterisk host and reads the existing `LIVEKIT_*` env there.
 
 The worker sends the final Telegram brief to n8n through
 `CODEX_DIAGNOSTICS_N8N_WEBHOOK_URL`; Telegram credentials remain owned by n8n.
+The full-report button callback is also handled by n8n. n8n should call the
+local worker endpoint:
+
+```http
+POST http://172.18.0.1:18181/telegram/full-report
+Content-Type: application/json
+
+{"audit_id": 123, "chat_id": -100...}
+```
+
+The worker returns `messages`, an array of Russian report chunks ready for
+Telegram delivery.
 
 ## Safety Rules
 

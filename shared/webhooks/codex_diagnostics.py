@@ -15,18 +15,30 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
 SEVERITY_ORDER = {"info": 0, "warning": 1, "error": 2, "critical": 3}
 VERDICTS = {"ok", "watch", "needs_attention", "critical"}
+VALID_TARGETS = {"cloud", "local"}
+INCIDENT_WINDOW_BEFORE = timedelta(minutes=5)
+INCIDENT_WINDOW_AFTER = timedelta(minutes=10)
+VERDICT_LABELS_RU = {
+    "ok": "ок",
+    "watch": "наблюдать",
+    "needs_attention": "требует внимания",
+    "critical": "критично",
+}
+TARGET_LABELS_RU = {"cloud": "облако", "local": "локальный"}
 SECRET_KEY_RE = re.compile(r"(?i)(authorization|api[_-]?key|token|secret|password)")
 SECRET_VALUE_RE = re.compile(
     r"(authorization\s*[:=]\s*)(bearer|basic)\s+[^\s,;]+|"
@@ -48,10 +60,98 @@ CODEX_ENV_ALLOWLIST = {
     "SSL_CERT_FILE",
     "REQUESTS_CA_BUNDLE",
 }
+DEFAULT_REPORT_TIMEZONE = "Europe/Kaliningrad"
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        text = str(value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def report_timezone() -> ZoneInfo | timezone:
+    name = os.getenv("CODEX_DIAGNOSTICS_REPORT_TZ", DEFAULT_REPORT_TIMEZONE)
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        return timezone.utc
+
+
+def format_datetime_for_report(value: Any) -> str | None:
+    parsed = parse_datetime(value)
+    if parsed is None:
+        return None
+    tz = report_timezone()
+    suffix = getattr(tz, "key", "UTC")
+    return f"{parsed.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S')} ({suffix})"
+
+
+def format_call_time(
+    *, started_at: Any = None, ended_at: Any = None, duration_sec: Any = None
+) -> str:
+    start_text = format_datetime_for_report(started_at)
+    end_text = format_datetime_for_report(ended_at)
+    parts = []
+    if start_text:
+        parts.append(f"начало {start_text}")
+    if end_text:
+        parts.append(f"конец {end_text}")
+    if duration_sec not in {None, ""}:
+        try:
+            parts.append(f"длительность {float(duration_sec):.1f} сек")
+        except (TypeError, ValueError):
+            parts.append(f"длительность {duration_sec}")
+    return ", ".join(parts) if parts else "-"
+
+
+def aftercall_execution_url_from_payload(payload: dict[str, Any]) -> str | None:
+    diagnostics = (
+        payload.get("codex_diagnostics")
+        if isinstance(payload.get("codex_diagnostics"), dict)
+        else {}
+    )
+    direct_url = (
+        payload.get("aftercall_execution_url")
+        or payload.get("codex_diagnostics_aftercall_url")
+        or diagnostics.get("aftercall_execution_url")
+    )
+    if direct_url:
+        return str(direct_url)
+    execution_id = (
+        payload.get("aftercall_execution_id")
+        or payload.get("codex_diagnostics_aftercall_execution_id")
+        or diagnostics.get("aftercall_execution_id")
+    )
+    if not execution_id:
+        return None
+    workflow_id = (
+        payload.get("aftercall_workflow_id")
+        or payload.get("codex_diagnostics_aftercall_workflow_id")
+        or diagnostics.get("aftercall_workflow_id")
+        or "yj1KNjeuDOcJZNSS"
+    )
+    base_url = os.getenv("CODEX_DIAGNOSTICS_N8N_BASE_URL", "https://n8n.jcall.io")
+    return f"{base_url.rstrip('/')}/workflow/{workflow_id}/executions/{execution_id}"
+
+
+def normalize_target(value: Any) -> str:
+    target = str(value or "").strip().lower()
+    if target not in VALID_TARGETS:
+        raise ValueError("target must be cloud or local")
+    return target
 
 
 def normalize_digits(value: Any) -> str:
@@ -124,7 +224,7 @@ class CallContext:
             or sip.get("caller_phone")
         )
         return cls(
-            target=str(resolved_target).strip().lower() or "cloud",
+            target=normalize_target(resolved_target or "cloud"),
             room_name=payload.get("room_name") or payload.get("room"),
             caller_phone=str(caller) if caller else None,
             did=str(did) if did else None,
@@ -196,7 +296,7 @@ def rule_matches(
     if rule.trigger_mode == "manual":
         return trigger == "manual"
     if trigger == "manual":
-        return True
+        return False
     if rule.trigger_mode == "all_calls":
         return True
     if rule.trigger_mode == "incidents":
@@ -232,6 +332,32 @@ def audit_dedupe_key(call: CallContext, rule: DiagnosticRule) -> str:
     return f"{call.target}:{rule.id or 'rule'}:{rule.trigger_mode}:{call_key}"
 
 
+def incident_time_filters(call: CallContext) -> dict[str, str]:
+    filters: dict[str, str] = {}
+    started_at = parse_datetime(call.started_at)
+    ended_at = parse_datetime(call.ended_at)
+    if started_at is not None:
+        filters["filter[created_at][_gte]"] = (
+            started_at - INCIDENT_WINDOW_BEFORE
+        ).isoformat()
+    if ended_at is not None:
+        filters["filter[created_at][_lte]"] = (
+            ended_at + INCIDENT_WINDOW_AFTER
+        ).isoformat()
+    return filters
+
+
+def telegram_skip_status(rule: DiagnosticRule, report: dict[str, Any]) -> str | None:
+    if rule.telegram_policy == "silent":
+        return "skipped:silent"
+    if (
+        rule.telegram_policy == "critical_only"
+        and report.get("verdict") != "critical"
+    ):
+        return "skipped:critical_only"
+    return None
+
+
 def build_codex_prompt(
     *,
     call: CallContext,
@@ -264,7 +390,28 @@ def build_codex_prompt(
         "and the supplied call context. Look for errors, strange behavior, delayed "
         "responses, watchdog/fallback events, abnormal close, user frustration, "
         "and mismatches with the current robot logic. Produce only JSON that "
-        "matches the provided output schema.\n\n"
+        "matches the provided output schema. All human-readable strings in "
+        "summary, findings, recommendations, telegram_brief, and markdown must "
+        "be written in clear Russian for a non-technical business owner. Avoid "
+        "raw JSON/log dumps in human-readable fields. The telegram_brief field "
+        "must be a concise Russian Telegram brief with no English labels. The "
+        "markdown field must be a full Russian report with these sections: "
+        "Краткий итог, Хронология звонка, Паузы и задержки, Ошибки и инциденты, "
+        "Аномалии поведения, Предполагаемая причина, Рекомендации, Гарантия "
+        "безопасности. If a section has no data, say so plainly in Russian.\n\n"
+        "Quality bar for every finding: answer what exactly happened, where in "
+        "the dialog it happened, which event/tag/value/code-path proves it, why "
+        "it matters, what evidence is missing, and what implementation change "
+        "would reduce the issue. Do not write generic findings like 'tag logic "
+        "mismatch' without naming the exact tag/value/action and the repository "
+        "logic or document section you compared it with. For long pauses, name "
+        "the previous assistant phrase, the next user phrase, the approximate "
+        "timestamp or turn, and whether it was greeting, qualification, main "
+        "request, closing, or after the conversation already seemed finished. "
+        "Separate facts from inference. If the stage, tag, or cause cannot be "
+        "determined from the data, explicitly write that in missing_evidence "
+        "instead of guessing. The telegram_brief must include the stage, exact "
+        "detail, evidence, and implementation idea for each top finding.\n\n"
         f"Audit context summary:\n{json.dumps(redact(evidence_hint), ensure_ascii=False, indent=2)}\n\n"
         "The full sanitized audit input is attached on stdin as JSON."
     )
@@ -619,7 +766,12 @@ class DirectusClient:
         return [DiagnosticRule.from_directus(item) for item in data or []]
 
     def list_incidents_for_call(self, call: CallContext) -> list[dict[str, Any]]:
-        params: dict[str, str] = {"sort": "-created_at", "limit": "50"}
+        params: dict[str, str] = {
+            "sort": "-created_at",
+            "limit": "50",
+            "filter[environment][_eq]": call.target,
+        }
+        params.update(incident_time_filters(call))
         if call.room_name:
             params["filter[room_name][_eq]"] = call.room_name
         elif call.caller_phone:
@@ -629,6 +781,28 @@ class DirectusClient:
         else:
             return []
         return self._request("GET", "/items/robot_incidents", params=params) or []
+
+    def find_recent_audit_for_rule(
+        self, *, call: CallContext, rule: DiagnosticRule
+    ) -> dict[str, Any] | None:
+        if not rule.id or rule.cooldown_sec <= 0:
+            return None
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=rule.cooldown_sec)
+        data = self._request(
+            "GET",
+            "/items/robot_call_audits",
+            params={
+                "filter[matched_rule][_eq]": str(rule.id),
+                "filter[target][_eq]": call.target,
+                "filter[created_at][_gte]": cutoff.isoformat(),
+                "fields": "id,status,verdict,created_at",
+                "sort": "-created_at",
+                "limit": "1",
+            },
+        )
+        if not data:
+            return None
+        return data[0]
 
     def find_audit_by_dedupe_key(self, dedupe_key: str) -> dict[str, Any] | None:
         data = self._request(
@@ -675,12 +849,20 @@ class DirectusClient:
             "input_payload": redact(call.payload),
             "dedupe_key": dedupe_key,
         }
-        data = self._request(
-            "POST",
-            "/items/robot_call_audits",
-            params={"fields": "id"},
-            json=payload,
-        )
+        try:
+            data = self._request(
+                "POST",
+                "/items/robot_call_audits",
+                params={"fields": "id"},
+                json=payload,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in {400, 409}:
+                raise
+            existing = self.find_audit_by_dedupe_key(dedupe_key)
+            if existing is None:
+                raise
+            return int(existing["id"]), False
         return int(data["id"]), True
 
     def get_audit(self, audit_id: int) -> dict[str, Any]:
@@ -699,22 +881,61 @@ def report_markdown(report: dict[str, Any]) -> str:
     findings = (
         report.get("findings") if isinstance(report.get("findings"), list) else []
     )
+    verdict = str(report.get("verdict") or "unknown")
     lines = [
-        f"# Call Audit: {report.get('verdict', 'unknown')}",
+        f"# Диагностический отчет: {VERDICT_LABELS_RU.get(verdict, verdict)}",
         "",
+        "## Краткий итог",
         str(report.get("summary", "")),
+        "",
+        "## Хронология звонка",
+        "Отдельная хронология не была сформирована в JSON-отчете.",
+        "",
+        "## Паузы и задержки",
+        "Отдельные данные по паузам и задержкам не были сформированы в JSON-отчете.",
+        "",
+        "## Ошибки и инциденты",
     ]
-    for item in findings:
+    if not findings:
+        lines.append("Ошибки и инциденты не указаны.")
+    for index, item in enumerate(findings, start=1):
         lines.extend(
             [
                 "",
-                f"## {item.get('title', 'Finding')}",
-                f"Severity: {item.get('severity', 'info')}",
-                f"Evidence: {item.get('evidence', '')}",
-                f"Recommendation: {item.get('recommendation', '')}",
+                f"### Находка {index}: {item.get('title', 'без названия')}",
+                f"Серьезность: {item.get('severity', 'info')}",
+                f"Этап диалога: {item.get('stage', 'не указан')}",
+                f"Момент: {item.get('event_time_or_turn', 'не указан')}",
+                f"Конкретная деталь: {item.get('exact_detail', 'не указана')}",
+                f"Доказательства: {item.get('evidence', '')}",
+                f"Почему это важно: {item.get('why_it_matters', '')}",
+                f"Предполагаемая причина: {item.get('suspected_cause', '')}",
+                f"Рекомендация: {item.get('recommendation', '')}",
+                f"Идея реализации: {item.get('implementation_idea', '')}",
+                f"Чего не хватает для проверки: {item.get('missing_evidence', '')}",
             ]
         )
+    recommendations = report.get("recommendations")
+    if isinstance(recommendations, list) and recommendations:
+        lines.extend(["", "## Рекомендации"])
+        lines.extend(f"- {item}" for item in recommendations)
+    lines.extend(
+        [
+            "",
+            "## Гарантия безопасности",
+            "Автоисправления не выполнялись: диагностика только читает данные и пишет отчет.",
+        ]
+    )
     return "\n".join(lines).strip()
+
+
+def directus_audit_report_url(*, directus_url: str, audit_id: int) -> str:
+    app_url = (
+        os.getenv("CODEX_DIAGNOSTICS_DIRECTUS_APP_URL") or directus_url
+    ).rstrip("/")
+    if app_url.endswith("/admin"):
+        return f"{app_url}/content/robot_call_audits/{audit_id}"
+    return f"{app_url}/admin/content/robot_call_audits/{audit_id}"
 
 
 def telegram_payload(
@@ -724,29 +945,163 @@ def telegram_payload(
     report: dict[str, Any],
     directus_url: str,
 ) -> dict[str, Any]:
+    report_url = directus_audit_report_url(
+        directus_url=directus_url, audit_id=audit_id
+    )
     findings = (
         report.get("findings") if isinstance(report.get("findings"), list) else []
     )
     top = findings[:3]
+    verdict = str(report.get("verdict") or "unknown")
+    target = str(call.target or "-")
+    call_time = format_call_time(
+        started_at=call.started_at,
+        ended_at=call.ended_at,
+        duration_sec=call.payload.get("duration_sec"),
+    )
+    aftercall_url = aftercall_execution_url_from_payload(call.payload)
     text_lines = [
-        f"Codex audit: {report.get('verdict', 'unknown')}",
-        f"Target: {call.target}",
-        f"Room: {call.room_name or '-'}",
-        f"DID/xDID: {call.xdid or call.did or '-'}",
-        f"Caller: {call.caller_phone or '-'}",
+        f"Вердикт: {VERDICT_LABELS_RU.get(verdict, verdict)}",
+        f"Цель: {TARGET_LABELS_RU.get(target, target)}",
+        f"Комната: {call.room_name or '-'}",
+        f"Время звонка: {call_time}",
+        f"Номер DID/xDID: {call.xdid or call.did or '-'}",
+        f"Звонящий: {call.caller_phone or '-'}",
     ]
+    if aftercall_url:
+        text_lines.append(f"Прогон aftercall: {aftercall_url}")
     for item in top:
-        text_lines.append(f"- {item.get('title')}: {item.get('evidence')}")
+        finding_parts = [f"- {item.get('title', 'Находка')}"]
+        stage = str(item.get("stage") or "").strip()
+        event_time = str(item.get("event_time_or_turn") or "").strip()
+        exact_detail = str(item.get("exact_detail") or "").strip()
+        evidence = str(item.get("evidence") or "").strip()
+        implementation_idea = str(
+            item.get("implementation_idea") or item.get("recommendation") or ""
+        ).strip()
+        for label, value in [
+            ("Этап", stage),
+            ("Момент", event_time),
+            ("Деталь", exact_detail),
+            ("Доказательство", evidence),
+            ("Что поменять", implementation_idea),
+        ]:
+            if value:
+                finding_parts.append(f"{label}: {value.rstrip('. ')}.")
+        text_lines.append(" ".join(finding_parts))
     if not top:
-        text_lines.append(str(report.get("summary", "")))
-    text_lines.append(f"Directus audit id: {audit_id}")
+        summary = str(report.get("summary", "")).strip()
+        if summary:
+            text_lines.append(summary)
+    text_lines.append(f"Полный отчет: {report_url}")
     return {
         "audit_id": audit_id,
         "target": call.target,
-        "verdict": report.get("verdict"),
-        "telegram_brief": report.get("telegram_brief") or "\n".join(text_lines),
+        "verdict": verdict,
+        "telegram_brief": "\n".join(text_lines),
         "text": "\n".join(text_lines),
+        "button_text": "отправить полный отчет",
+        "callback_data": f"codex_full_report:{audit_id}",
+        "reply_markup": {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "отправить полный отчет",
+                        "callback_data": f"codex_full_report:{audit_id}",
+                    }
+                ]
+            ]
+        },
+        "directus_report_url": report_url,
+        "report_url": report_url,
+        "aftercall_execution_url": aftercall_url,
         "directus_url": directus_url,
+    }
+
+
+def split_telegram_text(text: str, *, limit: int = 3600) -> list[str]:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return ["Полный отчет пуст."]
+    chunks: list[str] = []
+    current = ""
+    for paragraph in re.split(r"(\n{2,})", normalized):
+        if not paragraph:
+            continue
+        if len(paragraph) > limit:
+            if current.strip():
+                chunks.append(current.strip())
+                current = ""
+            for start in range(0, len(paragraph), limit):
+                chunks.append(paragraph[start : start + limit].strip())
+            continue
+        if len(current) + len(paragraph) > limit:
+            if current.strip():
+                chunks.append(current.strip())
+            current = paragraph
+        else:
+            current += paragraph
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks or ["Полный отчет пуст."]
+
+
+def full_report_text(audit: dict[str, Any], *, directus_url: str) -> str:
+    audit_id = int(audit.get("id") or 0)
+    report_url = directus_audit_report_url(
+        directus_url=directus_url, audit_id=audit_id
+    )
+    verdict = str(audit.get("verdict") or "unknown")
+    target = str(audit.get("target") or "-")
+    incident_ids = audit.get("incident_ids")
+    if isinstance(incident_ids, list) and incident_ids:
+        incident_text = ", ".join(str(item) for item in incident_ids)
+    else:
+        incident_text = "записанных robot_incidents нет"
+    input_payload = (
+        audit.get("input_payload") if isinstance(audit.get("input_payload"), dict) else {}
+    )
+    call_time = format_call_time(
+        started_at=audit.get("started_at") or input_payload.get("started_at"),
+        ended_at=audit.get("ended_at") or input_payload.get("ended_at"),
+        duration_sec=input_payload.get("duration_sec"),
+    )
+    aftercall_url = aftercall_execution_url_from_payload(input_payload)
+    markdown = str(audit.get("report_markdown") or "").strip()
+    if not markdown:
+        report_json = audit.get("report_json")
+        markdown = report_markdown(report_json if isinstance(report_json, dict) else {})
+    lines = [
+        "Полный диагностический отчет",
+        "",
+        f"ID отчета: {audit_id or '-'}",
+        f"Вердикт: {VERDICT_LABELS_RU.get(verdict, verdict)}",
+        f"Цель: {TARGET_LABELS_RU.get(target, target)}",
+        f"Комната: {audit.get('room_name') or '-'}",
+        f"Время звонка: {call_time}",
+        f"Номер DID/xDID: {audit.get('xdid') or audit.get('did') or '-'}",
+        f"Звонящий: {audit.get('caller_phone') or '-'}",
+        f"Инциденты: {incident_text}",
+        f"Прогон aftercall: {aftercall_url or 'ссылка не передана'}",
+        f"Ссылка на отчет: {report_url}",
+        "",
+        markdown,
+    ]
+    return "\n".join(lines).strip()
+
+
+def full_report_payload(
+    *, audit_id: int, chat_id: Any = None, directus: DirectusClient | None = None
+) -> dict[str, Any]:
+    directus = directus or DirectusClient.from_env()
+    audit = directus.get_audit(audit_id)
+    if not audit:
+        raise ValueError(f"audit not found: {audit_id}")
+    text = full_report_text(audit, directus_url=directus.url)
+    return {
+        "audit_id": audit_id,
+        "chat_id": chat_id,
+        "messages": split_telegram_text(text),
     }
 
 
@@ -806,14 +1161,16 @@ def run_audit(
                 "livekit_snapshot": livekit_snapshot,
             },
         )
-        telegram_status = notify_n8n(
-            telegram_payload(
-                audit_id=audit_id,
-                call=call,
-                report=result.report,
-                directus_url=directus.url,
+        telegram_status = telegram_skip_status(rule, result.report)
+        if telegram_status is None:
+            telegram_status = notify_n8n(
+                telegram_payload(
+                    audit_id=audit_id,
+                    call=call,
+                    report=result.report,
+                    directus_url=directus.url,
+                )
             )
-        )
         directus.update_audit(audit_id, {"telegram_status": telegram_status})
         return {
             "audit_id": audit_id,
@@ -841,17 +1198,44 @@ def default_runner() -> CodexRunner:
     )
 
 
-def run_aftercall(
-    payload: dict[str, Any], *, target: str | None = None
+def run_diagnostics(
+    payload: dict[str, Any],
+    *,
+    target: str | None = None,
+    trigger: str = "aftercall",
+    directus: DirectusClient | None = None,
+    runner: CodexRunner | None = None,
 ) -> dict[str, Any]:
-    directus = DirectusClient.from_env()
-    runner = default_runner()
+    directus = directus or DirectusClient.from_env()
+    runner = runner or default_runner()
     call = CallContext.from_payload(payload, target=target)
     incidents = directus.list_incidents_for_call(call)
     rules = directus.list_rules()
-    matched = select_matching_rules(rules, call, incidents, trigger="aftercall")
+    matched = select_matching_rules(rules, call, incidents, trigger=trigger)
     results = []
     for rule in matched:
+        dedupe_key = audit_dedupe_key(call, rule)
+        existing = directus.find_audit_by_dedupe_key(dedupe_key)
+        if existing is not None:
+            results.append(
+                {
+                    "audit_id": int(existing["id"]),
+                    "status": "skipped",
+                    "reason": "duplicate_dedupe_key",
+                }
+            )
+            continue
+        recent = directus.find_recent_audit_for_rule(call=call, rule=rule)
+        if recent is not None:
+            results.append(
+                {
+                    "audit_id": int(recent["id"]),
+                    "status": "skipped",
+                    "reason": "cooldown",
+                    "cooldown_sec": rule.cooldown_sec,
+                }
+            )
+            continue
         audit_id, created = directus.ensure_audit(
             call=call, rule=rule, incidents=incidents
         )
@@ -874,7 +1258,17 @@ def run_aftercall(
                 runner=runner,
             )
         )
-    return {"matched_rules": len(matched), "audits": results}
+    return {"trigger": trigger, "matched_rules": len(matched), "audits": results}
+
+
+def run_aftercall(
+    payload: dict[str, Any], *, target: str | None = None
+) -> dict[str, Any]:
+    return run_diagnostics(payload, target=target, trigger="aftercall")
+
+
+def run_manual(payload: dict[str, Any], *, target: str | None = None) -> dict[str, Any]:
+    return run_diagnostics(payload, target=target, trigger="manual")
 
 
 def load_json_arg(path: str) -> dict[str, Any]:
@@ -898,13 +1292,63 @@ class DiagnosticsHTTPHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or "0")
         try:
             payload = json.loads(self.rfile.read(length) or b"{}")
-            if parsed.path != "/aftercall":
+            if parsed.path == "/telegram/full-report":
+                query = parse_qs(parsed.query)
+                audit_id_value = (
+                    payload.get("audit_id")
+                    or query.get("audit_id", [None])[0]
+                    or payload.get("id")
+                )
+                if audit_id_value is None:
+                    raise ValueError("audit_id is required")
+                self._send_json(
+                    200,
+                    full_report_payload(
+                        audit_id=int(audit_id_value), chat_id=payload.get("chat_id")
+                    ),
+                )
+                return
+            if parsed.path not in {"/aftercall", "/manual"}:
                 self._send_json(404, {"error": "unknown endpoint"})
                 return
-            target = parse_qs(parsed.query).get("target", [None])[0]
-            self._send_json(200, run_aftercall(payload, target=target))
+            query = parse_qs(parsed.query)
+            target = query.get("target", [None])[0]
+            run_func = run_manual if parsed.path == "/manual" else run_aftercall
+            if str(query.get("async", [""])[0]).lower() in {"1", "true", "yes"}:
+                thread = threading.Thread(
+                    target=run_background_diagnostics,
+                    args=(run_func, payload, target),
+                    daemon=True,
+                )
+                thread.start()
+                self._send_json(
+                    202,
+                    {
+                        "status": "accepted",
+                        "endpoint": parsed.path.lstrip("/"),
+                        "target": target,
+                    },
+                )
+                return
+            result = run_func(payload, target=target)
+            self._send_json(200, result)
+        except ValueError as exc:
+            self._send_json(400, {"error": redact(str(exc))})
         except Exception as exc:
             self._send_json(500, {"error": redact(str(exc))})
+
+
+def run_background_diagnostics(
+    run_func: Any, payload: dict[str, Any], target: str | None
+) -> None:
+    try:
+        run_func(payload, target=target)
+    except Exception as exc:
+        print(
+            f"background diagnostics failed: {redact(str(exc))}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def serve() -> None:
@@ -921,6 +1365,9 @@ def main(argv: list[str] | None = None) -> int:
     aftercall = subparsers.add_parser("aftercall")
     aftercall.add_argument("--payload-file", default="-")
     aftercall.add_argument("--target", choices=["cloud", "local"])
+    manual = subparsers.add_parser("manual")
+    manual.add_argument("--payload-file", default="-")
+    manual.add_argument("--target", choices=["cloud", "local"])
     subparsers.add_parser("serve")
     args = parser.parse_args(argv)
 
@@ -929,6 +1376,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "aftercall":
         result = run_aftercall(load_json_arg(args.payload_file), target=args.target)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "manual":
+        result = run_manual(load_json_arg(args.payload_file), target=args.target)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     return 2

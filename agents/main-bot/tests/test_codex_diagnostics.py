@@ -2,6 +2,8 @@ import json
 import sys
 from pathlib import Path
 
+import httpx
+
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -10,15 +12,26 @@ from shared.webhooks.codex_diagnostics import (  # noqa: E402
     CallContext,
     CodexRunner,
     DiagnosticRule,
+    DirectusClient,
+    aftercall_execution_url_from_payload,
     audit_dedupe_key,
     build_codex_prompt,
     build_livekit_snapshot_commands,
+    directus_audit_report_url,
     extract_final_codex_message,
+    format_call_time,
+    full_report_payload,
+    full_report_text,
+    incident_time_filters,
     parse_codex_report,
     redact_command,
+    report_markdown,
     rule_matches,
+    run_diagnostics,
     select_matching_rules,
+    split_telegram_text,
     telegram_payload,
+    telegram_skip_status,
 )
 
 
@@ -116,15 +129,22 @@ def test_xdid_and_caller_modes_normalize_digits() -> None:
 
 
 def test_manual_rules_do_not_run_from_aftercall() -> None:
-    rule = DiagnosticRule(
+    manual_rule = DiagnosticRule(
         id=1,
         enabled=True,
         target="both",
         trigger_mode="manual",
     )
+    all_calls_rule = DiagnosticRule(
+        id=2,
+        enabled=True,
+        target="both",
+        trigger_mode="all_calls",
+    )
 
-    assert not rule_matches(rule, _call(), [], trigger="aftercall")
-    assert rule_matches(rule, _call(), [], trigger="manual")
+    assert not rule_matches(manual_rule, _call(), [], trigger="aftercall")
+    assert rule_matches(manual_rule, _call(), [], trigger="manual")
+    assert not rule_matches(all_calls_rule, _call(), [], trigger="manual")
 
 
 def test_select_matching_rules_keeps_multiple_modes() -> None:
@@ -150,6 +170,36 @@ def test_dedupe_key_includes_target_rule_and_room() -> None:
     assert audit_dedupe_key(_call("cloud"), rule) == (
         "cloud:42:all_calls:_79990001122_abcd"
     )
+
+
+def test_incident_time_filters_pad_call_window() -> None:
+    filters = incident_time_filters(_call())
+
+    assert filters["filter[created_at][_gte]"].startswith("2026-05-07T11:55:00")
+    assert filters["filter[created_at][_lte]"].startswith("2026-05-07T12:11:00")
+
+
+def test_telegram_policy_can_skip_n8n_handoff() -> None:
+    silent = DiagnosticRule(
+        id=1,
+        enabled=True,
+        target="both",
+        trigger_mode="all_calls",
+        telegram_policy="silent",
+    )
+    critical_only = DiagnosticRule(
+        id=2,
+        enabled=True,
+        target="both",
+        trigger_mode="all_calls",
+        telegram_policy="critical_only",
+    )
+
+    assert telegram_skip_status(silent, {"verdict": "critical"}) == "skipped:silent"
+    assert telegram_skip_status(
+        critical_only, {"verdict": "needs_attention"}
+    ) == "skipped:critical_only"
+    assert telegram_skip_status(critical_only, {"verdict": "critical"}) is None
 
 
 def test_codex_runner_command_is_read_only_ephemeral_json() -> None:
@@ -188,6 +238,12 @@ def test_prompt_forbids_auto_fix_and_mutating_livekit_commands() -> None:
     assert "do not edit files" in lowered
     assert "do not call mutating livekit commands" in lowered
     assert "untrusted data" in lowered
+    assert "russian" in lowered
+    assert "паузы и задержки" in lowered
+    assert "ошибки и инциденты" in lowered
+    assert "exact tag/value/action" in lowered
+    assert "previous assistant phrase" in lowered
+    assert "missing_evidence" in lowered
 
 
 def test_parse_codex_report_accepts_json_fence() -> None:
@@ -198,6 +254,40 @@ def test_parse_codex_report_accepts_json_fence() -> None:
     )
 
     assert report["verdict"] == "watch"
+
+
+def test_report_markdown_fallback_is_readable_russian() -> None:
+    markdown = report_markdown(
+        {
+            "verdict": "needs_attention",
+            "summary": "Робот не ответил на вопрос клиента.",
+            "findings": [
+                {
+                    "title": "Нет ответа по адресу",
+                    "severity": "warning",
+                    "stage": "основной вопрос клиента",
+                    "event_time_or_turn": "после вопроса клиента про адрес",
+                    "exact_detail": "адрес не найден в базе знаний",
+                    "evidence": "Клиент спросил адрес.",
+                    "why_it_matters": "Клиент не получил нужную информацию.",
+                    "suspected_cause": "Ответ не найден в базе.",
+                    "recommendation": "Проверить запись адреса.",
+                    "implementation_idea": "Добавить адрес в Directus и покрыть lookup тестом.",
+                    "missing_evidence": "Нет сырых логов поиска по базе.",
+                }
+            ],
+            "recommendations": ["Добавить адрес в базу знаний."],
+        }
+    )
+
+    assert "Диагностический отчет" in markdown
+    assert "Паузы и задержки" in markdown
+    assert "Ошибки и инциденты" in markdown
+    assert "Этап диалога: основной вопрос клиента" in markdown
+    assert "Конкретная деталь: адрес не найден в базе знаний" in markdown
+    assert "Идея реализации: Добавить адрес в Directus" in markdown
+    assert "Гарантия безопасности" in markdown
+    assert "Evidence:" not in markdown
 
 
 def test_extract_final_codex_message_from_jsonl() -> None:
@@ -285,15 +375,69 @@ def test_cloud_livekit_snapshot_prefers_explicit_cloud_credentials(monkeypatch) 
     assert "--project" not in commands[0]
 
 
-def test_telegram_payload_reuses_n8n_friendly_brief_shape() -> None:
+def test_directus_audit_report_url_points_to_item_page(monkeypatch) -> None:
+    assert directus_audit_report_url(
+        directus_url="https://jcall.io/directus", audit_id=7
+    ) == "https://jcall.io/directus/admin/content/robot_call_audits/7"
+
+    monkeypatch.setenv(
+        "CODEX_DIAGNOSTICS_DIRECTUS_APP_URL", "https://jcall.io/directus/admin"
+    )
+    assert directus_audit_report_url(
+        directus_url="https://api.example/directus", audit_id=8
+    ) == "https://jcall.io/directus/admin/content/robot_call_audits/8"
+
+
+def test_call_time_and_aftercall_execution_url_are_readable(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_DIAGNOSTICS_REPORT_TZ", "Europe/Kaliningrad")
+
+    assert format_call_time(
+        started_at="2026-05-07T05:08:02+00:00",
+        ended_at="2026-05-07T05:08:28+00:00",
+        duration_sec=25.3,
+    ) == (
+        "начало 2026-05-07 07:08:02 (Europe/Kaliningrad), "
+        "конец 2026-05-07 07:08:28 (Europe/Kaliningrad), "
+        "длительность 25.3 сек"
+    )
+    assert aftercall_execution_url_from_payload(
+        {"codex_diagnostics_aftercall_execution_id": "37107"}
+    ) == "https://n8n.jcall.io/workflow/yj1KNjeuDOcJZNSS/executions/37107"
+    assert aftercall_execution_url_from_payload(
+        {
+            "codex_diagnostics": {
+                "aftercall_execution_url": "https://n8n.example/execution/1"
+            }
+        }
+    ) == "https://n8n.example/execution/1"
+
+
+def test_telegram_payload_uses_russian_brief_and_report_link() -> None:
+    call = CallContext.from_payload(
+        {
+            **_call("local").payload,
+            "duration_sec": 61,
+            "codex_diagnostics_aftercall_execution_id": "123",
+        },
+        target="local",
+    )
     payload = telegram_payload(
         audit_id=7,
-        call=_call("local"),
+        call=call,
         report={
             "verdict": "needs_attention",
-            "summary": "slow response",
-            "telegram_brief": "brief",
-            "findings": [{"title": "slow", "evidence": "e2e 9000ms"}],
+            "summary": "медленный ответ",
+            "telegram_brief": "old brief",
+            "findings": [
+                {
+                    "title": "Медленный ответ",
+                    "stage": "квалификация заявки",
+                    "event_time_or_turn": "после вопроса робота про задачу клиента",
+                    "exact_detail": "e2e latency 9000ms",
+                    "evidence": "e2e 9000ms",
+                    "implementation_idea": "Проверить slow_response threshold и трассировку turn metrics.",
+                }
+            ],
         },
         directus_url="https://jcall.io/directus",
     )
@@ -301,5 +445,177 @@ def test_telegram_payload_reuses_n8n_friendly_brief_shape() -> None:
     assert payload["audit_id"] == 7
     assert payload["target"] == "local"
     assert payload["verdict"] == "needs_attention"
-    assert payload["telegram_brief"] == "brief"
+    assert payload["directus_report_url"] == (
+        "https://jcall.io/directus/admin/content/robot_call_audits/7"
+    )
+    assert payload["report_url"] == payload["directus_report_url"]
+    assert payload["button_text"] == "отправить полный отчет"
+    assert payload["callback_data"] == "codex_full_report:7"
+    assert payload["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == (
+        "codex_full_report:7"
+    )
+    assert "Вердикт: требует внимания" in payload["telegram_brief"]
+    assert "Цель: локальный" in payload["telegram_brief"]
+    assert "Время звонка: начало 2026-05-07 14:00:00" in payload["telegram_brief"]
+    assert "Прогон aftercall: https://n8n.jcall.io/workflow/yj1KNjeuDOcJZNSS/executions/123" in payload["telegram_brief"]
+    assert "Номер DID/xDID: 312388" in payload["telegram_brief"]
+    assert "Полный отчет: https://jcall.io/directus/admin/content/robot_call_audits/7" in payload["telegram_brief"]
+    assert "Этап: квалификация заявки" in payload["telegram_brief"]
+    assert "Деталь: e2e latency 9000ms" in payload["telegram_brief"]
+    assert "Что поменять: Проверить slow_response threshold" in payload["telegram_brief"]
     assert "e2e 9000ms" in payload["text"]
+
+
+def test_full_report_text_includes_metadata_report_and_directus_link() -> None:
+    text = full_report_text(
+        {
+            "id": 7,
+            "target": "cloud",
+            "verdict": "needs_attention",
+            "room_name": "room-1",
+            "caller_phone": "79990001122",
+            "did": "312388",
+            "started_at": "2026-05-07T12:00:00+00:00",
+            "ended_at": "2026-05-07T12:01:00+00:00",
+            "incident_ids": [1, 2],
+            "input_payload": {
+                "duration_sec": 60,
+                "codex_diagnostics_aftercall_execution_id": "321",
+            },
+            "report_markdown": "## Паузы и задержки\nДлинных пауз нет.",  # noqa: RUF001
+        },
+        directus_url="https://jcall.io/directus",
+    )
+
+    assert "Полный диагностический отчет" in text
+    assert "Вердикт: требует внимания" in text
+    assert "Время звонка: начало 2026-05-07 14:00:00" in text
+    assert "Прогон aftercall: https://n8n.jcall.io/workflow/yj1KNjeuDOcJZNSS/executions/321" in text
+    assert "Инциденты: 1, 2" in text
+    assert "https://jcall.io/directus/admin/content/robot_call_audits/7" in text
+    assert "Длинных пауз нет." in text
+
+
+def test_split_telegram_text_chunks_long_reports() -> None:
+    chunks = split_telegram_text("я" * 3700, limit=1000)
+
+    assert len(chunks) == 4
+    assert all(len(chunk) <= 1000 for chunk in chunks)
+
+
+class _FullReportDirectus:
+    url = "https://jcall.io/directus"
+
+    def get_audit(self, audit_id: int) -> dict:
+        assert audit_id == 7
+        return {
+            "id": 7,
+            "target": "local",
+            "verdict": "watch",
+            "report_markdown": "## Ошибки и инциденты\nОшибок нет.",  # noqa: RUF001
+        }
+
+
+def test_full_report_payload_loads_audit_and_returns_chunks() -> None:
+    payload = full_report_payload(
+        audit_id=7, chat_id=-1001, directus=_FullReportDirectus()
+    )
+
+    assert payload["audit_id"] == 7
+    assert payload["chat_id"] == -1001
+    assert payload["messages"]
+    assert "Ошибок нет" in payload["messages"][0]
+
+
+class _CooldownDirectus:
+    url = "https://jcall.io/directus"
+
+    def __init__(self) -> None:
+        self.ensure_called = False
+
+    def list_incidents_for_call(self, call: CallContext) -> list[dict]:
+        return []
+
+    def list_rules(self) -> list[DiagnosticRule]:
+        return [
+            DiagnosticRule(
+                id=11,
+                enabled=True,
+                target="both",
+                trigger_mode="all_calls",
+                cooldown_sec=60,
+            )
+        ]
+
+    def find_audit_by_dedupe_key(self, dedupe_key: str) -> dict | None:
+        return None
+
+    def find_recent_audit_for_rule(
+        self, *, call: CallContext, rule: DiagnosticRule
+    ) -> dict | None:
+        return {"id": 21, "status": "completed"}
+
+    def ensure_audit(
+        self,
+        *,
+        call: CallContext,
+        rule: DiagnosticRule,
+        incidents: list[dict],
+    ) -> tuple[int, bool]:
+        self.ensure_called = True
+        raise AssertionError("cooldown should skip before creating an audit")
+
+
+class _NoRunRunner:
+    repo_dir = Path("/repo")
+
+
+def test_run_diagnostics_skips_with_rule_cooldown() -> None:
+    directus = _CooldownDirectus()
+
+    result = run_diagnostics(
+        _call().payload,
+        target="cloud",
+        directus=directus,
+        runner=_NoRunRunner(),
+    )
+
+    assert result["trigger"] == "aftercall"
+    assert result["audits"] == [
+        {
+            "audit_id": 21,
+            "status": "skipped",
+            "reason": "cooldown",
+            "cooldown_sec": 60,
+        }
+    ]
+    assert not directus.ensure_called
+
+
+class _ConflictDirectus(DirectusClient):
+    def __init__(self) -> None:
+        self.lookup_count = 0
+
+    def _request(self, method: str, path: str, **kwargs):
+        if method == "GET" and path == "/items/robot_call_audits":
+            self.lookup_count += 1
+            if self.lookup_count == 1:
+                return []
+            return [{"id": 31, "status": "queued", "verdict": None}]
+        if method == "POST" and path == "/items/robot_call_audits":
+            request = httpx.Request("POST", "https://jcall.io/directus")
+            response = httpx.Response(409, request=request)
+            raise httpx.HTTPStatusError(
+                "duplicate dedupe key", request=request, response=response
+            )
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+
+def test_ensure_audit_handles_unique_dedupe_race() -> None:
+    client = _ConflictDirectus()
+    rule = DiagnosticRule(id=42, enabled=True, target="both", trigger_mode="all_calls")
+
+    audit_id, created = client.ensure_audit(call=_call(), rule=rule, incidents=[])
+
+    assert audit_id == 31
+    assert created is False
