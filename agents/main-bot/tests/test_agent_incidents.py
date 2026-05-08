@@ -1,3 +1,4 @@
+import pytest
 from livekit import rtc
 
 from agent import (
@@ -8,6 +9,7 @@ from agent import (
     should_log_startup_provider_fallback,
     should_play_initial_greeting,
     turn_response_latency_ms,
+    wait_for_initial_greeting_delay,
 )
 
 
@@ -146,3 +148,32 @@ def test_initial_greeting_can_play_before_user_speech() -> None:
         )
         is True
     )
+
+
+@pytest.mark.asyncio
+async def test_initial_greeting_delay_waits_configured_seconds(monkeypatch) -> None:
+    calls = []
+
+    async def fake_sleep(delay_sec):
+        calls.append(delay_sec)
+
+    monkeypatch.setattr("agent.asyncio.sleep", fake_sleep)
+
+    await wait_for_initial_greeting_delay(1.5)
+
+    assert calls == [1.5]
+
+
+@pytest.mark.asyncio
+async def test_initial_greeting_delay_skips_non_positive_values(monkeypatch) -> None:
+    calls = []
+
+    async def fake_sleep(delay_sec):
+        calls.append(delay_sec)
+
+    monkeypatch.setattr("agent.asyncio.sleep", fake_sleep)
+
+    await wait_for_initial_greeting_delay(0)
+    await wait_for_initial_greeting_delay(-1)
+
+    assert calls == []

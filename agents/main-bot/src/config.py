@@ -282,6 +282,9 @@ VOICE_INITIAL_GREETING_PHRASE = (
     ).strip()
     or "Алло, здравствуйте."
 )
+VOICE_INITIAL_GREETING_DELAY_SEC = float(
+    os.getenv("VOICE_INITIAL_GREETING_DELAY_SEC", "1.5")
+)
 VOICE_SHORT_GREETING_PHRASE = (
     os.getenv(
         "VOICE_SHORT_GREETING_PHRASE",

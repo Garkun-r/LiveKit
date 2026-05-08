@@ -234,6 +234,7 @@ from config import (
     VOICE_CLIENT_SILENCE_SEC,
     VOICE_EMERGENCY_AUDIO_PATH,
     VOICE_EMERGENCY_PHRASE,
+    VOICE_INITIAL_GREETING_DELAY_SEC,
     VOICE_INITIAL_GREETING_PHRASE,
     VOICE_RESPONSE_DELAY_AUDIO_PATH,
     VOICE_RESPONSE_DELAY_AUDIO_PATHS,
@@ -548,6 +549,11 @@ def should_play_initial_greeting(
     if close_event_set or user_speech_started_count > 0:
         return False
     return state_value(session_user_state) != "speaking"
+
+
+async def wait_for_initial_greeting_delay(delay_sec: float) -> None:
+    if delay_sec > 0:
+        await asyncio.sleep(delay_sec)
 
 
 def extract_sip_call_numbers(participant: Any | None) -> dict[str, str | None]:
@@ -4223,6 +4229,7 @@ async def my_agent(ctx: JobContext):
                 STT_EARLY_INTERIM_FINAL_DELAY_SEC,
             ),
             "stt_early_interim_final_min_stable_interims": STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS,
+            "voice_initial_greeting_delay_sec": VOICE_INITIAL_GREETING_DELAY_SEC,
             "voice_response_delay_sec": VOICE_RESPONSE_DELAY_SEC,
             "voice_response_delay_post_gap_sec": VOICE_RESPONSE_DELAY_POST_GAP_SEC,
             "voice_response_delay_audio_paths": [
@@ -4963,14 +4970,20 @@ async def my_agent(ctx: JobContext):
                 close_event_set=close_event.is_set(),
             )
         ):
-            played_initial_greeting = await play_prerecorded_audio(
-                session=session,
-                audio_path=initial_greeting_audio_path,
-                sample_rate=audio_output_sample_rate,
-                allow_interruptions=True,
-                add_to_chat_ctx=False,
-                text=initial_greeting,
-            )
+            await wait_for_initial_greeting_delay(VOICE_INITIAL_GREETING_DELAY_SEC)
+            if should_play_initial_greeting(
+                user_speech_started_count=user_speech_started_count,
+                session_user_state=session.user_state,
+                close_event_set=close_event.is_set(),
+            ):
+                played_initial_greeting = await play_prerecorded_audio(
+                    session=session,
+                    audio_path=initial_greeting_audio_path,
+                    sample_rate=audio_output_sample_rate,
+                    allow_interruptions=True,
+                    add_to_chat_ctx=False,
+                    text=initial_greeting,
+                )
         # Do not block call flow if warmup is still in progress.
         if runtime_warmup_task and not runtime_warmup_task.done():
             with suppress(Exception):
