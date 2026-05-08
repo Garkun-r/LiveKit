@@ -4,7 +4,9 @@ from agent import (
     event_timestamp_seconds,
     extract_sip_diagnostic_context,
     is_abnormal_close,
+    should_log_slow_response_latency,
     should_log_startup_provider_fallback,
+    should_play_initial_greeting,
     turn_response_latency_ms,
 )
 
@@ -100,3 +102,47 @@ def test_turn_response_latency_measures_user_end_to_agent_start() -> None:
 def test_event_timestamp_seconds_falls_back_when_created_at_missing() -> None:
     assert event_timestamp_seconds(_Event(created_at=123.5)) == 123.5
     assert event_timestamp_seconds(_Event(), default=456.0) == 456.0
+
+
+def test_should_log_slow_response_latency_when_threshold_is_reached() -> None:
+    assert should_log_slow_response_latency(7000, 7000) is True
+    assert should_log_slow_response_latency(7200.5, 7000) is True
+
+
+def test_should_not_log_slow_response_latency_below_threshold_or_disabled() -> None:
+    assert should_log_slow_response_latency(None, 7000) is False
+    assert should_log_slow_response_latency(6999.9, 7000) is False
+    assert should_log_slow_response_latency(10000, 0) is False
+
+
+def test_initial_greeting_is_skipped_after_user_speech_started() -> None:
+    assert (
+        should_play_initial_greeting(
+            user_speech_started_count=1,
+            session_user_state="listening",
+            close_event_set=False,
+        )
+        is False
+    )
+
+
+def test_initial_greeting_is_skipped_while_user_is_speaking() -> None:
+    assert (
+        should_play_initial_greeting(
+            user_speech_started_count=0,
+            session_user_state="speaking",
+            close_event_set=False,
+        )
+        is False
+    )
+
+
+def test_initial_greeting_can_play_before_user_speech() -> None:
+    assert (
+        should_play_initial_greeting(
+            user_speech_started_count=0,
+            session_user_state="listening",
+            close_event_set=False,
+        )
+        is True
+    )

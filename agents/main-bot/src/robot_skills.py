@@ -67,6 +67,15 @@ class RobotSkillRunner:
                     detail="no supported action selected",
                     data={},
                 )
+            elif interrupted:
+                result = RobotSkillResult(
+                    status="ignored",
+                    detail="selected action ignored because speech was interrupted",
+                    data={
+                        "reason": "speech_interrupted",
+                        "action": parsed.selected.action,
+                    },
+                )
             else:
                 result = await self._run_selected(parsed.selected)
         except Exception as e:

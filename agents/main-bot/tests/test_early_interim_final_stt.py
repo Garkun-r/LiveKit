@@ -133,6 +133,28 @@ async def _collect_events_with_local_vad_notify(
     return events
 
 
+async def _collect_events_with_local_vad_start_after_synthetic(
+    stt_client: EarlyInterimFinalSTT,
+    *,
+    timeout_sec: float = 1.0,
+) -> list[stt.SpeechEvent]:
+    stream = stt_client.stream()
+    stream.end_input()
+    events: list[stt.SpeechEvent] = []
+
+    async def _collect() -> None:
+        async for event in stream:
+            events.append(event)
+
+    collect_task = asyncio.create_task(_collect())
+    await asyncio.sleep(0.001)
+    stt_client.notify_local_end_of_speech(ended_at=time.time() - 1.0)
+    await asyncio.sleep(0.01)
+    stt_client.notify_local_start_of_speech(started_at=time.time())
+    await asyncio.wait_for(collect_task, timeout=timeout_sec)
+    return events
+
+
 def test_should_wrap_stt_respects_disabled_mode() -> None:
     assert not should_wrap_stt(
         _ScriptedSTT(),
@@ -503,6 +525,54 @@ async def test_late_different_final_after_synthetic_is_suppressed() -> None:
         stt.SpeechEventType.END_OF_SPEECH,
     ]
     assert events[2].alternatives[0].text == "адрес"
+
+
+@pytest.mark.asyncio
+async def test_local_vad_start_resets_after_synthetic_for_next_transcript() -> None:
+    wrapped = EarlyInterimFinalSTT(
+        _ScriptedSTT(
+            [
+                (0, _event(stt.SpeechEventType.START_OF_SPEECH, request_id="old")),
+                (
+                    0,
+                    _event(
+                        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                        "какой у вас адрес",
+                        request_id="old",
+                    ),
+                ),
+                (
+                    0.03,
+                    _event(
+                        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                        "а вы до скольки сегодня работаете",
+                        request_id="new",
+                    ),
+                ),
+                (
+                    0.01,
+                    _event(
+                        stt.SpeechEventType.FINAL_TRANSCRIPT,
+                        "А вы до скольки сегодня работаете?",
+                        request_id="new",
+                    ),
+                ),
+            ]
+        ),
+        delay_sec=0.001,
+    )
+
+    events = await _collect_events_with_local_vad_start_after_synthetic(wrapped)
+
+    assert [event.type for event in events] == [
+        stt.SpeechEventType.START_OF_SPEECH,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+    ]
+    assert events[2].alternatives[0].text == "какой у вас адрес"
+    assert events[4].alternatives[0].text == "А вы до скольки сегодня работаете?"
 
 
 @pytest.mark.asyncio

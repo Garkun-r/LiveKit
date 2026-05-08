@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -268,10 +269,23 @@ class TBankSynthesizeStream(tts.SynthesizeStream):
         output_emitter: tts.AudioEmitter,
     ) -> None:
         segment_started = False
+        seen_text_keys: set[str] = set()
         async for sentence in sentence_stream:
             text = _sanitize_text_segment(sentence.token or "")
             if not text:
                 continue
+            duplicate_key = _duplicate_text_key(text)
+            if duplicate_key in seen_text_keys:
+                logger.info(
+                    "tbank_tts duplicate text segment skipped",
+                    extra={
+                        "voice": self._opts.voice_name,
+                        "text_len": len(text),
+                        "text_hash": _text_hash(text),
+                    },
+                )
+                continue
+            seen_text_keys.add(duplicate_key)
 
             self._mark_started()
             if not segment_started:
@@ -351,6 +365,7 @@ async def _stream_segment_to_emitter(
                         "ttfb_ms": round((first_chunk_at - started_at) * 1000, 1),
                         "voice": opts.voice_name,
                         "text_len": len(sanitized),
+                        "text_hash": _text_hash(sanitized),
                     },
                 )
             output_emitter.push(chunk)
@@ -385,6 +400,7 @@ async def _stream_segment_to_emitter(
                 "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 1),
                 "chunk_count": chunk_count,
                 "audio_bytes": total_bytes,
+                "text_hash": _text_hash(sanitized),
             },
         )
 
@@ -416,6 +432,14 @@ def _sanitize_text_segment(text: str) -> str:
     if not stripped or not _ALNUM_RE.search(stripped):
         return ""
     return stripped
+
+
+def _duplicate_text_key(text: str) -> str:
+    return _sanitize_text_segment(text).casefold().strip(" \t\r\n.,!?;:…—-")
+
+
+def _text_hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
 
 def _validate_rate(name: str, value: float) -> None:

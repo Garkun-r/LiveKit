@@ -30,10 +30,8 @@ in LiveKit Cloud just to avoid permission updates.
 Recommended readable fields:
 
 - `CallerID`: `CallerID`, `client_id`
-- `bot_configurations`: `client_id`, `system_prompt`, `examples`, `skills_name`,
-  `first_step_text` (legacy fallback for greeting)
-- `clients`: `id`, `add_info`, `company_website`, `company_extra`,
-  `first_step`
+- `bot_configurations`: `client_id`, `system_prompt`, `examples`, `skills_name`
+- `clients`: `id`, `add_info`, `company_website`, `company_extra`, `first_step`
 - `clients_prompt`: `name`, `text`
 - `webparsing`: `url`, `text`
 - `transfer_number`: `client_id`, `disc`, `direction`
@@ -122,17 +120,25 @@ The cached value must be a template, not a fully rendered prompt. Use
 `{{CURRENT_DATETIME_BLOCK}}` where the robot should inject fresh local company
 date and time on each call.
 
-Client-specific fixed greetings are read from `clients.first_step` first, then
-from legacy `bot_configurations.first_step_text`. If the Directus API key differs
-from the UI label, set `DIRECTUS_INITIAL_GREETING_FIELD` to the real field key.
+Client-specific fixed greetings are read from `clients.first_step` by default.
+If the cell is empty, the robot uses its default greeting. If the Directus API
+key differs from the UI label, set `DIRECTUS_INITIAL_GREETING_FIELD` to the real
+field key.
+
+`DIRECTUS_PROMPT_CACHE_TTL_SEC` controls both the short in-process cache and
+the maximum age of a stored `client_prompt_cache` row. With the default `300`,
+the robot can use a saved row for up to five minutes; after that it rebuilds
+from source collections and writes a fresh cache row.
 
 ## Robot write-through cache
 
 The LiveKit robot uses write-through cache behavior:
 
 1. Read `client_prompt_cache` by `caller_id` and `active = true`.
-2. If found, render fresh `<current_datetime>` and start the call.
-3. If not found, build the prompt live from source collections.
+2. If found and `date_updated` is not older than
+   `DIRECTUS_PROMPT_CACHE_TTL_SEC`, render fresh `<current_datetime>` and start
+   the call.
+3. If not found or stale, build the prompt live from source collections.
 4. After a successful live build, upsert only `client_prompt_cache`.
 5. If the cache write fails, continue the call with the live prompt and log a
    warning.
@@ -142,9 +148,9 @@ The robot does not write to `CallerID`, `bot_configurations`, `clients`,
 
 ## Flow
 
-Create a Directus Flow that rebuilds only `client_prompt_cache`. This Flow is a
-future freshness improvement; the robot can already create a cache row on the
-first cache miss.
+Create a Directus Flow that rebuilds only `client_prompt_cache`. This Flow is
+optional but useful when prompt edits must be reflected immediately; without it,
+the robot refreshes stale rows on the next lookup after the cache TTL expires.
 
 Recommended triggers:
 

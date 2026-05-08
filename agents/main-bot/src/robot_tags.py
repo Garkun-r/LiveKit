@@ -25,6 +25,7 @@ _BRACKETED_RE = re.compile(r"\[[^\[\]]*\]")
 _STATUS_RE = re.compile(r"^STATUS\s*:\s*(?P<status>[A-Z_]+)\s*$", re.IGNORECASE)
 _TRANSFER_RE = re.compile(r"^TRANSFER\s*:\s*(?P<target>.+)$", re.IGNORECASE)
 _GEO_SEARCH_RE = re.compile(r"^GEO_SEARCH\s*:\s*(?P<query>.+)$", re.IGNORECASE)
+_FENCE_MARKER = "```"
 _SUPPORTED_STATUSES = {"END", "SPAM", "INFO_CLOSE", "LEAD", "SMS_LINK"}
 
 
@@ -93,16 +94,43 @@ class ParsedRobotTags:
 
 
 def strip_bracketed_segments(text: str) -> str:
-    """Remove all square-bracketed segments without leaving tag-only spacing."""
+    """Remove hidden tags and fenced markdown blocks without tag-only spacing."""
     output: list[str] = []
     pending_ws: list[str] = []
     in_brackets = False
+    in_fence = False
+    pending_backticks = ""
 
     for char in text:
+        if in_fence:
+            if char == "`":
+                pending_backticks += char
+                if pending_backticks == _FENCE_MARKER:
+                    pending_backticks = ""
+                    in_fence = False
+                continue
+            pending_backticks = ""
+            continue
+
         if in_brackets:
             if char == "]":
                 in_brackets = False
             continue
+
+        if char == "`":
+            pending_backticks += char
+            if pending_backticks == _FENCE_MARKER:
+                pending_backticks = ""
+                pending_ws.clear()
+                in_fence = True
+            continue
+
+        if pending_backticks:
+            if pending_ws:
+                output.extend(pending_ws)
+                pending_ws.clear()
+            output.append(pending_backticks)
+            pending_backticks = ""
 
         if char == "[":
             pending_ws.clear()
@@ -118,7 +146,13 @@ def strip_bracketed_segments(text: str) -> str:
             pending_ws.clear()
         output.append(char)
 
-    if not in_brackets and pending_ws:
+    if not in_brackets and not in_fence and pending_backticks:
+        if pending_ws:
+            output.extend(pending_ws)
+            pending_ws.clear()
+        output.append(pending_backticks)
+
+    if not in_brackets and not in_fence and pending_ws:
         output.extend(pending_ws)
 
     return "".join(output).strip()
@@ -130,14 +164,41 @@ async def sanitize_tagged_text_stream(
     """Streaming variant of strip_bracketed_segments for TTS/transcriptions."""
     pending_ws: list[str] = []
     in_brackets = False
+    in_fence = False
+    pending_backticks = ""
 
     async for chunk in text:
         output: list[str] = []
         for char in chunk:
+            if in_fence:
+                if char == "`":
+                    pending_backticks += char
+                    if pending_backticks == _FENCE_MARKER:
+                        pending_backticks = ""
+                        in_fence = False
+                    continue
+                pending_backticks = ""
+                continue
+
             if in_brackets:
                 if char == "]":
                     in_brackets = False
                 continue
+
+            if char == "`":
+                pending_backticks += char
+                if pending_backticks == _FENCE_MARKER:
+                    pending_backticks = ""
+                    pending_ws.clear()
+                    in_fence = True
+                continue
+
+            if pending_backticks:
+                if pending_ws:
+                    output.extend(pending_ws)
+                    pending_ws.clear()
+                output.append(pending_backticks)
+                pending_backticks = ""
 
             if char == "[":
                 pending_ws.clear()
@@ -156,7 +217,13 @@ async def sanitize_tagged_text_stream(
         if output:
             yield "".join(output)
 
-    if not in_brackets and pending_ws:
+    if not in_brackets and not in_fence and pending_backticks:
+        if pending_ws:
+            yield "".join(pending_ws)
+            pending_ws.clear()
+        yield pending_backticks
+
+    if not in_brackets and not in_fence and pending_ws:
         yield "".join(pending_ws)
 
 

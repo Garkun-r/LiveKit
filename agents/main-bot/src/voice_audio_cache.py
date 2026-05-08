@@ -59,10 +59,14 @@ class VoiceAudioCache:
     ) -> Path | None:
         normalized_text = normalize_cache_text(text)
         if not normalized_text:
-            return self._legacy_path_if_allowed(legacy_path)
+            path = self._legacy_path_if_allowed(legacy_path)
+            if path is not None:
+                self._log("voice audio legacy file used", kind=kind, audio_path=path)
+            return path
 
         legacy_path = self._legacy_path_if_allowed(legacy_path)
         if legacy_path is not None:
+            self._log("voice audio legacy file used", kind=kind, audio_path=legacy_path)
             return legacy_path
 
         if not self.enabled:
@@ -70,11 +74,14 @@ class VoiceAudioCache:
 
         cache_path = self.path_for(kind=kind, text=normalized_text)
         if cache_path.exists():
+            self._log("voice audio cache hit", kind=kind, audio_path=cache_path)
             return cache_path
 
+        self._log("voice audio cache miss", kind=kind, audio_path=cache_path)
         lock = await self._lock_for(cache_path)
         async with lock:
             if cache_path.exists():
+                self._log("voice audio cache hit", kind=kind, audio_path=cache_path)
                 return cache_path
             try:
                 await synthesize_text_to_wav(
@@ -106,19 +113,46 @@ class VoiceAudioCache:
         kind: str,
         text: str,
         legacy_path: Path | None = None,
+        allow_legacy_any_profile: bool = False,
     ) -> Path | None:
         normalized_text = normalize_cache_text(text)
         if not normalized_text:
-            return self._legacy_path_if_allowed(legacy_path)
-        legacy_path = self._legacy_path_if_allowed(legacy_path)
-        if legacy_path is not None:
-            return legacy_path
+            return self._legacy_path_if_allowed(
+                legacy_path,
+                allow_any_profile=allow_legacy_any_profile,
+            )
+        legacy_path_allowed = self._legacy_path_if_allowed(legacy_path)
+        if legacy_path_allowed is not None:
+            self._log(
+                "voice audio legacy file used",
+                kind=kind,
+                audio_path=legacy_path_allowed,
+            )
+            return legacy_path_allowed
         cache_path = self.path_for(kind=kind, text=normalized_text)
         if cache_path.exists():
+            self._log("voice audio cache hit", kind=kind, audio_path=cache_path)
             return cache_path
+        if allow_legacy_any_profile:
+            legacy_path_any_profile = self._existing_path(legacy_path)
+            if legacy_path_any_profile is not None:
+                self._log(
+                    "voice audio legacy file used across profile",
+                    kind=kind,
+                    audio_path=legacy_path_any_profile,
+                )
+                return legacy_path_any_profile
+        self._log("voice audio cache miss", kind=kind, audio_path=cache_path)
         return None
 
-    def _legacy_path_if_allowed(self, legacy_path: Path | None) -> Path | None:
+    def _legacy_path_if_allowed(
+        self,
+        legacy_path: Path | None,
+        *,
+        allow_any_profile: bool = False,
+    ) -> Path | None:
+        if allow_any_profile:
+            return self._existing_path(legacy_path)
         if self.is_legacy_profile or not self.enabled:
             return self._existing_path(legacy_path)
         return None
@@ -131,6 +165,16 @@ class VoiceAudioCache:
         safe_kind = _safe_path_part(kind.strip().lower() or "voice")
         text_hash = hashlib.sha256(normalize_cache_text(text).encode("utf-8")).hexdigest()[:16]
         return self.cache_dir / self.voice_profile_id / f"{safe_kind}-{text_hash}.wav"
+
+    def _log(self, message: str, *, kind: str, audio_path: Path) -> None:
+        logger.info(
+            message,
+            extra={
+                "kind": kind,
+                "voice_profile_id": self.voice_profile_id,
+                "audio_path": str(audio_path),
+            },
+        )
 
     async def _lock_for(self, cache_path: Path) -> asyncio.Lock:
         async with self._locks_guard:

@@ -33,7 +33,6 @@ logger = logging.getLogger("prompt_repo")
 PROMPT_FILE = Path(__file__).with_name("prompt.txt")
 
 _CURRENT_DATETIME_PLACEHOLDER = "{{CURRENT_DATETIME_BLOCK}}"
-_BOT_CONFIG_INITIAL_GREETING_FIELD = "first_step_text"
 _URL_PROTOCOL_RE = re.compile(r"^https?://", re.IGNORECASE)
 _MONTH_NAMES = (
     "января",
@@ -127,7 +126,9 @@ class DirectusPromptClient:
                     "client_id",
                     "prompt_template",
                     "timezone",
+                    "source_hash",
                     "active",
+                    "date_updated",
                 ],
             )
         except httpx.HTTPStatusError as e:
@@ -140,6 +141,20 @@ class DirectusPromptClient:
 
         template = _string_value(row.get("prompt_template"))
         if not template:
+            return None
+
+        cache_age_sec = _cache_row_age_seconds(row)
+        if _is_cached_prompt_stale(row):
+            logger.info(
+                "Directus prompt cache is stale; building live prompt",
+                extra={
+                    "sip_trunk_number": caller_id,
+                    "cache_age_sec": cache_age_sec,
+                    "cache_ttl_sec": DIRECTUS_PROMPT_CACHE_TTL_SEC,
+                    "cache_updated_at": _string_value(row.get("date_updated")),
+                    "source_hash": _string_value(row.get("source_hash")),
+                },
+            )
             return None
 
         return _PromptTemplate(
@@ -251,31 +266,22 @@ class DirectusPromptClient:
         )
 
     async def _fetch_bot_config(self, client_id: str | int) -> dict[str, Any] | None:
+        fields = ["client_id", "system_prompt", "examples", "skills_name"]
         return await self._fetch_one(
             DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
             filters={"client_id": client_id},
-            fields=["client_id", "system_prompt", "examples", "skills_name"],
+            fields=fields,
         )
 
     async def _fetch_initial_greeting(self, client_id: str | int | None) -> str | None:
         if client_id is None or not DIRECTUS_INITIAL_GREETING_FIELD:
             return None
 
-        greeting = await self._fetch_initial_greeting_from_collection(
+        return await self._fetch_initial_greeting_from_collection(
             DIRECTUS_COLLECTION_CLIENTS,
             filters={"id": client_id},
             fields=["id", DIRECTUS_INITIAL_GREETING_FIELD],
             source_label="clients",
-        )
-        if greeting:
-            return greeting
-
-        return await self._fetch_initial_greeting_from_collection(
-            DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
-            filters={"client_id": client_id},
-            fields=["client_id", _BOT_CONFIG_INITIAL_GREETING_FIELD],
-            value_field=_BOT_CONFIG_INITIAL_GREETING_FIELD,
-            source_label="bot_configurations",
         )
 
     async def _fetch_initial_greeting_from_collection(
@@ -306,11 +312,24 @@ class DirectusPromptClient:
         return _string_value(row.get(value_field)) or None
 
     async def _fetch_client(self, client_id: str | int) -> dict[str, Any] | None:
-        client = await self._fetch_one(
-            DIRECTUS_COLLECTION_CLIENTS,
-            filters={"id": client_id},
-            fields=["id", "add_info", "company_website"],
-        )
+        fields = ["id", "add_info", "company_website"]
+        if DIRECTUS_INITIAL_GREETING_FIELD:
+            fields.append(DIRECTUS_INITIAL_GREETING_FIELD)
+        try:
+            client = await self._fetch_one(
+                DIRECTUS_COLLECTION_CLIENTS,
+                filters={"id": client_id},
+                fields=fields,
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code not in {400, 403} or not DIRECTUS_INITIAL_GREETING_FIELD:
+                raise
+            logger.info("Directus client initial greeting field is unavailable; retrying")
+            client = await self._fetch_one(
+                DIRECTUS_COLLECTION_CLIENTS,
+                filters={"id": client_id},
+                fields=["id", "add_info", "company_website"],
+            )
         if not client:
             return None
 
@@ -756,6 +775,36 @@ def _directus_filter_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+
+def _is_cached_prompt_stale(row: dict[str, Any]) -> bool:
+    if DIRECTUS_PROMPT_CACHE_TTL_SEC <= 0:
+        return False
+    updated_raw = _string_value(row.get("date_updated"))
+    if not updated_raw:
+        return False
+    age_sec = _cache_row_age_seconds(row)
+    return age_sec is None or age_sec > DIRECTUS_PROMPT_CACHE_TTL_SEC
+
+
+def _cache_row_age_seconds(row: dict[str, Any]) -> float | None:
+    updated_at = _parse_directus_datetime(row.get("date_updated"))
+    if updated_at is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - updated_at).total_seconds())
+
+
+def _parse_directus_datetime(value: Any) -> datetime | None:
+    raw_value = _string_value(value)
+    if not raw_value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _template_hash(template: str) -> str:

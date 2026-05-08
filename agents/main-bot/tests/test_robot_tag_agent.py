@@ -119,6 +119,24 @@ async def test_question_before_tag_is_hidden_and_not_selected() -> None:
     assert parsed.ignored[0].reason == "question_before_tag"
 
 
+@pytest.mark.asyncio
+async def test_user_speech_during_tagged_response_marks_tag_interrupted() -> None:
+    runner = _FakeTagRunner()
+    assistant = Assistant(tag_skill_runner=runner, prompt="test prompt")
+
+    async def source():
+        yield "До свидания. "
+        assistant.note_user_started_speaking()
+        yield "[STATUS: END]"
+
+    async for _ in assistant._tracked_robot_tag_llm_stream(source()):
+        pass
+    await _wait_for_runner_call(runner)
+
+    assert runner.calls[0]["interrupted"] is True
+    assert runner.calls[0]["parsed"].selected.action == "status_end"
+
+
 def test_end_call_tool_is_not_registered() -> None:
     assistant = Assistant(prompt="test prompt")
 

@@ -24,6 +24,16 @@ def test_parse_status_end_selects_action_and_cleans_text() -> None:
     assert parsed.ignored == ()
 
 
+def test_parse_status_info_close_selects_action_and_cleans_text() -> None:
+    parsed = parse_robot_tags("Рада была помочь, всего доброго. [STATUS: INFO_CLOSE]")
+
+    assert parsed.clean_text == "Рада была помочь, всего доброго."
+    assert parsed.selected is not None
+    assert parsed.selected.action == "status_info_close"
+    assert parsed.selected.arguments == {"status": "INFO_CLOSE"}
+    assert parsed.ignored == ()
+
+
 def test_parse_supported_tags() -> None:
     cases = [
         ("Рада была помочь. [STATUS: INFO_CLOSE]", "status_info_close"),
@@ -65,6 +75,15 @@ def test_question_before_tag_ignores_action() -> None:
     assert parsed.ignored[0].reason == "question_before_tag"
 
 
+def test_question_before_info_close_ignores_action() -> None:
+    parsed = parse_robot_tags("Продолжаем? [STATUS: INFO_CLOSE]")
+
+    assert parsed.clean_text == "Продолжаем?"
+    assert parsed.selected is None
+    assert len(parsed.ignored) == 1
+    assert parsed.ignored[0].reason == "question_before_tag"
+
+
 def test_unknown_tags_are_hidden_but_not_selected() -> None:
     parsed = parse_robot_tags("Заявка принята. [STATUS: CALLBACK] [вздыхает]")
 
@@ -90,3 +109,17 @@ async def test_sanitize_stream_hides_all_square_segments() -> None:
     )
 
     assert cleaned == "Кхм, перевожу сейчас."
+
+
+@pytest.mark.asyncio
+async def test_sanitize_stream_hides_fenced_code_blocks() -> None:
+    cleaned = await _collect(
+        [
+            "Завтра работаем до шестнадцати.",
+            "\n\n```",
+            "\nЗавтра работаем до шестнадцати.",
+            "\n```",
+        ]
+    )
+
+    assert cleaned == "Завтра работаем до шестнадцати."

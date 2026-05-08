@@ -100,6 +100,12 @@ class EarlyInterimFinalSTT(stt.STT):
         for stream in list(self._streams):
             stream.notify_local_end_of_speech(ended_at=ended_at)
 
+    def notify_local_start_of_speech(self, *, started_at: float | None = None) -> None:
+        """Notify active STT streams that local VAD has detected new speech."""
+
+        for stream in list(self._streams):
+            stream.notify_local_start_of_speech(started_at=started_at)
+
     async def aclose(self) -> None:
         await self._wrapped.aclose()
 
@@ -260,6 +266,43 @@ class EarlyInterimFinalStream(stt.SpeechStream):
         )
         self._notify_tasks.add(task)
         task.add_done_callback(self._notify_tasks.discard)
+
+    def notify_local_start_of_speech(self, *, started_at: float | None = None) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(
+                "cannot notify local VAD start of speech without a running event loop"
+            )
+            return
+
+        task = loop.create_task(
+            self._notify_local_start_of_speech(started_at=started_at),
+            name="EarlyInterimFinalStream._notify_local_start_of_speech",
+        )
+        self._notify_tasks.add(task)
+        task.add_done_callback(self._notify_tasks.discard)
+
+    async def _notify_local_start_of_speech(
+        self, *, started_at: float | None = None
+    ) -> None:
+        async with self._state_lock:
+            if not (
+                self._final_seen
+                or self._synthetic_committed
+                or self._speech_ended
+                or self._pending_eos is not None
+                or self._local_eos_due
+            ):
+                return
+
+            await self._cancel_pending_eos_task_locked()
+            await self._cancel_local_eos_task_locked()
+            self._reset_segment_locked()
+            logger.debug(
+                "local VAD start of speech reset early interim final segment",
+                extra={"started_at": started_at},
+            )
 
     async def _notify_local_end_of_speech(
         self, *, ended_at: float | None = None

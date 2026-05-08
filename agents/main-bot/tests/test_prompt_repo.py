@@ -1,5 +1,5 @@
 # ruff: noqa: RUF001
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -240,8 +240,93 @@ async def test_resolve_prompt_uses_memory_cache_without_second_http_call(
     assert [request[0] for request in http_client.requests] == [
         "client_prompt_cache",
         "clients",
-        "bot_configurations",
     ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_prompt_uses_fresh_directus_cache(prompt_file, monkeypatch):
+    _enable_directus(monkeypatch)
+    http_client = _DirectusHttpClient(
+        {
+            "client_prompt_cache": [
+                {
+                    "caller_id": "+15550100",
+                    "client_id": 7,
+                    "prompt_template": "fresh cached prompt",
+                    "timezone": "Europe/Kaliningrad",
+                    "active": True,
+                    "date_updated": datetime.now(timezone.utc).isoformat(),
+                }
+            ],
+        }
+    )
+
+    result = await prompt_repo.resolve_prompt_for_call(
+        sip_trunk_number="+15550100",
+        directus_client_factory=_directus_factory(http_client),
+    )
+
+    assert result.source == "directus:cache"
+    assert "fresh cached prompt" in result.prompt
+    assert not http_client.writes
+
+
+@pytest.mark.asyncio
+async def test_resolve_prompt_rebuilds_stale_directus_cache(prompt_file, monkeypatch):
+    _enable_directus(monkeypatch)
+    http_client = _DirectusHttpClient(
+        {
+            "client_prompt_cache": [
+                {
+                    "id": 42,
+                    "caller_id": "+15550100",
+                    "client_id": 7,
+                    "prompt_template": "stale cached prompt",
+                    "timezone": "Europe/Kaliningrad",
+                    "active": True,
+                    "date_updated": "2026-01-01T00:00:00Z",
+                }
+            ],
+            "CallerID": [{"CallerID": "+15550100", "client_id": 7}],
+            "bot_configurations": [
+                {
+                    "client_id": 7,
+                    "system_prompt": "specific strategy",
+                    "examples": "dialogue example",
+                    "skills_name": "skill_info+questions",
+                }
+            ],
+            "clients": [
+                {
+                    "id": 7,
+                    "add_info": "fresh client knowledge",
+                    "company_website": "",
+                    "company_extra": "",
+                }
+            ],
+            "clients_prompt": [
+                {"name": "global_rules", "text": "global rules text"},
+                {"name": "skill_info+questions", "text": "skills text"},
+            ],
+            "transfer_number": [],
+        }
+    )
+
+    result = await prompt_repo.resolve_prompt_for_call(
+        sip_trunk_number="+15550100",
+        directus_client_factory=_directus_factory(http_client),
+        now_factory=_fixed_now,
+    )
+
+    assert result.source == "directus:live"
+    assert "fresh client knowledge" in result.prompt
+    assert "stale cached prompt" not in result.prompt
+    assert len(http_client.writes) == 1
+    method, collection, row_id, payload = http_client.writes[0]
+    assert method == "patch"
+    assert collection == "client_prompt_cache"
+    assert row_id == "42"
+    assert "fresh client knowledge" in payload["prompt_template"]
 
 
 @pytest.mark.asyncio
@@ -309,7 +394,7 @@ async def test_resolve_prompt_builds_live_prompt_on_cache_miss(
 
 
 @pytest.mark.asyncio
-async def test_resolve_prompt_reads_initial_greeting_from_bot_config(
+async def test_resolve_prompt_reads_initial_greeting_from_client_first_step(
     prompt_file, monkeypatch
 ):
     _enable_directus(monkeypatch)
@@ -323,7 +408,6 @@ async def test_resolve_prompt_reads_initial_greeting_from_bot_config(
                     "system_prompt": "specific strategy",
                     "examples": "dialogue example",
                     "skills_name": "skill_info+questions",
-                    "first_step_text": "Здравствуйте, вы позвонили в компанию X.",
                 }
             ],
             "clients": [
@@ -332,6 +416,7 @@ async def test_resolve_prompt_reads_initial_greeting_from_bot_config(
                     "add_info": "client knowledge",
                     "company_website": "",
                     "company_extra": "",
+                    "first_step": "Здравствуйте, вы позвонили в компанию X.",
                 }
             ],
             "clients_prompt": [
@@ -396,41 +481,7 @@ async def test_resolve_prompt_prefers_initial_greeting_from_client(
 
 
 @pytest.mark.asyncio
-async def test_cached_prompt_reads_initial_greeting_from_bot_config(
-    prompt_file, monkeypatch
-):
-    _enable_directus(monkeypatch)
-    http_client = _DirectusHttpClient(
-        {
-            "client_prompt_cache": [
-                {
-                    "caller_id": "+15550100",
-                    "client_id": 7,
-                    "prompt_template": "cached prompt",
-                    "timezone": "Europe/Kaliningrad",
-                    "active": True,
-                }
-            ],
-            "bot_configurations": [
-                {
-                    "client_id": 7,
-                    "first_step_text": "Здравствуйте, вы позвонили в компанию X.",
-                }
-            ],
-        }
-    )
-
-    result = await prompt_repo.resolve_prompt_for_call(
-        sip_trunk_number="+15550100",
-        directus_client_factory=_directus_factory(http_client),
-    )
-
-    assert result.source == "directus:cache"
-    assert result.initial_greeting == "Здравствуйте, вы позвонили в компанию X."
-
-
-@pytest.mark.asyncio
-async def test_cached_prompt_prefers_initial_greeting_from_client(
+async def test_cached_prompt_reads_initial_greeting_from_client_first_step(
     prompt_file, monkeypatch
 ):
     _enable_directus(monkeypatch)
@@ -448,13 +499,7 @@ async def test_cached_prompt_prefers_initial_greeting_from_client(
             "clients": [
                 {
                     "id": 7,
-                    "first_step": "Здравствуйте из clients.",
-                }
-            ],
-            "bot_configurations": [
-                {
-                    "client_id": 7,
-                    "first_step_text": "Здравствуйте из bot_configurations.",
+                    "first_step": "Здравствуйте, вы позвонили в компанию X.",
                 }
             ],
         }
@@ -466,7 +511,36 @@ async def test_cached_prompt_prefers_initial_greeting_from_client(
     )
 
     assert result.source == "directus:cache"
-    assert result.initial_greeting == "Здравствуйте из clients."
+    assert result.initial_greeting == "Здравствуйте, вы позвонили в компанию X."
+
+
+@pytest.mark.asyncio
+async def test_empty_client_first_step_uses_default_greeting(
+    prompt_file, monkeypatch
+):
+    _enable_directus(monkeypatch)
+    http_client = _DirectusHttpClient(
+        {
+            "client_prompt_cache": [
+                {
+                    "caller_id": "+15550100",
+                    "client_id": 7,
+                    "prompt_template": "cached prompt",
+                    "timezone": "Europe/Kaliningrad",
+                    "active": True,
+                }
+            ],
+            "clients": [{"id": 7, "first_step": "   "}],
+        }
+    )
+
+    result = await prompt_repo.resolve_prompt_for_call(
+        sip_trunk_number="+15550100",
+        directus_client_factory=_directus_factory(http_client),
+    )
+
+    assert result.source == "directus:cache"
+    assert result.initial_greeting is None
 
 
 @pytest.mark.asyncio

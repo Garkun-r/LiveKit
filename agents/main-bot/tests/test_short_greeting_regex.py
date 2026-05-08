@@ -6,6 +6,7 @@ from agent import (
     is_short_greeting_response,
     resolve_initial_greeting_audio,
     resolve_short_greeting_audio_path,
+    should_start_response_delay_for_transcript,
 )
 
 
@@ -121,6 +122,27 @@ async def test_short_greeting_uses_prerecorded_audio(tmp_path) -> None:
 
     assert resolved_audio_path == audio_path
     assert cache.calls == []
+
+
+@pytest.mark.parametrize("text", ["Роман.", "  подскажите адрес  "])
+def test_response_delay_starts_for_final_non_empty_transcript(text: str) -> None:
+    assert should_start_response_delay_for_transcript(text, is_final=True) is True
+
+
+@pytest.mark.parametrize(
+    ("text", "is_final"),
+    [
+        ("Роман.", False),
+        ("", True),
+        ("   ", True),
+        (None, True),
+    ],
+)
+def test_response_delay_skips_without_final_non_empty_transcript(
+    text: str | None,
+    is_final: bool,
+) -> None:
+    assert should_start_response_delay_for_transcript(text, is_final=is_final) is False
 
 
 def test_extract_sip_call_numbers_prefers_mapped_x_did_attribute() -> None:

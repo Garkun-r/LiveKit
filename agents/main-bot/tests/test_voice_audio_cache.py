@@ -133,3 +133,50 @@ async def test_cache_error_does_not_use_legacy_for_different_profile(tmp_path) -
 
     assert result is None
     assert tts.calls == ["Здравствуйте"]
+
+
+def test_get_existing_can_use_legacy_for_different_profile_when_allowed(tmp_path) -> None:
+    legacy_path = tmp_path / "legacy.wav"
+    legacy_path.write_bytes(b"legacy")
+    cache = VoiceAudioCache(
+        cache_dir=tmp_path / "cache",
+        tts_client=_FakeTTS(voice_id="new-voice"),
+        legacy_profile_id=build_voice_profile_id(_FakeTTS(voice_id="old-voice")),
+    )
+
+    default_result = cache.get_existing(
+        kind="emergency",
+        text="Emergency",
+        legacy_path=legacy_path,
+    )
+    allowed_result = cache.get_existing(
+        kind="emergency",
+        text="Emergency",
+        legacy_path=legacy_path,
+        allow_legacy_any_profile=True,
+    )
+
+    assert default_result is None
+    assert allowed_result == legacy_path
+
+
+def test_get_existing_prefers_current_cache_over_cross_profile_legacy(tmp_path) -> None:
+    legacy_path = tmp_path / "legacy.wav"
+    legacy_path.write_bytes(b"legacy")
+    cache = VoiceAudioCache(
+        cache_dir=tmp_path / "cache",
+        tts_client=_FakeTTS(voice_id="new-voice"),
+        legacy_profile_id=build_voice_profile_id(_FakeTTS(voice_id="old-voice")),
+    )
+    cache_path = cache.path_for(kind="emergency", text="Emergency")
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_bytes(b"cache")
+
+    result = cache.get_existing(
+        kind="emergency",
+        text="Emergency",
+        legacy_path=legacy_path,
+        allow_legacy_any_profile=True,
+    )
+
+    assert result == cache_path

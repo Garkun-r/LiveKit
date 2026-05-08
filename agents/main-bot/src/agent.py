@@ -535,6 +535,21 @@ def safe_dump(value: Any) -> Any:
     return str(value)
 
 
+def state_value(state: Any) -> Any:
+    return getattr(state, "value", state)
+
+
+def should_play_initial_greeting(
+    *,
+    user_speech_started_count: int,
+    session_user_state: Any,
+    close_event_set: bool,
+) -> bool:
+    if close_event_set or user_speech_started_count > 0:
+        return False
+    return state_value(session_user_state) != "speaking"
+
+
 def extract_sip_call_numbers(participant: Any | None) -> dict[str, str | None]:
     if participant is None:
         return {
@@ -788,6 +803,23 @@ async def resolve_initial_greeting_audio(
         resolved_default_greeting,
         _existing_prerecorded_audio_path(prerecorded_path),
     )
+
+
+def should_start_response_delay_for_transcript(
+    transcript: str | None,
+    *,
+    is_final: bool,
+) -> bool:
+    return is_final and bool((transcript or "").strip())
+
+
+def should_log_slow_response_latency(
+    latency_ms: int | float | None,
+    threshold_ms: int,
+) -> bool:
+    if latency_ms is None or threshold_ms <= 0:
+        return False
+    return float(latency_ms) >= threshold_ms
 
 
 def resolve_audio_output_sample_rate(
@@ -3012,9 +3044,13 @@ class Assistant(Agent):
         self._llm_branch_started_at: dict[str, float] = {}
         self._tts_first_frame_ready_at: float | None = None
         self._tts_first_frame_yielded_at: float | None = None
+        self._user_speech_revision = 0
         resolved_prompt = prompt if prompt is not None else get_active_prompt()
         super().__init__(instructions=resolved_prompt)
         self._register_llm_availability_listeners()
+
+    def note_user_started_speaking(self) -> None:
+        self._user_speech_revision += 1
 
     async def on_user_turn_completed(self, _: Any, new_message: ChatMessage) -> None:
         if not self._awaiting_first_user_turn:
@@ -3092,13 +3128,22 @@ class Assistant(Agent):
         if content:
             raw_parts.append(str(content))
 
-    def _register_robot_tag_output(self, raw_text: str) -> None:
+    def _register_robot_tag_output(
+        self,
+        raw_text: str,
+        *,
+        stream_user_speech_revision: int,
+    ) -> None:
         if self._tag_skill_runner is None or not raw_text:
             return
 
         parsed = parse_robot_tags(raw_text)
         if not parsed.has_action_or_tags:
             return
+
+        interrupted_by_user_speech = (
+            self._user_speech_revision > stream_user_speech_revision
+        )
 
         try:
             from livekit.agents.voice.agent_activity import _SpeechHandleContextVar
@@ -3111,15 +3156,18 @@ class Assistant(Agent):
             self._schedule_robot_tag_run(
                 parsed,
                 speech_handle_id=None,
-                interrupted=False,
+                interrupted=interrupted_by_user_speech,
             )
             return
 
         def _on_speech_done(handle: Any) -> None:
+            interrupted = bool(getattr(handle, "interrupted", False)) or (
+                self._user_speech_revision > stream_user_speech_revision
+            )
             self._schedule_robot_tag_run(
                 parsed,
                 speech_handle_id=str(getattr(handle, "id", "")) or None,
-                interrupted=bool(getattr(handle, "interrupted", False)),
+                interrupted=interrupted,
             )
 
         speech_handle.add_done_callback(_on_speech_done)
@@ -3154,12 +3202,16 @@ class Assistant(Agent):
         stream: AsyncIterable[Any],
     ) -> AsyncIterator[Any]:
         raw_parts: list[str] = []
+        stream_user_speech_revision = self._user_speech_revision
         try:
             async for chunk in stream:
                 self._capture_robot_tag_text(raw_parts, chunk)
                 yield chunk
         finally:
-            self._register_robot_tag_output("".join(raw_parts))
+            self._register_robot_tag_output(
+                "".join(raw_parts),
+                stream_user_speech_revision=stream_user_speech_revision,
+            )
 
     def _get_last_user_turn(self, chat_ctx: Any) -> tuple[str | None, bool | None]:
         if self._model_router is None:
@@ -3719,7 +3771,11 @@ async def my_agent(ctx: JobContext):
     user_activity_count = 0
     pending_user_phrase_end_at: float | None = None
     pending_user_phrase_end_source: str | None = None
+    user_speech_started_count = 0
     assistant_message_count = 0
+    last_final_user_turn_started_at: float | None = None
+    last_final_user_turn_text_len = 0
+    slow_response_logged_for_current_turn = False
     end_call_task: asyncio.Task | None = None
     reply_watchdog_task: asyncio.Task | None = None
     export_wait_sec = 20.0
@@ -4200,6 +4256,7 @@ async def my_agent(ctx: JobContext):
                 kind="emergency",
                 text=VOICE_EMERGENCY_PHRASE,
                 legacy_path=_EMERGENCY_AUDIO_PATH,
+                allow_legacy_any_profile=True,
             )
         else:
             emergency_audio_path = await voice_audio_cache.get_or_create(
@@ -4218,6 +4275,8 @@ async def my_agent(ctx: JobContext):
                 text=VOICE_EMERGENCY_PHRASE,
             )
             if played:
+                if err_type == "tts_error":
+                    await request_tag_end_call("unrecoverable_tts_error")
                 return
 
         # If TTS itself is broken and no emergency audio exists, saying a text
@@ -4226,6 +4285,7 @@ async def my_agent(ctx: JobContext):
             logger.warning(
                 "unrecoverable TTS error has no playable emergency audio fallback"
             )
+            await request_tag_end_call("unrecoverable_tts_error")
             return
 
         try:
@@ -4299,6 +4359,7 @@ async def my_agent(ctx: JobContext):
     @session.on("conversation_item_added")
     def on_conversation_item_added(ev):
         nonlocal assistant_message_count, reply_watchdog_task
+        nonlocal slow_response_logged_for_current_turn
         try:
             item = ev.item
             if not isinstance(item, ChatMessage):
@@ -4327,6 +4388,8 @@ async def my_agent(ctx: JobContext):
     def on_user_input_transcribed(ev):
         nonlocal pending_user_phrase_end_at, pending_user_phrase_end_source
         nonlocal user_activity_count, end_call_task, reply_watchdog_task
+        nonlocal last_final_user_turn_started_at, last_final_user_turn_text_len
+        nonlocal slow_response_logged_for_current_turn
         try:
             transcript_items.append(
                 {
@@ -4337,25 +4400,35 @@ async def my_agent(ctx: JobContext):
                     "speaker_id": getattr(ev, "speaker_id", None),
                 }
             )
-            transcript = (getattr(ev, "transcript", None) or "").strip()
+            raw_transcript = getattr(ev, "transcript", None)
+            transcript = (raw_transcript or "").strip()
+            is_final = bool(getattr(ev, "is_final", False))
             if transcript:
                 logger.info(
                     "user input transcribed",
                     extra={
                         "transcript": transcript,
-                        "is_final": bool(getattr(ev, "is_final", False)),
+                        "is_final": is_final,
                         "language": getattr(ev, "language", None),
                     },
                 )
                 # Any new user speech cancels a pending auto-hangup timer.
                 user_activity_count += 1
-                is_final = bool(getattr(ev, "is_final", False))
                 if is_final and pending_user_phrase_end_at is None:
                     pending_user_phrase_end_at = event_timestamp_seconds(
                         ev,
                         default=time.time(),
                     )
                     pending_user_phrase_end_source = "final_transcript"
+                if is_final:
+                    last_final_user_turn_started_at = time.monotonic()
+                    last_final_user_turn_text_len = len(transcript)
+                    slow_response_logged_for_current_turn = False
+                if should_start_response_delay_for_transcript(
+                    raw_transcript,
+                    is_final=is_final,
+                ):
+                    voice_prompts.start_response_delay_timer()
                 if is_final and REPLY_WATCHDOG_SEC > 0:
                     if reply_watchdog_task and not reply_watchdog_task.done():
                         reply_watchdog_task.cancel()
@@ -4371,11 +4444,12 @@ async def my_agent(ctx: JobContext):
     @session.on("user_state_changed")
     def on_user_state_changed(ev):
         nonlocal pending_user_phrase_end_at, pending_user_phrase_end_source
+        nonlocal user_speech_started_count
         try:
             old_state = getattr(ev, "old_state", None)
             new_state = getattr(ev, "new_state", None)
-            old_state_value = getattr(old_state, "value", old_state)
-            new_state_value = getattr(new_state, "value", new_state)
+            old_state_value = state_value(old_state)
+            new_state_value = state_value(new_state)
             logger.info(
                 "user state changed",
                 extra={"old_state": old_state_value, "new_state": new_state_value},
@@ -4383,6 +4457,14 @@ async def my_agent(ctx: JobContext):
             if new_state_value == "speaking":
                 pending_user_phrase_end_at = None
                 pending_user_phrase_end_source = None
+                user_speech_started_count += 1
+                assistant.note_user_started_speaking()
+                started_at = getattr(ev, "created_at", None)
+                notify_local_start_of_speech = getattr(
+                    stt_client, "notify_local_start_of_speech", None
+                )
+                if callable(notify_local_start_of_speech):
+                    notify_local_start_of_speech(started_at=started_at)
                 voice_prompts.on_user_started_speaking()
                 return
             if old_state_value == "speaking" and new_state_value == "listening":
@@ -4405,7 +4487,6 @@ async def my_agent(ctx: JobContext):
                 )
                 if callable(notify_local_end_of_speech):
                     notify_local_end_of_speech(ended_at=ended_at)
-                voice_prompts.start_response_delay_timer()
         except Exception as e:
             logger.exception("user_state_changed handler failed: %s", e)
 
@@ -4420,6 +4501,7 @@ async def my_agent(ctx: JobContext):
     def on_agent_state_changed(ev):
         nonlocal pending_user_phrase_end_at, pending_user_phrase_end_source
         nonlocal reply_watchdog_task
+        nonlocal slow_response_logged_for_current_turn
         try:
             old_state = getattr(ev, "old_state", None)
             new_state = getattr(ev, "new_state", None)
@@ -4450,27 +4532,35 @@ async def my_agent(ctx: JobContext):
                     user_phrase_ended_at=pending_user_phrase_end_at,
                     assistant_started_at=created_at,
                 )
-                if latency_ms is not None:
-                    if latency_ms >= INCIDENT_SLOW_RESPONSE_MS:
-                        incident_log.record_nowait(
-                            "slow_response",
-                            severity="warning",
-                            component="voice_pipeline",
-                            latency_ms=latency_ms,
-                            description=(
-                                "Assistant speech started after response latency "
-                                "threshold"
-                            ),
-                            payload={
-                                "threshold_ms": INCIDENT_SLOW_RESPONSE_MS,
-                                "measured_from": pending_user_phrase_end_source,
-                                "user_phrase_ended_at": pending_user_phrase_end_at,
-                                "assistant_started_speaking_at": created_at,
-                                "user_activity_count": user_activity_count,
-                            },
-                        )
-                    pending_user_phrase_end_at = None
-                    pending_user_phrase_end_source = None
+                if (
+                    latency_ms is not None
+                    and not slow_response_logged_for_current_turn
+                    and should_log_slow_response_latency(
+                        latency_ms,
+                        INCIDENT_SLOW_RESPONSE_MS,
+                    )
+                ):
+                    slow_response_logged_for_current_turn = True
+                    incident_log.record_nowait(
+                        "slow_response",
+                        severity="warning",
+                        component="voice_pipeline",
+                        latency_ms=latency_ms,
+                        description=(
+                            "Assistant speech started after response latency threshold"
+                        ),
+                        payload={
+                            "threshold_ms": INCIDENT_SLOW_RESPONSE_MS,
+                            "measured_from": pending_user_phrase_end_source,
+                            "user_phrase_ended_at": pending_user_phrase_end_at,
+                            "assistant_started_speaking_at": created_at,
+                            "user_activity_count": user_activity_count,
+                            "final_transcript_len": last_final_user_turn_text_len,
+                            "metric_source": "agent_state_changed",
+                        },
+                    )
+                pending_user_phrase_end_at = None
+                pending_user_phrase_end_source = None
                 if isinstance(created_at, (int, float)):
                     logger.info(
                         "agent playback started latency",
@@ -4528,7 +4618,11 @@ async def my_agent(ctx: JobContext):
                     "error_label": getattr(err, "label", None),
                     "source_label": getattr(source, "label", None),
                     "error": safe_dump(err),
-                    "source": safe_dump(source),
+                    "source": {
+                        "provider": getattr(source, "provider", None),
+                        "model": getattr(source, "model", None),
+                        "label": getattr(source, "label", None),
+                    },
                 },
             )
             if recoverable:
@@ -4633,9 +4727,9 @@ async def my_agent(ctx: JobContext):
             close_info["reason"] = close_reason
             voice_prompts.cancel_client_silence_timer()
             voice_prompts.cancel_response_delay_timer()
-            await ensure_session_closed(timeout_sec=4.0)
             logger.info("ending call by deleting room", extra={"room": ctx.room.name})
-            # Bound delete_room call to avoid waiting indefinitely on API edge cases.
+            # Delete the room first so the SIP leg is dropped immediately after
+            # the final tagged phrase finishes.
             await asyncio.wait_for(
                 asyncio.shield(ctx.delete_room(ctx.room.name)), timeout=3.0
             )
@@ -4840,21 +4934,40 @@ async def my_agent(ctx: JobContext):
             ),
             name="runtime_warmup_backends",
         )
-        initial_greeting, initial_greeting_audio_path = (
-            await resolve_initial_greeting_audio(
-                voice_audio_cache=voice_audio_cache,
-                client_greeting=prompt_resolution.initial_greeting,
-                default_greeting=VOICE_INITIAL_GREETING_PHRASE,
-                prerecorded_path=_INITIAL_GREETING_AUDIO_PATH,
-            )
+        initial_greeting_audio_path = None
+        should_greet = should_play_initial_greeting(
+            user_speech_started_count=user_speech_started_count,
+            session_user_state=session.user_state,
+            close_event_set=close_event.is_set(),
         )
+        if should_greet:
+            initial_greeting, initial_greeting_audio_path = (
+                await resolve_initial_greeting_audio(
+                    voice_audio_cache=voice_audio_cache,
+                    client_greeting=prompt_resolution.initial_greeting,
+                    default_greeting=VOICE_INITIAL_GREETING_PHRASE,
+                    prerecorded_path=_INITIAL_GREETING_AUDIO_PATH,
+                )
+            )
+        else:
+            initial_greeting = (
+                (prompt_resolution.initial_greeting or "").strip()
+                or VOICE_INITIAL_GREETING_PHRASE
+            )
         played_initial_greeting = False
-        if initial_greeting_audio_path is not None:
+        if (
+            initial_greeting_audio_path is not None
+            and should_play_initial_greeting(
+                user_speech_started_count=user_speech_started_count,
+                session_user_state=session.user_state,
+                close_event_set=close_event.is_set(),
+            )
+        ):
             played_initial_greeting = await play_prerecorded_audio(
                 session=session,
                 audio_path=initial_greeting_audio_path,
                 sample_rate=audio_output_sample_rate,
-                allow_interruptions=False,
+                allow_interruptions=True,
                 add_to_chat_ctx=False,
                 text=initial_greeting,
             )
@@ -4865,7 +4978,11 @@ async def my_agent(ctx: JobContext):
                     asyncio.shield(runtime_warmup_task),
                     timeout=0.25,
                 )
-        if not played_initial_greeting:
+        if not played_initial_greeting and should_play_initial_greeting(
+            user_speech_started_count=user_speech_started_count,
+            session_user_state=session.user_state,
+            close_event_set=close_event.is_set(),
+        ):
             await session.generate_reply(
                 instructions=(
                     "Сразу после подключения скажи клиенту ровно эту фразу: "

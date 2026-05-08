@@ -145,6 +145,51 @@ async def test_tbank_tts_sentence_splitting_keeps_one_livekit_segment() -> None:
     assert emitter.chunks == [b"audio-1", b"audio-2"]
 
 
+@pytest.mark.asyncio
+async def test_tbank_tts_skips_repeated_sentence_segments() -> None:
+    requests = []
+
+    async def fake_streaming_synthesize(request, metadata):
+        requests.append(request)
+        yield tbank_tts_pb.StreamingSynthesizeSpeechResponse(
+            audio_chunk=f"audio-{len(requests)}".encode()
+        )
+
+    tts_obj = TBankVoiceKitTTS(
+        api_key="test-key",
+        secret_key=_secret_key(),
+        synthesize_stream_factory=fake_streaming_synthesize,
+    )
+    stream = TBankSynthesizeStream(
+        tts=tts_obj,
+        conn_options=DEFAULT_API_CONNECT_OPTIONS,
+    )
+    emitter = _Emitter()
+
+    try:
+        await stream._run_sentence_stream(
+            _SentenceStream(
+                [
+                    "Да, конечно.",
+                    "Вход с торца здания.",
+                    "Да, конечно.",
+                    "Вход с торца здания.",
+                ]
+            ),
+            emitter,
+        )
+    finally:
+        await stream.aclose()
+
+    assert [request.input.text for request in requests] == [
+        "Да, конечно.",
+        "Вход с торца здания.",
+    ]
+    assert emitter.chunks == [b"audio-1", b"audio-2"]
+    assert len(emitter.started_segments) == 1
+    assert emitter.ended_segments == 1
+
+
 def test_build_tts_uses_tbank_provider(monkeypatch) -> None:
     captured = {}
 
