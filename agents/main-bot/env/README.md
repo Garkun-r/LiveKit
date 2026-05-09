@@ -39,6 +39,11 @@ uv run python scripts/build_env.py --profile cloud --secrets env/cloud.secrets.e
 uv run python scripts/sync_cloud_secrets.py --env-file .env.cloud.local
 ```
 
+`sync_cloud_secrets.py` updates provided keys without deleting other cloud
+secrets by default. Use `--overwrite` only for an intentional full replacement
+after confirming the env file contains every required runtime and diagnostics
+secret.
+
 Build an Asterisk candidate file for review:
 
 ```console

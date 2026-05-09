@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -32,6 +32,8 @@ VERDICTS = {"ok", "watch", "needs_attention", "critical"}
 VALID_TARGETS = {"cloud", "local"}
 INCIDENT_WINDOW_BEFORE = timedelta(minutes=5)
 INCIDENT_WINDOW_AFTER = timedelta(minutes=10)
+RAW_LOG_WINDOW_BEFORE = timedelta(seconds=60)
+RAW_LOG_WINDOW_AFTER = timedelta(minutes=3)
 VERDICT_LABELS_RU = {
     "ok": "ок",
     "watch": "наблюдать",
@@ -39,6 +41,8 @@ VERDICT_LABELS_RU = {
     "critical": "критично",
 }
 TARGET_LABELS_RU = {"cloud": "облако", "local": "локальный"}
+TELEGRAM_FINDING_LIMIT = 2
+TELEGRAM_BRIEF_LINE_MAX_CHARS = 320
 SECRET_KEY_RE = re.compile(r"(?i)(authorization|api[_-]?key|token|secret|password)")
 SECRET_VALUE_RE = re.compile(
     r"(authorization\s*[:=]\s*)(bearer|basic)\s+[^\s,;]+|"
@@ -61,6 +65,51 @@ CODEX_ENV_ALLOWLIST = {
     "REQUESTS_CA_BUNDLE",
 }
 DEFAULT_REPORT_TIMEZONE = "Europe/Kaliningrad"
+DEFAULT_DIRECTUS_COLLECTION_CLIENT_PROMPT_CACHE = "client_prompt_cache"
+CURRENT_DATETIME_PLACEHOLDER = "{{CURRENT_DATETIME_BLOCK}}"
+MONTH_NAMES_RU = (
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+)
+WEEKDAY_NAMES_RU = (
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+    "воскресенье",
+)
+RAW_LOG_KEY_PATTERNS = (
+    "agent session error",
+    "closing agent session",
+    "disconnect",
+    "exception",
+    "error",
+    "failed",
+    "initial greeting",
+    "local vad",
+    "play",
+    "playback",
+    "prerecorded",
+    "prompt resolved",
+    "reply watchdog",
+    "stt",
+    "transcribed",
+    "tts",
+    "user state changed",
+    "voice prompt",
+)
 
 
 def utc_now_iso() -> str:
@@ -115,6 +164,96 @@ def format_call_time(
         except (TypeError, ValueError):
             parts.append(f"длительность {duration_sec}")
     return ", ".join(parts) if parts else "-"
+
+
+def prompt_context_max_chars() -> int:
+    raw = os.getenv("CODEX_DIAGNOSTICS_PROMPT_CONTEXT_MAX_CHARS", "100000")
+    try:
+        return max(1000, int(raw))
+    except ValueError:
+        return 100000
+
+
+def raw_log_limit() -> int:
+    raw = os.getenv("CODEX_DIAGNOSTICS_RAW_LOG_LIMIT", "500")
+    try:
+        return max(20, min(2000, int(raw)))
+    except ValueError:
+        return 500
+
+
+def raw_log_text_max_chars() -> int:
+    raw = os.getenv("CODEX_DIAGNOSTICS_RAW_LOG_TEXT_MAX_CHARS", "1200")
+    try:
+        return max(200, min(4000, int(raw)))
+    except ValueError:
+        return 1200
+
+
+def truncate_prompt_context(text: Any, *, max_chars: int | None = None) -> str:
+    value = str(text or "")
+    limit = max_chars or prompt_context_max_chars()
+    if len(value) <= limit:
+        return value
+    omitted = len(value) - limit
+    return (
+        value[:limit]
+        + f"\n\n[Обрезано для диагностики: еще {omitted} символов. "
+        "Увеличьте CODEX_DIAGNOSTICS_PROMPT_CONTEXT_MAX_CHARS, если нужен полный prompt.]"
+    )
+
+
+def truncate_runtime_text(text: Any, *, max_chars: int | None = None) -> str | None:
+    value = str(text or "").strip()
+    if not value:
+        return None
+    limit = max_chars or raw_log_text_max_chars()
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f"... [truncated {len(value) - limit} chars]"
+
+
+def build_diagnostic_datetime_block(
+    *, timezone_name: str, started_at: Any = None
+) -> str:
+    try:
+        tz: ZoneInfo | timezone = ZoneInfo(timezone_name or DEFAULT_REPORT_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        tz = report_timezone()
+    started = parse_datetime(started_at)
+    now = started.astimezone(tz) if started is not None else datetime.now(tz)
+    timezone_label = getattr(tz, "key", str(tz))
+    return (
+        "<current_datetime>\n"
+        "Сейчас локальная дата и время компании:\n"
+        f"- Дата: {now.day} {MONTH_NAMES_RU[now.month - 1]} {now.year} г.\n"  # noqa: RUF001
+        f"- День недели: {WEEKDAY_NAMES_RU[now.weekday()]}\n"
+        f"- Время: {now.hour:02d}:00\n"
+        f"- Часовой пояс: {timezone_label}\n\n"
+        "Этот блок является источником истины для слов:\n"
+        "«сегодня», «завтра», «вчера», «сейчас», «в этот день», "
+        "«на текущий момент».\n\n"
+        "Если клиент спрашивает:\n"
+        "- какой сегодня день недели,\n"
+        "- какая сегодня дата,\n"
+        "- до скольки сегодня работаете,\n"
+        "- вы сегодня открыты,\n"
+        "- вы сейчас работаете,\n\n"
+        "сначала определи текущий день по этому блоку, затем используй график "
+        "работы из <knowledge_base>.\n"
+        "</current_datetime>"
+    )
+
+
+def render_diagnostic_prompt_template(
+    template: str, *, timezone_name: str, started_at: Any = None
+) -> str:
+    block = build_diagnostic_datetime_block(
+        timezone_name=timezone_name, started_at=started_at
+    )
+    if CURRENT_DATETIME_PLACEHOLDER in template:
+        return template.replace(CURRENT_DATETIME_PLACEHOLDER, block)
+    return template
 
 
 def aftercall_execution_url_from_payload(payload: dict[str, Any]) -> str | None:
@@ -347,6 +486,21 @@ def incident_time_filters(call: CallContext) -> dict[str, str]:
     return filters
 
 
+def raw_log_time_filters(call: CallContext) -> dict[str, str]:
+    filters: dict[str, str] = {}
+    started_at = parse_datetime(call.started_at)
+    ended_at = parse_datetime(call.ended_at)
+    if started_at is not None:
+        filters["filter[event_time][_gte]"] = (
+            started_at - RAW_LOG_WINDOW_BEFORE
+        ).isoformat()
+    if ended_at is not None:
+        filters["filter[event_time][_lte]"] = (
+            ended_at + RAW_LOG_WINDOW_AFTER
+        ).isoformat()
+    return filters
+
+
 def telegram_skip_status(rule: DiagnosticRule, report: dict[str, Any]) -> str | None:
     if rule.telegram_policy == "silent":
         return "skipped:silent"
@@ -358,12 +512,300 @@ def telegram_skip_status(rule: DiagnosticRule, report: dict[str, Any]) -> str | 
     return None
 
 
+def compact_raw_log_row(row: dict[str, Any]) -> dict[str, Any]:
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    extras = payload.get("extras") if isinstance(payload.get("extras"), dict) else {}
+    compact = {
+        "id": row.get("id"),
+        "event_time": row.get("event_time"),
+        "level": row.get("level"),
+        "logger_name": row.get("logger_name"),
+        "message": truncate_runtime_text(row.get("message")),
+        "raw_text": truncate_runtime_text(row.get("raw_text")),
+        "module": row.get("module"),
+        "function_name": row.get("function_name"),
+        "line_no": row.get("line_no"),
+        "task_name": row.get("task_name"),
+        "extras": redact(
+            {
+                key: value
+                for key, value in extras.items()
+                if key not in {"message", "room"}
+            }
+        ),
+    }
+    return {
+        key: value
+        for key, value in compact.items()
+        if value is not None and value != "" and value != {}
+    }
+
+
+def _call_session_row(call_session: dict[str, Any]) -> dict[str, Any]:
+    session = call_session.get("session")
+    return session if isinstance(session, dict) else {}
+
+
+def _call_session_payload(call_session: dict[str, Any]) -> dict[str, Any]:
+    session = _call_session_row(call_session)
+    payload = session.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _list_from_sources(
+    key: str, call: CallContext, call_session: dict[str, Any]
+) -> list[Any]:
+    value = call.payload.get(key)
+    if isinstance(value, list):
+        return value
+    session = _call_session_row(call_session)
+    value = session.get(key)
+    if isinstance(value, list):
+        return value
+    session_payload = _call_session_payload(call_session)
+    value = session_payload.get(key)
+    if isinstance(value, list):
+        return value
+    return []
+
+
+def _summary_count(
+    key: str,
+    *,
+    fallback: int,
+    call: CallContext,
+    call_session: dict[str, Any],
+) -> int:
+    summary = call.payload.get("summary")
+    if isinstance(summary, dict) and summary.get(key) is not None:
+        try:
+            return int(summary[key])
+        except (TypeError, ValueError):
+            pass
+    session = _call_session_row(call_session)
+    metrics_summary = session.get("metrics_summary")
+    if isinstance(metrics_summary, dict) and metrics_summary.get(key) is not None:
+        try:
+            return int(metrics_summary[key])
+        except (TypeError, ValueError):
+            pass
+    return fallback
+
+
+def _duration_sec(call: CallContext, call_session: dict[str, Any]) -> float | None:
+    for value in (
+        call.payload.get("duration_sec"),
+        _call_session_row(call_session).get("duration_sec"),
+    ):
+        if value not in {None, ""}:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    started_at = parse_datetime(call.started_at)
+    ended_at = parse_datetime(call.ended_at)
+    if started_at is not None and ended_at is not None:
+        return max(0.0, (ended_at - started_at).total_seconds())
+    return None
+
+
+def _close_reason(call: CallContext, call_session: dict[str, Any]) -> str | None:
+    close = call.payload.get("close") if isinstance(call.payload.get("close"), dict) else {}
+    for value in (
+        close.get("reason"),
+        _call_session_row(call_session).get("close_reason"),
+        _call_session_row(call_session).get("status"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _raw_log_rows(raw_logs: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = raw_logs.get("rows")
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def _log_text(row: dict[str, Any]) -> str:
+    parts = [row.get("message"), row.get("raw_text")]
+    extras = row.get("extras") if isinstance(row.get("extras"), dict) else {}
+    parts.extend(
+        str(value) for value in extras.values() if value is not None and value != ""
+    )
+    return " ".join(str(part) for part in parts if part).lower()
+
+
+def _raw_log_key_events(rows: list[dict[str, Any]], *, limit: int = 80) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        text = _log_text(row)
+        if any(pattern in text for pattern in RAW_LOG_KEY_PATTERNS):
+            events.append(
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key
+                    in {
+                        "id",
+                        "event_time",
+                        "level",
+                        "logger_name",
+                        "message",
+                        "module",
+                        "function_name",
+                        "line_no",
+                        "extras",
+                    }
+                }
+            )
+        if len(events) >= limit:
+            break
+    return events
+
+
+def _snapshot_text(livekit_snapshot: dict[str, Any]) -> str:
+    commands = livekit_snapshot.get("commands")
+    if not isinstance(commands, list):
+        return ""
+    chunks = []
+    for command in commands:
+        if not isinstance(command, dict):
+            continue
+        chunks.append(str(command.get("stdout") or ""))
+        chunks.append(str(command.get("stderr") or ""))
+    return "\n".join(chunks)
+
+
+def collect_diagnostic_signals(
+    *,
+    call: CallContext,
+    incidents: list[dict[str, Any]],
+    call_session: dict[str, Any],
+    raw_logs: dict[str, Any],
+    livekit_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    transcript_items = _list_from_sources("transcript_items", call, call_session)
+    tag_events = _list_from_sources("tag_events", call, call_session)
+    metrics_events = _list_from_sources("metrics_events", call, call_session)
+    usage_updates = _list_from_sources("usage_updates", call, call_session)
+    transcript_count = _summary_count(
+        "transcript_count",
+        fallback=len(transcript_items),
+        call=call,
+        call_session=call_session,
+    )
+    tag_event_count = _summary_count(
+        "tag_event_count",
+        fallback=len(tag_events),
+        call=call,
+        call_session=call_session,
+    )
+    raw_rows = _raw_log_rows(raw_logs)
+    raw_texts = [_log_text(row) for row in raw_rows]
+    assistant_message_count = sum(
+        1
+        for item in transcript_items
+        if isinstance(item, dict) and "assistant" in str(item.get("role") or "").lower()
+    )
+    user_message_count = sum(
+        1
+        for item in transcript_items
+        if isinstance(item, dict)
+        and (
+            "user" in str(item.get("role") or "").lower()
+            or "user_input" in str(item.get("type") or "").lower()
+        )
+    )
+    duration_sec = _duration_sec(call, call_session)
+    close_reason = _close_reason(call, call_session)
+    snapshot_text = _snapshot_text(livekit_snapshot)
+    room_name = call.room_name or ""
+    warning_error_logs = [
+        row
+        for row in raw_rows
+        if str(row.get("level") or "").upper() in {"WARNING", "ERROR", "CRITICAL"}
+    ]
+    no_transcript = transcript_count == 0 and not transcript_items
+    no_tag_events = tag_event_count == 0 and not tag_events
+    short_call_no_dialog = bool(
+        duration_sec is not None
+        and duration_sec >= 5
+        and no_transcript
+        and no_tag_events
+    )
+    signals = {
+        "duration_sec": duration_sec,
+        "close_reason": close_reason,
+        "incident_count": len(incidents),
+        "transcript_count": transcript_count,
+        "tag_event_count": tag_event_count,
+        "metrics_event_count": len(metrics_events),
+        "usage_update_count": len(usage_updates),
+        "assistant_message_count": assistant_message_count,
+        "user_message_count": user_message_count,
+        "no_transcript_items": no_transcript,
+        "no_tag_events": no_tag_events,
+        "no_assistant_messages": assistant_message_count == 0,
+        "short_call_no_dialog": short_call_no_dialog,
+        "participant_disconnected": "participant_disconnected"
+        in str(close_reason or "").lower(),
+        "raw_logs_available": bool(raw_rows),
+        "raw_log_count": len(raw_rows),
+        "raw_log_warning_error_count": len(warning_error_logs),
+        "prompt_resolved_log_seen": any("prompt resolved" in text for text in raw_texts),
+        "stt_provider_log_seen": any("stt provider" in text for text in raw_texts),
+        "tts_provider_log_seen": any("tts provider" in text for text in raw_texts),
+        "tts_warmup_seen": any(
+            "tts synthesis warmup completed" in text for text in raw_texts
+        ),
+        "user_speech_state_seen": any(
+            "user state changed" in text and "speaking" in text for text in raw_texts
+        ),
+        "vad_end_seen": any("vad end of speech" in text for text in raw_texts),
+        "agent_session_error_seen": any("agent session error" in text for text in raw_texts),
+        "reply_watchdog_seen": any("reply watchdog" in text for text in raw_texts),
+        "initial_greeting_playback_log_seen": any(
+            "initial greeting" in text and ("play" in text or "prerecorded" in text)
+            for text in raw_texts
+        ),
+        "voice_prompt_log_seen": any("voice prompt" in text for text in raw_texts),
+        "room_seen_in_livekit_snapshot": bool(room_name and room_name in snapshot_text),
+        "egress_active_in_livekit_snapshot": bool(
+            room_name and room_name in snapshot_text and "EGRESS_ACTIVE" in snapshot_text
+        ),
+        "raw_log_warning_error_events": warning_error_logs[:20],
+        "raw_log_key_events": _raw_log_key_events(raw_rows),
+    }
+    focus = []
+    if short_call_no_dialog:
+        focus.append("root_cause_no_dialog")
+    if signals["no_assistant_messages"]:
+        focus.append("verify_initial_greeting_or_first_reply")
+    if signals["user_speech_state_seen"] and no_transcript:
+        focus.append("speech_seen_without_transcript")
+    if signals["room_seen_in_livekit_snapshot"]:
+        focus.append("post_close_room_or_egress_state")
+    if warning_error_logs:
+        focus.append("raw_log_warning_error")
+    signals["analysis_focus"] = focus
+    signals["expected_first_steps"] = [
+        "prompt resolved",
+        "initial greeting played or generated",
+        "user speech detected and transcribed",
+        "assistant answer or silence/status handling",
+        "session export and aftercall",
+    ]
+    return redact(signals)
+
+
 def build_codex_prompt(
     *,
     call: CallContext,
     incidents: list[dict[str, Any]],
     rule: DiagnosticRule,
     livekit_snapshot: dict[str, Any],
+    diagnostic_signals: dict[str, Any] | None = None,
 ) -> str:
     evidence_hint = {
         "target": call.target,
@@ -379,6 +821,7 @@ def build_codex_prompt(
             "min_severity": rule.min_severity,
         },
         "incident_count": len(incidents),
+        "diagnostic_signals": diagnostic_signals or {},
     }
     return (
         "You are Codex running a post-call diagnostic audit for a LiveKit voice "
@@ -394,11 +837,49 @@ def build_codex_prompt(
         "summary, findings, recommendations, telegram_brief, and markdown must "
         "be written in clear Russian for a non-technical business owner. Avoid "
         "raw JSON/log dumps in human-readable fields. The telegram_brief field "
-        "must be a concise Russian Telegram brief with no English labels. The "
-        "markdown field must be a full Russian report with these sections: "
+        "must be a short Russian decision brief, not a protocol. It should fit "
+        "in one Telegram screen: one-line outcome, top 1-2 findings, why it "
+        "matters, and what to do next. Avoid repeated source/detail labels in "
+        "the brief; put long evidence in markdown. The markdown field must be "
+        "a full Russian report with these sections: "
         "Краткий итог, Хронология звонка, Паузы и задержки, Ошибки и инциденты, "
         "Аномалии поведения, Предполагаемая причина, Рекомендации, Гарантия "
-        "безопасности. If a section has no data, say so plainly in Russian.\n\n"
+        "безопасности. If a section has no data, say so plainly in Russian. "
+        "Use short sentences, simple words, and one idea per sentence. Do not "
+        "hide the main point behind timestamps, filenames, class names, or raw "
+        "metrics. Explain the meaning first, then give technical proof.\n\n"
+        "The audit input may include prompt_context.rendered_prompt from "
+        "Directus client_prompt_cache. When it is present, treat it as the "
+        "primary source of truth for the robot's knowledge base and instructions "
+        "during this call. Repository files such as prompt.txt are fallback or "
+        "code references, not proof that the production prompt omitted a fact. "
+        "Before writing that the robot contradicted the prompt or knowledge "
+        "base, check prompt_context first, especially <knowledge_base>, add_info, "
+        "company_extra, and current_datetime. Put the exact source you checked "
+        "into source_of_truth. If prompt_context is unavailable, say that in "
+        "missing_evidence and lower confidence.\n\n"
+        "The audit input may also include call_session, raw_logs, and "
+        "diagnostic_signals from Directus. Treat them as primary runtime "
+        "evidence. For calls where transcript_items are empty, tag_events are "
+        "empty, or the owner says the robot was silent, do not stop at 'there "
+        "is no transcript'. Run a root-cause audit of the call chain: SIP/room "
+        "join, prompt resolve, initial greeting, STT/VAD, LLM, TTS/playout, tag "
+        "parser, close reason, session export, and aftercall. Compare what the "
+        "scenario expected to happen with what runtime logs prove happened. "
+        "If raw_logs are present, cite the relevant log messages and times in "
+        "evidence. If raw_logs are missing a needed event, name that as an "
+        "instrumentation gap and propose the exact diagnostic event to add. "
+        "For a no-dialog call longer than five seconds with no transcript and "
+        "no tag, use verdict needs_attention or critical unless the supplied "
+        "evidence clearly proves it was a harmless test or spam call.\n\n"
+        "For silence/no-dialog cases, the first finding must explain in simple "
+        "Russian: what the robot should have done first, what actually happened, "
+        "the most likely place where the chain broke, what proves it, and what "
+        "is still not provable. Check raw log events such as prompt resolved, "
+        "user state changed, local VAD end of speech, STT provider, TTS provider, "
+        "initial greeting/playback/prerecorded audio, agent session error, reply "
+        "watchdog, and participant disconnect. Do not confuse TTS warmup with "
+        "proof that the greeting was played to the caller.\n\n"
         "Quality bar for every finding: answer what exactly happened, where in "
         "the dialog it happened, which event/tag/value/code-path proves it, why "
         "it matters, what evidence is missing, and what implementation change "
@@ -410,8 +891,18 @@ def build_codex_prompt(
         "request, closing, or after the conversation already seemed finished. "
         "Separate facts from inference. If the stage, tag, or cause cannot be "
         "determined from the data, explicitly write that in missing_evidence "
-        "instead of guessing. The telegram_brief must include the stage, exact "
-        "detail, evidence, and implementation idea for each top finding.\n\n"
+        "instead of guessing. The plain_explanation field is mandatory: write "
+        "one or two simple Russian sentences that a business owner can understand "
+        "without knowing LiveKit, Python, metrics, or internal tags. The "
+        "telegram_brief must be easy to read quickly. For each top finding use "
+        "simple labels like Смысл, Где, Что сделать, Почему верю. Keep proof "
+        "short and move long source names, raw metric values, and file paths to "
+        "the full markdown report.\n\n"
+        "For markdown findings, use this order every time: "
+        "1) Что случилось, 2) Где в звонке, 3) Почему это важно, "
+        "4) Чем подтверждается, 5) Что сделать. Add technical details and "
+        "missing_evidence only when they change the conclusion. Keep each "
+        "paragraph short.\n\n"
         f"Audit context summary:\n{json.dumps(redact(evidence_hint), ensure_ascii=False, indent=2)}\n\n"
         "The full sanitized audit input is attached on stdin as JSON."
     )
@@ -766,21 +1257,209 @@ class DirectusClient:
         return [DiagnosticRule.from_directus(item) for item in data or []]
 
     def list_incidents_for_call(self, call: CallContext) -> list[dict[str, Any]]:
+        if not call.room_name:
+            return []
         params: dict[str, str] = {
             "sort": "-created_at",
             "limit": "50",
             "filter[environment][_eq]": call.target,
+            "filter[room_name][_eq]": call.room_name,
         }
         params.update(incident_time_filters(call))
-        if call.room_name:
-            params["filter[room_name][_eq]"] = call.room_name
-        elif call.caller_phone:
-            params["filter[caller_phone][_eq]"] = call.caller_phone
-        elif call.did:
-            params["filter[did][_eq]"] = call.did
-        else:
-            return []
         return self._request("GET", "/items/robot_incidents", params=params) or []
+
+    def fetch_call_session_for_call(self, call: CallContext) -> dict[str, Any]:
+        context: dict[str, Any] = {
+            "status": "not_found",
+            "room_name": call.room_name,
+            "note": (
+                "Directus robot_call_sessions row for this room. Runtime fields "
+                "here are read-only evidence for Codex diagnostics."
+            ),
+        }
+        if not call.room_name:
+            context["status"] = "no_room_name"
+            return context
+        try:
+            rows = self._request(
+                "GET",
+                "/items/robot_call_sessions",
+                params={
+                    "filter[room_name][_eq]": call.room_name,
+                    "fields": (
+                        "id,created_at,updated_at,source,agent_name,runtime_profile,"
+                        "room_name,session_id,lead_session_id,client_id,client_name,"
+                        "phone_number,xdid,did,gateway_number,sip_call_id,job_id,"
+                        "trace_id,started_at,ended_at,duration_sec,status,close_reason,"
+                        "prompt_source,chat_history,transcript_items,tag_events,"
+                        "usage_updates,metrics_summary,payload"
+                    ),
+                    "limit": "1",
+                },
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {403, 404}:
+                context["status"] = "unavailable"
+                context["error"] = (
+                    f"Directus returned {exc.response.status_code} for robot_call_sessions"
+                )
+                return context
+            raise
+        if not rows:
+            return context
+        context["status"] = "found"
+        context["session"] = rows[0]
+        return redact(context)
+
+    def fetch_raw_logs_for_call(
+        self, call: CallContext, *, call_session: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        limit = raw_log_limit()
+        context: dict[str, Any] = {
+            "status": "not_found",
+            "room_name": call.room_name,
+            "limit": limit,
+            "rows": [],
+            "note": (
+                "Directus robot_call_raw_logs rows for this call. These are "
+                "compact, redacted runtime log lines for root-cause diagnostics."
+            ),
+        }
+        session = _call_session_row(call_session or {})
+        session_id = session.get("id")
+        if not session_id and not call.room_name:
+            context["status"] = "no_lookup_key"
+            return context
+
+        fields = (
+            "id,event_time,call_session,source,agent_name,runtime_profile,room_name,"
+            "session_id,job_id,trace_id,sip_call_id,sequence,level,logger_name,"
+            "message,raw_text,module,function_name,line_no,task_name,payload"
+        )
+
+        def query(params: dict[str, str], *, source: str) -> list[dict[str, Any]]:
+            rows = self._request(
+                "GET",
+                "/items/robot_call_raw_logs",
+                params={
+                    "fields": fields,
+                    "sort": "event_time,sequence,id",
+                    "limit": str(limit),
+                    **params,
+                },
+            )
+            context["query_source"] = source
+            return [compact_raw_log_row(row) for row in rows or []]
+
+        try:
+            rows: list[dict[str, Any]] = []
+            if session_id:
+                rows = query(
+                    {"filter[call_session][_eq]": str(session_id)},
+                    source="call_session",
+                )
+            if not rows and call.room_name:
+                params = {"filter[room_name][_eq]": call.room_name}
+                params.update(raw_log_time_filters(call))
+                rows = query(params, source="room_name")
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {403, 404}:
+                context["status"] = "unavailable"
+                context["error"] = (
+                    f"Directus returned {exc.response.status_code} for robot_call_raw_logs"
+                )
+                return context
+            raise
+        context["rows"] = rows
+        context["count"] = len(rows)
+        if rows:
+            context["status"] = "found"
+            context["first_event_time"] = rows[0].get("event_time")
+            context["last_event_time"] = rows[-1].get("event_time")
+        return redact(context)
+
+    def fetch_prompt_context_for_call(self, call: CallContext) -> dict[str, Any]:
+        caller_id = (
+            call.did
+            or call.xdid
+            or (
+                call.payload.get("sip", {}).get("sip_trunk_number")
+                if isinstance(call.payload.get("sip"), dict)
+                else None
+            )
+        )
+        sip = call.payload.get("sip") if isinstance(call.payload.get("sip"), dict) else {}
+        context: dict[str, Any] = {
+            "status": "not_found",
+            "caller_id": str(caller_id) if caller_id else None,
+            "agent_prompt_source": sip.get("prompt_source"),
+            "agent_prompt_lookup_error": sip.get("prompt_lookup_error"),
+            "note": (
+                "This context is read by diagnostics only. It is used to verify "
+                "facts against the Directus prompt/cache that the robot used."
+            ),
+        }
+        if not caller_id:
+            context["status"] = "no_sip_trunk_number"
+            return context
+
+        collection = os.getenv(
+            "DIRECTUS_COLLECTION_CLIENT_PROMPT_CACHE",
+            DEFAULT_DIRECTUS_COLLECTION_CLIENT_PROMPT_CACHE,
+        )
+        try:
+            rows = self._request(
+                "GET",
+                f"/items/{quote(collection, safe='')}",
+                params={
+                    "filter[caller_id][_eq]": str(caller_id),
+                    "filter[active][_eq]": "true",
+                    "fields": (
+                        "id,caller_id,client_id,prompt_template,timezone,"
+                        "source_hash,active,last_error,date_updated"
+                    ),
+                    "sort": "-date_updated",
+                    "limit": "1",
+                },
+            )
+        except httpx.HTTPStatusError as exc:
+            context["status"] = "unavailable"
+            context["error"] = (
+                f"Directus returned {exc.response.status_code} for {collection}"
+            )
+            return context
+        except Exception as exc:
+            context["status"] = "unavailable"
+            context["error"] = redact(str(exc))
+            return context
+
+        if not rows:
+            return context
+
+        row = rows[0]
+        template = str(row.get("prompt_template") or "")
+        timezone_name = str(row.get("timezone") or DEFAULT_REPORT_TIMEZONE)
+        rendered_prompt = render_diagnostic_prompt_template(
+            template,
+            timezone_name=timezone_name,
+            started_at=call.started_at,
+        )
+        context.update(
+            {
+                "status": "found",
+                "source": f"directus:{collection}",
+                "cache_id": row.get("id"),
+                "client_id": row.get("client_id"),
+                "timezone": timezone_name,
+                "source_hash": row.get("source_hash"),
+                "date_updated": row.get("date_updated"),
+                "last_error": row.get("last_error"),
+                "prompt_template_chars": len(template),
+                "rendered_prompt_chars": len(rendered_prompt),
+                "rendered_prompt": truncate_prompt_context(rendered_prompt),
+            }
+        )
+        return redact(context)
 
     def find_recent_audit_for_rule(
         self, *, call: CallContext, rule: DiagnosticRule
@@ -904,14 +1583,14 @@ def report_markdown(report: dict[str, Any]) -> str:
                 "",
                 f"### Находка {index}: {item.get('title', 'без названия')}",
                 f"Серьезность: {item.get('severity', 'info')}",
-                f"Этап диалога: {item.get('stage', 'не указан')}",
-                f"Момент: {item.get('event_time_or_turn', 'не указан')}",
-                f"Конкретная деталь: {item.get('exact_detail', 'не указана')}",
-                f"Доказательства: {item.get('evidence', '')}",
-                f"Почему это важно: {item.get('why_it_matters', '')}",
+                f"Что произошло простыми словами: {item.get('plain_explanation', '')}",
+                f"Где в звонке: {item.get('stage', 'не указан')}; {item.get('event_time_or_turn', 'не указан')}",
+                f"Почему важно: {item.get('why_it_matters', '')}",
+                f"Что сделать: {item.get('implementation_idea', '') or item.get('recommendation', '')}",
+                f"Как проверили: {item.get('evidence', '')}",
+                f"Источник проверки: {item.get('source_of_truth', 'не указан')}",
+                f"Техническая деталь: {item.get('exact_detail', 'не указана')}",
                 f"Предполагаемая причина: {item.get('suspected_cause', '')}",
-                f"Рекомендация: {item.get('recommendation', '')}",
-                f"Идея реализации: {item.get('implementation_idea', '')}",
                 f"Чего не хватает для проверки: {item.get('missing_evidence', '')}",
             ]
         )
@@ -938,6 +1617,31 @@ def directus_audit_report_url(*, directus_url: str, audit_id: int) -> str:
     return f"{app_url}/admin/content/robot_call_audits/{audit_id}"
 
 
+def clean_report_sentence(value: Any) -> str:
+    return str(value or "").strip().rstrip(". ")
+
+
+def brief_text(value: Any, *, max_chars: int = TELEGRAM_BRIEF_LINE_MAX_CHARS) -> str:
+    text = re.sub(r"\s+", " ", clean_report_sentence(value))
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def append_report_line(lines: list[str], label: str, value: Any) -> None:
+    text = clean_report_sentence(value)
+    if text:
+        lines.append(f"   {label}: {text}.")
+
+
+def append_brief_line(lines: list[str], label: str, value: Any) -> None:
+    text = brief_text(value)
+    if text:
+        lines.append(f"   {label}: {text}.")
+
+
 def telegram_payload(
     *,
     audit_id: int,
@@ -951,7 +1655,7 @@ def telegram_payload(
     findings = (
         report.get("findings") if isinstance(report.get("findings"), list) else []
     )
-    top = findings[:3]
+    top = findings[:TELEGRAM_FINDING_LIMIT]
     verdict = str(report.get("verdict") or "unknown")
     target = str(call.target or "-")
     call_time = format_call_time(
@@ -960,39 +1664,55 @@ def telegram_payload(
         duration_sec=call.payload.get("duration_sec"),
     )
     aftercall_url = aftercall_execution_url_from_payload(call.payload)
+    summary = brief_text(report.get("summary"), max_chars=420)
     text_lines = [
         f"Вердикт: {VERDICT_LABELS_RU.get(verdict, verdict)}",
-        f"Цель: {TARGET_LABELS_RU.get(target, target)}",
+        f"Звонок: {call_time}",
+        (
+            f"Клиент: {call.caller_phone or '-'} | "
+            f"DID/xDID: {call.xdid or call.did or '-'} | "
+            f"{TARGET_LABELS_RU.get(target, target)}"
+        ),
         f"Комната: {call.room_name or '-'}",
-        f"Время звонка: {call_time}",
-        f"Номер DID/xDID: {call.xdid or call.did or '-'}",
-        f"Звонящий: {call.caller_phone or '-'}",
     ]
     if aftercall_url:
         text_lines.append(f"Прогон aftercall: {aftercall_url}")
-    for item in top:
-        finding_parts = [f"- {item.get('title', 'Находка')}"]
+    if summary:
+        text_lines.extend(["", "Итог:", summary])
+    if top:
+        text_lines.append("")
+        text_lines.append("Главное:")
+    for index, item in enumerate(top, start=1):
+        finding_lines = [f"{index}. {brief_text(item.get('title') or 'Находка', max_chars=120)}"]
+        plain_explanation = str(item.get("plain_explanation") or "").strip()
         stage = str(item.get("stage") or "").strip()
         event_time = str(item.get("event_time_or_turn") or "").strip()
         exact_detail = str(item.get("exact_detail") or "").strip()
         evidence = str(item.get("evidence") or "").strip()
+        why_it_matters = str(item.get("why_it_matters") or "").strip()
         implementation_idea = str(
             item.get("implementation_idea") or item.get("recommendation") or ""
         ).strip()
-        for label, value in [
-            ("Этап", stage),
-            ("Момент", event_time),
-            ("Деталь", exact_detail),
-            ("Доказательство", evidence),
-            ("Что поменять", implementation_idea),
-        ]:
-            if value:
-                finding_parts.append(f"{label}: {value.rstrip('. ')}.")
-        text_lines.append(" ".join(finding_parts))
-    if not top:
-        summary = str(report.get("summary", "")).strip()
-        if summary:
-            text_lines.append(summary)
+        append_brief_line(
+            finding_lines,
+            "Смысл",
+            plain_explanation or exact_detail,
+        )
+        where = "; ".join(item for item in (stage, event_time) if item)
+        append_brief_line(finding_lines, "Где", where)
+        append_brief_line(finding_lines, "Почему важно", why_it_matters)
+        append_brief_line(finding_lines, "Что сделать", implementation_idea)
+        proof_parts = []
+        if evidence:
+            proof_parts.append(evidence)
+        if exact_detail and exact_detail not in evidence:
+            proof_parts.append(exact_detail)
+        append_brief_line(finding_lines, "Почему верю", " ".join(proof_parts))
+        text_lines.append("\n".join(finding_lines))
+    if not top and not summary:
+        fallback_summary = brief_text(report.get("telegram_brief"), max_chars=420)
+        if fallback_summary:
+            text_lines.append(fallback_summary)
     text_lines.append(f"Полный отчет: {report_url}")
     return {
         "audit_id": audit_id,
@@ -1137,16 +1857,31 @@ def run_audit(
         livekit_snapshot = collect_livekit_snapshot(
             call.target, repo_dir=runner.repo_dir
         )
+        prompt_context = directus.fetch_prompt_context_for_call(call)
+        call_session = directus.fetch_call_session_for_call(call)
+        raw_logs = directus.fetch_raw_logs_for_call(call, call_session=call_session)
+        diagnostic_signals = collect_diagnostic_signals(
+            call=call,
+            incidents=incidents,
+            call_session=call_session,
+            raw_logs=raw_logs,
+            livekit_snapshot=livekit_snapshot,
+        )
         audit_input = {
             "call": call.__dict__ | {"payload": redact(call.payload)},
             "incidents": redact(incidents),
             "livekit_snapshot": livekit_snapshot,
+            "prompt_context": prompt_context,
+            "call_session": call_session,
+            "raw_logs": raw_logs,
+            "diagnostic_signals": diagnostic_signals,
         }
         prompt = build_codex_prompt(
             call=call,
             incidents=incidents,
             rule=rule,
             livekit_snapshot=livekit_snapshot,
+            diagnostic_signals=diagnostic_signals,
         )
         result = runner.run(prompt, audit_input)
         markdown = report_markdown(result.report)

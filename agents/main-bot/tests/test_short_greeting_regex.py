@@ -3,10 +3,11 @@ from livekit import rtc
 
 from agent import (
     extract_sip_call_numbers,
+    is_response_delay_candidate_transcript,
     is_short_greeting_response,
     resolve_initial_greeting_audio,
     resolve_short_greeting_audio_path,
-    should_start_response_delay_for_transcript,
+    should_start_response_delay_after_vad,
 )
 
 
@@ -125,8 +126,10 @@ async def test_short_greeting_uses_prerecorded_audio(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("text", ["Роман.", "  подскажите адрес  "])
-def test_response_delay_starts_for_final_non_empty_transcript(text: str) -> None:
-    assert should_start_response_delay_for_transcript(text, is_final=True) is True
+def test_response_delay_marks_final_non_empty_transcript_as_candidate(
+    text: str,
+) -> None:
+    assert is_response_delay_candidate_transcript(text, is_final=True) is True
 
 
 @pytest.mark.parametrize(
@@ -138,11 +141,41 @@ def test_response_delay_starts_for_final_non_empty_transcript(text: str) -> None
         (None, True),
     ],
 )
-def test_response_delay_skips_without_final_non_empty_transcript(
+def test_response_delay_ignores_non_final_or_empty_transcript(
     text: str | None,
     is_final: bool,
 ) -> None:
-    assert should_start_response_delay_for_transcript(text, is_final=is_final) is False
+    assert is_response_delay_candidate_transcript(text, is_final=is_final) is False
+
+
+@pytest.mark.parametrize(
+    (
+        "has_final_transcript",
+        "user_stopped_speaking",
+        "already_started",
+        "expected",
+    ),
+    [
+        (True, True, False, True),
+        (True, False, False, False),
+        (False, True, False, False),
+        (True, True, True, False),
+    ],
+)
+def test_response_delay_starts_only_after_vad_end(
+    has_final_transcript: bool,
+    user_stopped_speaking: bool,
+    already_started: bool,
+    expected: bool,
+) -> None:
+    assert (
+        should_start_response_delay_after_vad(
+            has_final_transcript=has_final_transcript,
+            user_stopped_speaking=user_stopped_speaking,
+            already_started=already_started,
+        )
+        is expected
+    )
 
 
 def test_extract_sip_call_numbers_prefers_mapped_x_did_attribute() -> None:

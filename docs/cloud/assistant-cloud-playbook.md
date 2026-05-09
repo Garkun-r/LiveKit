@@ -138,6 +138,10 @@ Direct LiveKit CLI alternative:
 lk agent update-secrets --secrets-file .env.local
 ```
 
+The repository sync helper performs an additive update by default so an
+incomplete env file does not remove unrelated runtime or diagnostics secrets.
+Only pass `--overwrite` after explicitly confirming a full secret replacement.
+
 Important details from LiveKit docs:
 
 - LiveKit automatically injects `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` for the deployed cloud agent.

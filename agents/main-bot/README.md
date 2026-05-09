@@ -461,6 +461,69 @@ Get started quickly with our pre-built frontend starter apps, or add telephony s
 
 For advanced customization, see the [complete frontend guide](https://docs.livekit.io/frontends/).
 
+## Call Recordings Index
+
+LiveKit Egress recordings are stored outside Directus in private MinIO/S3. The
+agent indexes completed sessions in Directus so `/admin` and `platform` can find
+the matching recording metadata and stream it through a protected backend.
+
+For LiveKit Cloud, `CALL_RECORDING_S3_ENDPOINT` must be a public HTTPS
+S3-compatible endpoint that Cloud Egress can reach. Do not use
+`http://127.0.0.1:9000` there; that local MinIO endpoint is only appropriate for
+the admin backend read proxy (`RECORDINGS_S3_ENDPOINT`) running on the VPS.
+
+Apply the Directus/Postgres schema before enabling cabinet playback:
+
+```console
+sudo -u postgres psql -d voicebot -f agents/main-bot/schema/robot_call_recordings.sql
+sudo -u postgres psql -d voicebot -f agents/main-bot/schema/robot_call_recordings_directus.sql
+```
+
+`send_session_to_n8n()` also best-effort upserts `robot_call_sessions` by
+`room_name` when `DIRECTUS_URL` and `DIRECTUS_TOKEN` are set. Recording rows in
+`robot_call_recordings` are written by the LiveKit Egress completion/indexer
+path and contain the private MinIO object key.
+
+If an agent exits before LiveKit finishes Egress finalization, refresh recording
+metadata with:
+
+```console
+uv run python scripts/reconcile_recordings.py --limit 200
+```
+
+Run this periodically from a small cron/systemd timer after `CALL_RECORDING_*`,
+`LIVEKIT_*`, `DIRECTUS_URL`, and `DIRECTUS_TOKEN` are available in the
+environment.
+
+## Per-Call Raw Logs
+
+The agent captures Python logging records during each call and writes them to
+Directus collection `robot_call_raw_logs` while the call is still running. This
+is intentionally separate from the aftercall JSON export: if the final export is
+missing or incomplete, recent per-call log lines can still be visible in
+`/admin/` under `Логи LiveKit`.
+
+Apply the schema before enabling runtime writes:
+
+```console
+sudo -u postgres psql -d voicebot -f agents/main-bot/schema/robot_call_raw_logs.sql
+sudo -u postgres psql -d voicebot -f agents/main-bot/schema/robot_call_raw_logs_directus.sql
+```
+
+Runtime settings:
+
+```env
+RAW_CALL_LOG_ENABLED=true
+RAW_CALL_LOG_LEVEL=INFO
+RAW_CALL_LOG_FLUSH_INTERVAL_SEC=2.0
+RAW_CALL_LOG_BATCH_SIZE=50
+RAW_CALL_LOG_MAX_PENDING=1000
+```
+
+Rows are redacted and truncated before upload. The writer is best-effort and
+must not affect the customer-visible voice flow when Directus is slow or
+unavailable.
+
 ## Tests and evals
 
 This project includes a complete suite of evals, based on the LiveKit Agents [testing & evaluation framework](https://docs.livekit.io/agents/start/testing/). To run them, use `pytest`.

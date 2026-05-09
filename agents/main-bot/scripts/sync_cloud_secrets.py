@@ -70,6 +70,14 @@ def main() -> None:
         action="store_true",
         help="Only show which keys would be synced.",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Replace the full cloud secret set. Dangerous: omitted keys are removed. "
+            "Default is additive update."
+        ),
+    )
     args = parser.parse_args()
 
     env_file = Path(args.env_file).expanduser().resolve()
@@ -99,17 +107,23 @@ def main() -> None:
         "agent",
         "update-secrets",
         "--yes",
-        "--overwrite",
         "--secrets-file",
         str(tmp_path),
     ]
+    if args.overwrite:
+        cmd.insert(4, "--overwrite")
     if args.id:
         cmd.extend(["--id", args.id])
     if args.project:
         cmd.extend(["--project", args.project])
 
     cmd.append(str(Path(args.working_dir).expanduser().resolve()))
-    subprocess.run(cmd, check=True)
+    if args.overwrite:
+        print("WARNING: --overwrite replaces the full cloud secret set.")
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        tmp_path.unlink(missing_ok=True)
     print("Secrets synced to LiveKit Cloud.")
 
 

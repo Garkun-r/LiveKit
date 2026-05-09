@@ -140,7 +140,10 @@ Voice prompt catalog:
 - `response_delay`: "Секундочку." Plays if the caller finished speaking and the
   assistant stays silent past `VOICE_RESPONSE_DELAY_SEC`.
 - `client_silence`: "Алло." Plays if the assistant is listening and the caller
-  stays silent past `VOICE_CLIENT_SILENCE_SEC`.
+  stays silent past `VOICE_CLIENT_SILENCE_SEC`. The prompt repeats up to
+  `VOICE_CLIENT_SILENCE_MAX_PROMPTS`; if the caller stays silent after the last
+  prompt and one more silence interval, the agent deletes the room without a
+  final LLM-generated phrase.
 - `emergency`: "Извините, перезвоните ещё раз." Plays for unrecoverable runtime
   errors.
 - Future prompts: `tool_wait`, `transfer`, and `farewell` are reserved for
@@ -151,8 +154,9 @@ Requirements:
 - Voice prompts must use pre-synthesized/prerecorded audio files from
   `agents/main-bot/audio`, with paths configurable through env.
 - Technical prompts must not be added to LLM chat context.
-- Only one technical prompt may play at a time. New user speech cancels pending
-  prompt timers and stops active short prompts.
+- Only one technical prompt may play at a time. VAD user-speech events pause
+  prompt playback so audio does not overlap with the caller; final non-empty
+  STT transcripts reset the client-silence sequence.
 - Do not blindly start a parallel `generate_reply` to cover silence; use audio
   prompts for perceived latency and keep `REPLY_WATCHDOG_SEC` as a later recovery
   path for stuck scheduling.
@@ -186,8 +190,10 @@ Requirements:
 - The assistant TTS pipeline must wait for an active technical prompt to finish
   before releasing the normal answer, so prompt audio and assistant audio do not
   overlap.
-- The client-silence prompt starts only while the assistant is listening and no
-  `end_call` is scheduled.
+- The client-silence prompt sequence starts only while the assistant is
+  listening and no `end_call` is scheduled. VAD-only noise does not reset the
+  silence deadline or prompt count; final non-empty STT text is treated as a
+  caller answer and resets the sequence.
 
 ## Future tool prompts
 

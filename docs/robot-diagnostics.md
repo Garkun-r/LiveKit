@@ -36,7 +36,7 @@ Asterisk/dialplan и LiveKit webhook receiver для pre-agent этапов бу
 Агент в production пишет не напрямую в Postgres, а через Directus API over HTTPS.
 Прямой Postgres transport оставлен только как dev/fallback path.
 
-Таблица:
+Таблица инцидентов:
 
 ```text
 public.robot_incidents
@@ -58,6 +58,19 @@ agents/main-bot/schema/robot_incidents_directus.sql
 Агент не создает таблицу сам во время звонка. Это намеренно: миграция схемы,
 права ролей и Directus-настройки должны применяться отдельно и явно, чтобы не
 рисковать production-базой.
+
+Для полного разбора конкретного звонка есть отдельная коллекция:
+
+```text
+public.robot_call_raw_logs
+```
+
+Она хранит построчные Python logging records LiveKit agent по `room_name`,
+`session_id`, `sip_call_id` и `call_session`. Эти строки пишутся во время
+звонка через Directus API и показываются в `/admin/` в Raw/`Логи LiveKit`
+перед сохраненным aftercall JSON. Это не меняет контракт `robot_incidents`:
+инциденты остаются короткими структурированными событиями, а
+`robot_call_raw_logs` служит для детальной per-call диагностики.
 
 ## Подключение К VPS/Directus
 
@@ -279,6 +292,13 @@ INCIDENT_SLOW_RESPONSE_MS=4000
 
 `INCIDENT_DB_TIMEOUT_SEC` должен быть коротким. Если VPS/Directus/Postgres
 недоступен, звонок не должен падать из-за диагностики.
+
+Если запись в `robot_incidents` не удалась, агент пишет тот же sanitized
+incident payload в application log как `incident_fallback`. Это аварийный след
+для LiveKit Cloud logs, а не замена Directus: без `DIRECTUS_TOKEN`,
+`INCIDENT_DIRECTUS_TOKEN` или `INCIDENT_POSTGRES_DSN` процесс физически не может
+создать строку в Directus/Postgres. Токены Directus нельзя вшивать в код или
+Docker image.
 
 ## Границы MVP
 

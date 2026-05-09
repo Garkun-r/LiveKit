@@ -19,9 +19,11 @@
         "required": [
           "title",
           "severity",
+          "plain_explanation",
           "stage",
           "event_time_or_turn",
           "exact_detail",
+          "source_of_truth",
           "evidence",
           "why_it_matters",
           "confidence",
@@ -36,9 +38,11 @@
             "type": "string",
             "enum": ["info", "warning", "error", "critical"]
           },
+          "plain_explanation": {"type": "string"},
           "stage": {"type": "string"},
           "event_time_or_turn": {"type": "string"},
           "exact_detail": {"type": "string"},
+          "source_of_truth": {"type": "string"},
           "evidence": {"type": "string"},
           "why_it_matters": {"type": "string"},
           "confidence": {

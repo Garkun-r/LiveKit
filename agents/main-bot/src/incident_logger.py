@@ -435,12 +435,15 @@ class IncidentLogger:
                     timeout=self._timeout_sec,
                 )
         except Exception as e:
+            fallback_payload = record_to_payload(record)
             logger.warning(
-                "failed to write robot incident: %s",
+                "failed to write robot incident; emitted structured fallback: %s",
                 e,
                 extra={
                     "incident_type": incident_type,
                     "incident_transport": self._transport,
+                    "incident_fallback": fallback_payload,
+                    "incident_write_error": error_payload(e),
                 },
             )
 

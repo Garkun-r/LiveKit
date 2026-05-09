@@ -283,7 +283,7 @@ VOICE_INITIAL_GREETING_PHRASE = (
     or "Алло, здравствуйте."
 )
 VOICE_INITIAL_GREETING_DELAY_SEC = float(
-    os.getenv("VOICE_INITIAL_GREETING_DELAY_SEC", "1.5")
+    os.getenv("VOICE_INITIAL_GREETING_DELAY_SEC", "1.0")
 )
 VOICE_SHORT_GREETING_PHRASE = (
     os.getenv(
@@ -313,7 +313,10 @@ VOICE_CLIENT_SILENCE_PHRASE = (
     ).strip()
     or "Алло."
 )
-VOICE_CLIENT_SILENCE_SEC = float(os.getenv("VOICE_CLIENT_SILENCE_SEC", "8.0"))
+VOICE_CLIENT_SILENCE_SEC = float(os.getenv("VOICE_CLIENT_SILENCE_SEC", "4.0"))
+VOICE_CLIENT_SILENCE_MAX_PROMPTS = int(
+    os.getenv("VOICE_CLIENT_SILENCE_MAX_PROMPTS", "2")
+)
 VOICE_EMERGENCY_AUDIO_PATH = (
     os.getenv(
         "VOICE_EMERGENCY_AUDIO_PATH",
@@ -630,6 +633,17 @@ DIRECTUS_URL = os.getenv("DIRECTUS_URL", "").strip().rstrip("/")
 DIRECTUS_TOKEN = os.getenv("DIRECTUS_TOKEN", "").strip()
 DIRECTUS_REQUEST_TIMEOUT_SEC = float(os.getenv("DIRECTUS_REQUEST_TIMEOUT_SEC", "2.0"))
 DIRECTUS_PROMPT_CACHE_TTL_SEC = float(os.getenv("DIRECTUS_PROMPT_CACHE_TTL_SEC", "300"))
+
+# Per-call raw log capture. These rows are written during the call, not only in
+# the final aftercall payload, so abnormal closes still leave recent log lines.
+RAW_CALL_LOG_ENABLED = _env_bool("RAW_CALL_LOG_ENABLED", default=True)
+RAW_CALL_LOG_LEVEL = os.getenv("RAW_CALL_LOG_LEVEL", "INFO").strip().upper() or "INFO"
+RAW_CALL_LOG_FLUSH_INTERVAL_SEC = float(os.getenv("RAW_CALL_LOG_FLUSH_INTERVAL_SEC", "2.0"))
+RAW_CALL_LOG_BATCH_SIZE = int(os.getenv("RAW_CALL_LOG_BATCH_SIZE", "50"))
+RAW_CALL_LOG_MAX_PENDING = int(os.getenv("RAW_CALL_LOG_MAX_PENDING", "1000"))
+RAW_CALL_LOG_MAX_MESSAGE_CHARS = int(os.getenv("RAW_CALL_LOG_MAX_MESSAGE_CHARS", "8000"))
+RAW_CALL_LOG_MAX_EXTRA_CHARS = int(os.getenv("RAW_CALL_LOG_MAX_EXTRA_CHARS", "12000"))
+
 DIRECTUS_DEFAULT_TIMEZONE = os.getenv(
     "DIRECTUS_DEFAULT_TIMEZONE",
     "Europe/Kaliningrad",
@@ -705,6 +719,26 @@ AUDIO_INPUT_ENHANCEMENT = (
 
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 N8N_WEBHOOK_TOKEN = os.getenv("N8N_WEBHOOK_TOKEN", "")
+
+# LiveKit Egress audio recordings. This is best-effort and must never block the
+# realtime call path when Egress or storage is unavailable.
+CALL_RECORDING_ENABLED = _env_bool("CALL_RECORDING_ENABLED", default=False)
+CALL_RECORDING_S3_ENDPOINT = os.getenv("CALL_RECORDING_S3_ENDPOINT", "").strip().rstrip("/")
+CALL_RECORDING_S3_BUCKET = os.getenv("CALL_RECORDING_S3_BUCKET", "").strip()
+CALL_RECORDING_S3_REGION = os.getenv("CALL_RECORDING_S3_REGION", "us-east-1").strip()
+CALL_RECORDING_S3_ACCESS_KEY = os.getenv("CALL_RECORDING_S3_ACCESS_KEY", "").strip()
+CALL_RECORDING_S3_SECRET_KEY = os.getenv("CALL_RECORDING_S3_SECRET_KEY", "").strip()
+CALL_RECORDING_S3_FORCE_PATH_STYLE = _env_bool(
+    "CALL_RECORDING_S3_FORCE_PATH_STYLE",
+    default=True,
+)
+CALL_RECORDING_PREFIX = os.getenv("CALL_RECORDING_PREFIX", "livekit").strip().strip("/")
+CALL_RECORDING_FINALIZE_TIMEOUT_SEC = float(
+    os.getenv("CALL_RECORDING_FINALIZE_TIMEOUT_SEC", "12")
+)
+CALL_RECORDING_FINALIZE_POLL_SEC = float(
+    os.getenv("CALL_RECORDING_FINALIZE_POLL_SEC", "1.5")
+)
 
 SMS_RU_API_URL = os.getenv("SMS_RU_API_URL", "https://sms.ru/sms/send")
 SMS_RU_API_ID = os.getenv("SMS_RU_API_ID", "")

@@ -7,7 +7,7 @@ import random
 import re
 import tempfile
 import time
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -230,6 +230,7 @@ from config import (
     VOICE_AUDIO_CACHE_ENABLED,
     VOICE_AUDIO_LEGACY_PROFILE_ID,
     VOICE_CLIENT_SILENCE_AUDIO_PATH,
+    VOICE_CLIENT_SILENCE_MAX_PROMPTS,
     VOICE_CLIENT_SILENCE_PHRASE,
     VOICE_CLIENT_SILENCE_SEC,
     VOICE_EMERGENCY_AUDIO_PATH,
@@ -267,6 +268,12 @@ from egress import (
 from eleven_v3_tts import ElevenV3TTS
 from incident_logger import IncidentLogger, classify_error, component_identity
 from prompt_repo import PromptResolution, get_active_prompt, resolve_prompt_for_call
+from raw_call_logs import (
+    RawCallLogSink,
+    bind_raw_call_log_sink,
+    reset_raw_call_log_sink,
+)
+from recording_export import finalize_room_recording, start_room_recording
 from robot_settings import (
     ComponentSelection,
     ResolvedRobotSettings,
@@ -542,13 +549,9 @@ def state_value(state: Any) -> Any:
 
 def should_play_initial_greeting(
     *,
-    user_speech_started_count: int,
-    session_user_state: Any,
     close_event_set: bool,
 ) -> bool:
-    if close_event_set or user_speech_started_count > 0:
-        return False
-    return state_value(session_user_state) != "speaking"
+    return not close_event_set
 
 
 async def wait_for_initial_greeting_delay(delay_sec: float) -> None:
@@ -811,12 +814,21 @@ async def resolve_initial_greeting_audio(
     )
 
 
-def should_start_response_delay_for_transcript(
+def is_response_delay_candidate_transcript(
     transcript: str | None,
     *,
     is_final: bool,
 ) -> bool:
     return is_final and bool((transcript or "").strip())
+
+
+def should_start_response_delay_after_vad(
+    *,
+    has_final_transcript: bool,
+    user_stopped_speaking: bool,
+    already_started: bool,
+) -> bool:
+    return has_final_transcript and user_stopped_speaking and not already_started
 
 
 def should_log_slow_response_latency(
@@ -892,8 +904,10 @@ class VoicePromptManager:
         response_delay_sec: float,
         response_delay_post_gap_sec: float,
         client_silence_sec: float,
+        client_silence_max_prompts: int,
         is_closed: Callable[[], bool],
         is_end_call_scheduled: Callable[[], bool],
+        on_client_silence_timeout: Callable[[], Awaitable[None]],
     ) -> None:
         self._session = session
         self._background_audio = background_audio
@@ -903,8 +917,10 @@ class VoicePromptManager:
         self._response_delay_sec = max(0.0, response_delay_sec)
         self._response_delay_post_gap_sec = max(0.0, response_delay_post_gap_sec)
         self._client_silence_sec = max(0.0, client_silence_sec)
+        self._client_silence_max_prompts = max(0, client_silence_max_prompts)
         self._is_closed = is_closed
         self._is_end_call_scheduled = is_end_call_scheduled
+        self._on_client_silence_timeout = on_client_silence_timeout
 
         self._response_delay_task: asyncio.Task | None = None
         self._client_silence_task: asyncio.Task | None = None
@@ -913,8 +929,10 @@ class VoicePromptManager:
         self._active_prompt_handle: Any | None = None
         self._active_lock = asyncio.Lock()
         self._response_delay_played = False
-        self._client_silence_played = False
+        self._client_silence_prompt_count = 0
         self._waiting_for_client_response = False
+        self._client_silence_deadline_at: float | None = None
+        self._user_is_speaking = False
         self._last_response_delay_finished_at: float | None = None
 
     def start_response_delay_timer(self) -> None:
@@ -936,10 +954,12 @@ class VoicePromptManager:
             or self._is_closed()
             or self._is_end_call_scheduled()
             or not self._waiting_for_client_response
-            or self._client_silence_played
         ):
             return
         self.cancel_client_silence_timer()
+        self._schedule_client_silence_timer()
+
+    def _schedule_client_silence_timer(self) -> None:
         self._client_silence_task = asyncio.create_task(
             self._run_client_silence_timer(),
             name="voice_prompt_client_silence",
@@ -959,27 +979,47 @@ class VoicePromptManager:
         self.cancel_response_delay_timer()
         self.cancel_client_silence_timer()
         self._response_delay_played = False
-        self._client_silence_played = False
-        self._waiting_for_client_response = False
+        self._user_is_speaking = True
         self._stop_active_prompt_task = asyncio.create_task(
             self.stop_active_prompt(),
             name="voice_prompt_stop_on_user_speech",
+        )
+
+    def on_user_finished_speaking(self) -> None:
+        self._user_is_speaking = False
+        self.start_client_silence_timer()
+
+    def on_user_transcribed(self) -> None:
+        self.cancel_response_delay_timer()
+        self.cancel_client_silence_timer()
+        self._response_delay_played = False
+        self._client_silence_prompt_count = 0
+        self._waiting_for_client_response = False
+        self._client_silence_deadline_at = None
+        self._user_is_speaking = False
+        self._stop_active_prompt_task = asyncio.create_task(
+            self.stop_active_prompt(),
+            name="voice_prompt_stop_on_user_transcript",
         )
 
     def on_agent_started_speaking(self) -> None:
         self.cancel_response_delay_timer()
         self.cancel_client_silence_timer()
         self._waiting_for_client_response = False
+        self._client_silence_deadline_at = None
         if self._active_prompt_kind == "response_delay":
             self._stop_active_prompt_task = asyncio.create_task(
                 self.stop_active_prompt(),
                 name="voice_prompt_stop_on_agent_speech",
             )
         if self._active_prompt_kind != "client_silence":
-            self._client_silence_played = False
+            self._client_silence_prompt_count = 0
 
     def on_agent_finished_speaking(self) -> None:
+        self._client_silence_prompt_count = 0
         self._waiting_for_client_response = True
+        self._client_silence_deadline_at = time.monotonic() + self._client_silence_sec
+        self._user_is_speaking = False
         self.start_client_silence_timer()
 
     async def wait_for_active_prompt(self) -> None:
@@ -1037,21 +1077,47 @@ class VoicePromptManager:
 
     async def _run_client_silence_timer(self) -> None:
         try:
-            await asyncio.sleep(self._client_silence_sec)
-            if (
-                self._is_closed()
-                or self._is_end_call_scheduled()
-                or self._client_silence_played
-            ):
+            deadline_at = self._client_silence_deadline_at
+            if deadline_at is None:
+                deadline_at = time.monotonic() + self._client_silence_sec
+                self._client_silence_deadline_at = deadline_at
+            await asyncio.sleep(max(0.0, deadline_at - time.monotonic()))
+            if self._is_closed() or self._is_end_call_scheduled():
+                return
+            if not self._waiting_for_client_response or self._user_is_speaking:
                 return
             if self._session.agent_state != "listening":
                 return
             current_speech = self._session.current_speech
             if current_speech is not None and not current_speech.done():
                 return
+            if self._client_silence_prompt_count >= self._client_silence_max_prompts:
+                self._waiting_for_client_response = False
+                self._client_silence_deadline_at = None
+                logger.info(
+                    "client silence timeout reached",
+                    extra={
+                        "client_silence_prompt_count": self._client_silence_prompt_count,
+                        "client_silence_max_prompts": self._client_silence_max_prompts,
+                    },
+                )
+                await self._on_client_silence_timeout()
+                return
+            self._client_silence_prompt_count += 1
             played = await self._play_background_prompt(self._client_silence_prompt)
+            if self._is_closed() or self._is_end_call_scheduled():
+                return
             if played:
-                self._client_silence_played = True
+                logger.info(
+                    "client silence prompt completed",
+                    extra={
+                        "client_silence_prompt_count": self._client_silence_prompt_count,
+                        "client_silence_max_prompts": self._client_silence_max_prompts,
+                    },
+                )
+            self._waiting_for_client_response = True
+            self._client_silence_deadline_at = time.monotonic() + self._client_silence_sec
+            self._schedule_client_silence_timer()
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -3047,6 +3113,7 @@ class Assistant(Agent):
         self._tag_skill_runner = tag_skill_runner
         self._incident_logger = incident_logger
         self._awaiting_first_user_turn = True
+        self._initial_greeting_in_progress = False
         self._llm_branch_started_at: dict[str, float] = {}
         self._tts_first_frame_ready_at: float | None = None
         self._tts_first_frame_yielded_at: float | None = None
@@ -3054,6 +3121,12 @@ class Assistant(Agent):
         resolved_prompt = prompt if prompt is not None else get_active_prompt()
         super().__init__(instructions=resolved_prompt)
         self._register_llm_availability_listeners()
+
+    def begin_initial_greeting(self) -> None:
+        self._initial_greeting_in_progress = True
+
+    def finish_initial_greeting(self) -> None:
+        self._initial_greeting_in_progress = False
 
     def note_user_started_speaking(self) -> None:
         self._user_speech_revision += 1
@@ -3065,6 +3138,10 @@ class Assistant(Agent):
         user_text = (getattr(new_message, "text_content", None) or "").strip()
         if not user_text:
             return
+
+        if self._initial_greeting_in_progress:
+            logger.info("user turn ignored while initial greeting is playing")
+            raise StopResponse()
 
         self._awaiting_first_user_turn = False
         if not is_short_greeting_response(user_text):
@@ -3777,11 +3854,13 @@ async def my_agent(ctx: JobContext):
     user_activity_count = 0
     pending_user_phrase_end_at: float | None = None
     pending_user_phrase_end_source: str | None = None
-    user_speech_started_count = 0
     assistant_message_count = 0
     last_final_user_turn_started_at: float | None = None
     last_final_user_turn_text_len = 0
     slow_response_logged_for_current_turn = False
+    response_delay_has_final_transcript = False
+    response_delay_user_stopped_speaking = False
+    response_delay_started_for_turn = False
     end_call_task: asyncio.Task | None = None
     reply_watchdog_task: asyncio.Task | None = None
     export_wait_sec = 20.0
@@ -3801,8 +3880,23 @@ async def my_agent(ctx: JobContext):
         "gateway_number": None,
         "sip_client_number": None,
     }
+    sip_diagnostic_context = {
+        "trace_id": None,
+        "sip_call_id": None,
+    }
     participant = None
     robot_settings: ResolvedRobotSettings | None = None
+    recording_handle = None
+    raw_log_sink = RawCallLogSink(
+        room_name=ctx.room.name,
+        session_id=ctx.room.name,
+        agent_name=AGENT_NAME,
+        runtime_profile=ROBOT_RUNTIME_PROFILE,
+        job_id=job_id,
+    )
+    raw_log_token = bind_raw_call_log_sink(raw_log_sink)
+    await raw_log_sink.start()
+    logger.info("raw call log capture started")
 
     try:
         await ctx.connect()
@@ -3816,7 +3910,10 @@ async def my_agent(ctx: JobContext):
             )
 
         sip_call_numbers = extract_sip_call_numbers(participant)
-        incident_log.set_context(**extract_sip_diagnostic_context(participant))
+        sip_diagnostic_context = extract_sip_diagnostic_context(participant)
+        incident_log.set_context(**sip_diagnostic_context)
+        raw_log_sink.trace_id = sip_diagnostic_context.get("trace_id")
+        raw_log_sink.sip_call_id = sip_diagnostic_context.get("sip_call_id")
         prompt_resolution = await resolve_prompt_for_call(
             sip_trunk_number=sip_call_numbers["sip_trunk_number"],
             sip_client_number=sip_call_numbers["sip_client_number"],
@@ -3825,6 +3922,25 @@ async def my_agent(ctx: JobContext):
             did=sip_call_numbers["sip_trunk_number"],
             runtime_key=ROBOT_RUNTIME_PROFILE,
         )
+        try:
+            recording_handle = await start_room_recording(ctx.room.name)
+            if recording_handle:
+                logger.info(
+                    "room recording started",
+                    extra={
+                        "egress_id": recording_handle.egress_id,
+                        "object_key": recording_handle.object_key,
+                    },
+                )
+        except Exception as e:
+            logger.warning("failed to start room recording: %s", e)
+            incident_log.record_exception_nowait(
+                "call_recording_failed",
+                e,
+                severity="warning",
+                component="livekit_egress",
+                description="Failed to start LiveKit room recording",
+            )
         logger.info(
             "robot settings resolved",
             extra={
@@ -4168,6 +4284,10 @@ async def my_agent(ctx: JobContext):
         preemptive_generation=preemptive_generation,
     )
     background_audio = BackgroundAudioPlayer()
+
+    async def on_client_silence_timeout() -> None:
+        await request_client_silence_end_call()
+
     voice_prompts = VoicePromptManager(
         session=session,
         background_audio=background_audio,
@@ -4187,8 +4307,10 @@ async def my_agent(ctx: JobContext):
         response_delay_sec=VOICE_RESPONSE_DELAY_SEC,
         response_delay_post_gap_sec=VOICE_RESPONSE_DELAY_POST_GAP_SEC,
         client_silence_sec=VOICE_CLIENT_SILENCE_SEC,
+        client_silence_max_prompts=VOICE_CLIENT_SILENCE_MAX_PROMPTS,
         is_closed=close_event.is_set,
         is_end_call_scheduled=lambda: bool(end_call_task and not end_call_task.done()),
+        on_client_silence_timeout=on_client_silence_timeout,
     )
     logger.info(
         "session latency guards configured",
@@ -4236,6 +4358,7 @@ async def my_agent(ctx: JobContext):
                 str(path) for path in _RESPONSE_DELAY_AUDIO_PATHS
             ],
             "voice_client_silence_sec": VOICE_CLIENT_SILENCE_SEC,
+            "voice_client_silence_max_prompts": VOICE_CLIENT_SILENCE_MAX_PROMPTS,
             "voice_client_silence_audio_path": str(_CLIENT_SILENCE_AUDIO_PATH)
             if _CLIENT_SILENCE_AUDIO_PATH
             else None,
@@ -4247,6 +4370,17 @@ async def my_agent(ctx: JobContext):
             "voice_audio_cache_profile_id": voice_audio_cache.voice_profile_id,
         },
     )
+
+    def maybe_start_response_delay_timer() -> None:
+        nonlocal response_delay_started_for_turn
+        if not should_start_response_delay_after_vad(
+            has_final_transcript=response_delay_has_final_transcript,
+            user_stopped_speaking=response_delay_user_stopped_speaking,
+            already_started=response_delay_started_for_turn,
+        ):
+            return
+        response_delay_started_for_turn = True
+        voice_prompts.start_response_delay_timer()
 
     async def handle_unrecoverable_error(ev: Any) -> None:
         nonlocal unrecoverable_error_response_started
@@ -4397,6 +4531,7 @@ async def my_agent(ctx: JobContext):
         nonlocal user_activity_count, end_call_task, reply_watchdog_task
         nonlocal last_final_user_turn_started_at, last_final_user_turn_text_len
         nonlocal slow_response_logged_for_current_turn
+        nonlocal response_delay_has_final_transcript
         try:
             transcript_items.append(
                 {
@@ -4421,6 +4556,8 @@ async def my_agent(ctx: JobContext):
                 )
                 # Any new user speech cancels a pending auto-hangup timer.
                 user_activity_count += 1
+                if is_final:
+                    voice_prompts.on_user_transcribed()
                 if is_final and pending_user_phrase_end_at is None:
                     pending_user_phrase_end_at = event_timestamp_seconds(
                         ev,
@@ -4431,11 +4568,12 @@ async def my_agent(ctx: JobContext):
                     last_final_user_turn_started_at = time.monotonic()
                     last_final_user_turn_text_len = len(transcript)
                     slow_response_logged_for_current_turn = False
-                if should_start_response_delay_for_transcript(
+                if is_response_delay_candidate_transcript(
                     raw_transcript,
                     is_final=is_final,
                 ):
-                    voice_prompts.start_response_delay_timer()
+                    response_delay_has_final_transcript = True
+                    maybe_start_response_delay_timer()
                 if is_final and REPLY_WATCHDOG_SEC > 0:
                     if reply_watchdog_task and not reply_watchdog_task.done():
                         reply_watchdog_task.cancel()
@@ -4451,7 +4589,9 @@ async def my_agent(ctx: JobContext):
     @session.on("user_state_changed")
     def on_user_state_changed(ev):
         nonlocal pending_user_phrase_end_at, pending_user_phrase_end_source
-        nonlocal user_speech_started_count
+        nonlocal response_delay_has_final_transcript
+        nonlocal response_delay_user_stopped_speaking
+        nonlocal response_delay_started_for_turn
         try:
             old_state = getattr(ev, "old_state", None)
             new_state = getattr(ev, "new_state", None)
@@ -4464,7 +4604,9 @@ async def my_agent(ctx: JobContext):
             if new_state_value == "speaking":
                 pending_user_phrase_end_at = None
                 pending_user_phrase_end_source = None
-                user_speech_started_count += 1
+                response_delay_has_final_transcript = False
+                response_delay_user_stopped_speaking = False
+                response_delay_started_for_turn = False
                 assistant.note_user_started_speaking()
                 started_at = getattr(ev, "created_at", None)
                 notify_local_start_of_speech = getattr(
@@ -4494,6 +4636,9 @@ async def my_agent(ctx: JobContext):
                 )
                 if callable(notify_local_end_of_speech):
                     notify_local_end_of_speech(ended_at=ended_at)
+                response_delay_user_stopped_speaking = True
+                maybe_start_response_delay_timer()
+                voice_prompts.on_user_finished_speaking()
         except Exception as e:
             logger.exception("user_state_changed handler failed: %s", e)
 
@@ -4684,12 +4829,15 @@ async def my_agent(ctx: JobContext):
         payload = {
             "agent_name": AGENT_NAME,
             "room_name": ctx.room.name,
+            "client_id": getattr(prompt_resolution, "client_id", None),
             "started_at": session_started_at.isoformat(),
             "ended_at": ended_at.isoformat(),
             "duration_sec": (ended_at - session_started_at).total_seconds(),
             "close": close_info,
             "sip": {
                 **sip_call_numbers,
+                "trace_id": sip_diagnostic_context.get("trace_id"),
+                "sip_call_id": sip_diagnostic_context.get("sip_call_id"),
                 "prompt_source": prompt_resolution.source,
                 "prompt_lookup_error": prompt_resolution.error,
             },
@@ -4708,6 +4856,17 @@ async def my_agent(ctx: JobContext):
         }
 
         logger.info("sending session data to n8n")
+        try:
+            await finalize_room_recording(recording_handle)
+        except Exception as e:
+            logger.warning("failed to finalize room recording metadata: %s", e)
+            incident_log.record_exception_nowait(
+                "call_recording_failed",
+                e,
+                severity="warning",
+                component="livekit_egress",
+                description="Failed to finalize LiveKit room recording metadata",
+            )
         await send_session_to_n8n(payload)
         logger.info("session data sent to n8n")
 
@@ -4728,13 +4887,24 @@ async def my_agent(ctx: JobContext):
         except BaseException as e:
             logger.exception("session close failed: %s", e)
 
-    async def delete_room_safely(reason: str) -> None:
-        close_reason = f"tag_action:{reason}"
+    async def delete_room_safely(
+        reason: str,
+        *,
+        close_reason: str | None = None,
+    ) -> None:
+        resolved_close_reason = close_reason or f"tag_action:{reason}"
         try:
-            close_info["reason"] = close_reason
+            close_info["reason"] = resolved_close_reason
             voice_prompts.cancel_client_silence_timer()
             voice_prompts.cancel_response_delay_timer()
-            logger.info("ending call by deleting room", extra={"room": ctx.room.name})
+            logger.info(
+                "ending call by deleting room",
+                extra={
+                    "room": ctx.room.name,
+                    "reason": reason,
+                    "close_reason": resolved_close_reason,
+                },
+            )
             # Delete the room first so the SIP leg is dropped immediately after
             # the final tagged phrase finishes.
             await asyncio.wait_for(
@@ -4748,25 +4918,35 @@ async def my_agent(ctx: JobContext):
                 component="livekit_room",
                 error_type="TimeoutError",
                 description="delete_room timed out while ending call",
-                payload={"reason": reason, "room": ctx.room.name},
+                payload={
+                    "reason": reason,
+                    "close_reason": resolved_close_reason,
+                    "room": ctx.room.name,
+                },
             )
         except Exception as e:
             logger.exception("failed to delete room: %s", e)
-            close_reason = f"tag_action_failed:{reason}"
-            close_info["reason"] = close_reason
+            resolved_close_reason = (
+                f"{close_reason}_failed" if close_reason else f"tag_action_failed:{reason}"
+            )
+            close_info["reason"] = resolved_close_reason
             incident_log.record_exception_nowait(
                 "abnormal_close",
                 e,
                 severity="warning",
                 component="livekit_room",
                 description="delete_room failed while ending call",
-                payload={"reason": reason, "room": ctx.room.name},
+                payload={
+                    "reason": reason,
+                    "close_reason": resolved_close_reason,
+                    "room": ctx.room.name,
+                },
             )
         finally:
             # Unblock main entrypoint even if LiveKit close signal arrives late.
             close_event.set()
             # Ensure worker exits promptly after final playout and grace window.
-            ctx.shutdown(reason=close_reason)
+            ctx.shutdown(reason=resolved_close_reason)
             # Close local AgentSession explicitly so entrypoint does not hang
             # waiting for an external room-close callback.
             await ensure_session_closed(timeout_sec=2.0)
@@ -4788,6 +4968,30 @@ async def my_agent(ctx: JobContext):
                 logger.exception("tag end-call task failed: %s", e)
 
         end_call_task = asyncio.create_task(end_after_tag(), name="tag_end_call")
+        return "END_CALL_SCHEDULED"
+
+    async def request_client_silence_end_call() -> str:
+        nonlocal end_call_task
+        if end_call_task and not end_call_task.done():
+            return "END_CALL_ALREADY_SCHEDULED"
+
+        voice_prompts.cancel_response_delay_timer()
+
+        async def end_after_client_silence() -> None:
+            try:
+                await delete_room_safely(
+                    "client_silence_timeout",
+                    close_reason="client_silence_timeout",
+                )
+            except asyncio.CancelledError:
+                logger.info("client silence end-call task canceled")
+            except Exception as e:
+                logger.exception("client silence end-call task failed: %s", e)
+
+        end_call_task = asyncio.create_task(
+            end_after_client_silence(),
+            name="client_silence_end_call",
+        )
         return "END_CALL_SCHEDULED"
 
     @session.on("close")
@@ -4943,65 +5147,72 @@ async def my_agent(ctx: JobContext):
         )
         initial_greeting_audio_path = None
         should_greet = should_play_initial_greeting(
-            user_speech_started_count=user_speech_started_count,
-            session_user_state=session.user_state,
             close_event_set=close_event.is_set(),
         )
         if should_greet:
-            initial_greeting, initial_greeting_audio_path = (
-                await resolve_initial_greeting_audio(
-                    voice_audio_cache=voice_audio_cache,
-                    client_greeting=prompt_resolution.initial_greeting,
-                    default_greeting=VOICE_INITIAL_GREETING_PHRASE,
-                    prerecorded_path=_INITIAL_GREETING_AUDIO_PATH,
-                )
+            (
+                initial_greeting,
+                initial_greeting_audio_path,
+            ) = await resolve_initial_greeting_audio(
+                voice_audio_cache=voice_audio_cache,
+                client_greeting=prompt_resolution.initial_greeting,
+                default_greeting=VOICE_INITIAL_GREETING_PHRASE,
+                prerecorded_path=_INITIAL_GREETING_AUDIO_PATH,
             )
         else:
             initial_greeting = (
-                (prompt_resolution.initial_greeting or "").strip()
-                or VOICE_INITIAL_GREETING_PHRASE
-            )
+                prompt_resolution.initial_greeting or ""
+            ).strip() or VOICE_INITIAL_GREETING_PHRASE
         played_initial_greeting = False
-        if (
-            initial_greeting_audio_path is not None
-            and should_play_initial_greeting(
-                user_speech_started_count=user_speech_started_count,
-                session_user_state=session.user_state,
-                close_event_set=close_event.is_set(),
-            )
-        ):
-            await wait_for_initial_greeting_delay(VOICE_INITIAL_GREETING_DELAY_SEC)
-            if should_play_initial_greeting(
-                user_speech_started_count=user_speech_started_count,
-                session_user_state=session.user_state,
-                close_event_set=close_event.is_set(),
-            ):
-                played_initial_greeting = await play_prerecorded_audio(
-                    session=session,
-                    audio_path=initial_greeting_audio_path,
-                    sample_rate=audio_output_sample_rate,
-                    allow_interruptions=True,
-                    add_to_chat_ctx=False,
-                    text=initial_greeting,
-                )
-        # Do not block call flow if warmup is still in progress.
-        if runtime_warmup_task and not runtime_warmup_task.done():
+        if should_greet:
+            assistant.begin_initial_greeting()
+            try:
+                if (
+                    initial_greeting_audio_path is not None
+                    and should_play_initial_greeting(
+                        close_event_set=close_event.is_set(),
+                    )
+                ):
+                    await wait_for_initial_greeting_delay(
+                        VOICE_INITIAL_GREETING_DELAY_SEC
+                    )
+                    if should_play_initial_greeting(
+                        close_event_set=close_event.is_set(),
+                    ):
+                        played_initial_greeting = await play_prerecorded_audio(
+                            session=session,
+                            audio_path=initial_greeting_audio_path,
+                            sample_rate=audio_output_sample_rate,
+                            allow_interruptions=False,
+                            add_to_chat_ctx=False,
+                            text=initial_greeting,
+                        )
+                # Do not block call flow if warmup is still in progress.
+                if runtime_warmup_task and not runtime_warmup_task.done():
+                    with suppress(Exception):
+                        await asyncio.wait_for(
+                            asyncio.shield(runtime_warmup_task),
+                            timeout=0.25,
+                        )
+                if not played_initial_greeting and should_play_initial_greeting(
+                    close_event_set=close_event.is_set(),
+                ):
+                    await session.generate_reply(
+                        instructions=(
+                            "Сразу после подключения скажи клиенту ровно эту фразу: "
+                            f"{initial_greeting}"
+                        ),
+                        allow_interruptions=False,
+                    )
+            finally:
+                assistant.finish_initial_greeting()
+        elif runtime_warmup_task and not runtime_warmup_task.done():
+            # Do not block call flow if warmup is still in progress.
             with suppress(Exception):
                 await asyncio.wait_for(
                     asyncio.shield(runtime_warmup_task),
                     timeout=0.25,
                 )
-        if not played_initial_greeting and should_play_initial_greeting(
-            user_speech_started_count=user_speech_started_count,
-            session_user_state=session.user_state,
-            close_event_set=close_event.is_set(),
-        ):
-            await session.generate_reply(
-                instructions=(
-                    "Сразу после подключения скажи клиенту ровно эту фразу: "
-                    f"{initial_greeting}"
-                )
-            )
         await close_event.wait()
         await export_best_effort(timeout_sec=export_wait_sec)
     except asyncio.CancelledError:
@@ -5088,6 +5299,8 @@ async def my_agent(ctx: JobContext):
                     payload={"phase": "finalizer"},
                 )
         await incident_log.drain(timeout_sec=1.0)
+        reset_raw_call_log_sink(raw_log_token)
+        await raw_log_sink.close(timeout_sec=3.0)
 
 
 if __name__ == "__main__":

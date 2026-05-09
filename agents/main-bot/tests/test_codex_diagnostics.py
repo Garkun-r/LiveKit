@@ -17,6 +17,7 @@ from shared.webhooks.codex_diagnostics import (  # noqa: E402
     audit_dedupe_key,
     build_codex_prompt,
     build_livekit_snapshot_commands,
+    collect_diagnostic_signals,
     directus_audit_report_url,
     extract_final_codex_message,
     format_call_time,
@@ -24,7 +25,9 @@ from shared.webhooks.codex_diagnostics import (  # noqa: E402
     full_report_text,
     incident_time_filters,
     parse_codex_report,
+    raw_log_time_filters,
     redact_command,
+    render_diagnostic_prompt_template,
     report_markdown,
     rule_matches,
     run_diagnostics,
@@ -179,6 +182,211 @@ def test_incident_time_filters_pad_call_window() -> None:
     assert filters["filter[created_at][_lte]"].startswith("2026-05-07T12:11:00")
 
 
+def test_raw_log_time_filters_cover_call_and_short_tail() -> None:
+    filters = raw_log_time_filters(_call())
+
+    assert filters["filter[event_time][_gte]"].startswith("2026-05-07T11:59:00")
+    assert filters["filter[event_time][_lte]"].startswith("2026-05-07T12:04:00")
+
+
+class _IncidentLookupDirectus(DirectusClient):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def _request(self, method: str, path: str, **kwargs):
+        self.calls += 1
+        assert method == "GET"
+        assert path == "/items/robot_incidents"
+        params = kwargs["params"]
+        assert params["filter[environment][_eq]"] == "cloud"
+        assert params["filter[room_name][_eq]"] == "_79990001122_abcd"
+        assert "filter[caller_phone][_eq]" not in params
+        assert "filter[did][_eq]" not in params
+        assert params["filter[created_at][_gte]"].startswith("2026-05-07T11:55:00")
+        assert params["filter[created_at][_lte]"].startswith("2026-05-07T12:11:00")
+        return [
+            {
+                "id": 1,
+                "created_at": "2026-05-07T12:00:05+00:00",
+                "incident_type": "room_error",
+            }
+        ]
+
+
+class _NoIncidentLookupDirectus(DirectusClient):
+    def __init__(self) -> None:
+        pass
+
+    def _request(self, method: str, path: str, **kwargs):
+        raise AssertionError("incident lookup should require room_name")
+
+
+def test_directus_incident_lookup_uses_room_name_only() -> None:
+    directus = _IncidentLookupDirectus()
+    incidents = directus.list_incidents_for_call(_call())
+
+    assert directus.calls == 1
+    assert [item["id"] for item in incidents] == [1]
+
+
+def test_directus_incident_lookup_skips_without_room_name() -> None:
+    call = CallContext.from_payload(
+        {
+            **_call().payload,
+            "room_name": "",
+        },
+        target="cloud",
+    )
+
+    assert _NoIncidentLookupDirectus().list_incidents_for_call(call) == []
+
+
+class _RuntimeContextDirectus(DirectusClient):
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, str, dict]] = []
+
+    def _request(self, method: str, path: str, **kwargs):
+        self.requests.append((method, path, kwargs))
+        params = kwargs["params"]
+        if path == "/items/robot_call_sessions":
+            assert params["filter[room_name][_eq]"] == "_79990001122_abcd"
+            return [
+                {
+                    "id": 23834,
+                    "room_name": "_79990001122_abcd",
+                    "duration_sec": 11.4,
+                    "close_reason": "CloseReason.PARTICIPANT_DISCONNECTED",
+                    "transcript_items": [],
+                    "tag_events": [],
+                    "usage_updates": [],
+                    "metrics_summary": {
+                        "transcript_count": 0,
+                        "tag_event_count": 0,
+                    },
+                    "payload": {"metrics_events": [{"type": "llm_metrics"}]},
+                }
+            ]
+        if path == "/items/robot_call_raw_logs":
+            assert params["filter[call_session][_eq]"] == "23834"
+            return [
+                {
+                    "id": 1,
+                    "event_time": "2026-05-07T12:00:02+00:00",
+                    "level": "INFO",
+                    "logger_name": "agent",
+                    "message": "prompt resolved",
+                    "payload": {"extras": {"room": "_79990001122_abcd"}},
+                },
+                {
+                    "id": 2,
+                    "event_time": "2026-05-07T12:00:04+00:00",
+                    "level": "INFO",
+                    "logger_name": "agent",
+                    "message": "user state changed",
+                    "payload": {"extras": {"new_state": "speaking"}},
+                },
+            ]
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+
+def test_directus_fetches_call_session_and_raw_logs_for_codex_context() -> None:
+    directus = _RuntimeContextDirectus()
+    call_session = directus.fetch_call_session_for_call(_call())
+    raw_logs = directus.fetch_raw_logs_for_call(_call(), call_session=call_session)
+
+    assert call_session["status"] == "found"
+    assert call_session["session"]["id"] == 23834
+    assert raw_logs["status"] == "found"
+    assert raw_logs["query_source"] == "call_session"
+    assert raw_logs["count"] == 2
+    assert raw_logs["rows"][0]["message"] == "prompt resolved"
+
+
+class _RoomRawLogDirectus(DirectusClient):
+    def __init__(self) -> None:
+        pass
+
+    def _request(self, method: str, path: str, **kwargs):
+        params = kwargs["params"]
+        assert path == "/items/robot_call_raw_logs"
+        assert params["filter[room_name][_eq]"] == "_79990001122_abcd"
+        assert params["filter[event_time][_gte]"].startswith("2026-05-07T11:59:00")
+        return []
+
+
+def test_directus_raw_logs_fall_back_to_room_name_without_session() -> None:
+    raw_logs = _RoomRawLogDirectus().fetch_raw_logs_for_call(_call(), call_session={})
+
+    assert raw_logs["status"] == "not_found"
+    assert raw_logs["query_source"] == "room_name"
+
+
+def test_collect_diagnostic_signals_marks_no_dialog_root_cause_focus() -> None:
+    call = CallContext.from_payload(
+        {
+            **_call().payload,
+            "duration_sec": 11.4,
+            "summary": {"transcript_count": 0, "tag_event_count": 0},
+            "close": {"reason": "CloseReason.PARTICIPANT_DISCONNECTED"},
+        },
+        target="cloud",
+    )
+    signals = collect_diagnostic_signals(
+        call=call,
+        incidents=[],
+        call_session={
+            "status": "found",
+            "session": {
+                "id": 23834,
+                "transcript_items": [],
+                "tag_events": [],
+                "metrics_summary": {
+                    "transcript_count": 0,
+                    "tag_event_count": 0,
+                },
+                "payload": {"metrics_events": [{"type": "llm_metrics"}]},
+            },
+        },
+        raw_logs={
+            "status": "found",
+            "rows": [
+                {"level": "INFO", "message": "prompt resolved"},
+                {"level": "INFO", "message": "using Deepgram STT provider"},
+                {"level": "INFO", "message": "tts synthesis warmup completed"},
+                {
+                    "level": "INFO",
+                    "message": "user state changed",
+                    "extras": {"new_state": "speaking"},
+                },
+                {"level": "INFO", "message": "local VAD end of speech"},
+                {
+                    "level": "INFO",
+                    "message": "closing agent session due to participant disconnect",
+                },
+            ],
+        },
+        livekit_snapshot={
+            "commands": [
+                {
+                    "stdout": (
+                        "_79990001122_abcd Participants=2\n"
+                        "EGRESS_ACTIVE _79990001122_abcd"
+                    )
+                }
+            ]
+        },
+    )
+
+    assert signals["short_call_no_dialog"] is True
+    assert signals["prompt_resolved_log_seen"] is True
+    assert signals["tts_warmup_seen"] is True
+    assert signals["user_speech_state_seen"] is True
+    assert signals["initial_greeting_playback_log_seen"] is False
+    assert signals["room_seen_in_livekit_snapshot"] is True
+    assert "root_cause_no_dialog" in signals["analysis_focus"]
+    assert "verify_initial_greeting_or_first_reply" in signals["analysis_focus"]
+
+
 def test_telegram_policy_can_skip_n8n_handoff() -> None:
     silent = DiagnosticRule(
         id=1,
@@ -244,6 +452,11 @@ def test_prompt_forbids_auto_fix_and_mutating_livekit_commands() -> None:
     assert "exact tag/value/action" in lowered
     assert "previous assistant phrase" in lowered
     assert "missing_evidence" in lowered
+    assert "prompt_context.rendered_prompt" in prompt
+    assert "raw_logs" in prompt
+    assert "root-cause audit" in lowered
+    assert "do not confuse tts warmup" in lowered
+    assert "no-dialog call longer than five seconds" in lowered
 
 
 def test_parse_codex_report_accepts_json_fence() -> None:
@@ -265,9 +478,13 @@ def test_report_markdown_fallback_is_readable_russian() -> None:
                 {
                     "title": "Нет ответа по адресу",
                     "severity": "warning",
+                    "plain_explanation": (
+                        "Клиент спросил адрес, но робот не дал понятный ответ."
+                    ),
                     "stage": "основной вопрос клиента",
                     "event_time_or_turn": "после вопроса клиента про адрес",
                     "exact_detail": "адрес не найден в базе знаний",
+                    "source_of_truth": "prompt_context.rendered_prompt",
                     "evidence": "Клиент спросил адрес.",
                     "why_it_matters": "Клиент не получил нужную информацию.",
                     "suspected_cause": "Ответ не найден в базе.",
@@ -283,9 +500,11 @@ def test_report_markdown_fallback_is_readable_russian() -> None:
     assert "Диагностический отчет" in markdown
     assert "Паузы и задержки" in markdown
     assert "Ошибки и инциденты" in markdown
-    assert "Этап диалога: основной вопрос клиента" in markdown
-    assert "Конкретная деталь: адрес не найден в базе знаний" in markdown
-    assert "Идея реализации: Добавить адрес в Directus" in markdown
+    assert "Что произошло простыми словами: Клиент спросил адрес" in markdown
+    assert "Где в звонке: основной вопрос клиента" in markdown
+    assert "Техническая деталь: адрес не найден в базе знаний" in markdown
+    assert "Источник проверки: prompt_context.rendered_prompt" in markdown
+    assert "Что сделать: Добавить адрес в Directus" in markdown
     assert "Гарантия безопасности" in markdown
     assert "Evidence:" not in markdown
 
@@ -412,6 +631,56 @@ def test_call_time_and_aftercall_execution_url_are_readable(monkeypatch) -> None
     ) == "https://n8n.example/execution/1"
 
 
+def test_render_diagnostic_prompt_template_uses_call_time() -> None:
+    rendered = render_diagnostic_prompt_template(
+        "base\n{{CURRENT_DATETIME_BLOCK}}\nknowledge",
+        timezone_name="Europe/Kaliningrad",
+        started_at="2026-05-08T08:38:25+00:00",
+    )
+
+    assert "8 мая 2026 г." in rendered  # noqa: RUF001
+    assert "- День недели: пятница" in rendered
+    assert "- Время: 10:00" in rendered
+    assert "knowledge" in rendered
+
+
+class _PromptContextDirectus(DirectusClient):
+    def __init__(self) -> None:
+        pass
+
+    def _request(self, method: str, path: str, **kwargs):
+        assert method == "GET"
+        assert path == "/items/client_prompt_cache"
+        assert kwargs["params"]["filter[caller_id][_eq]"] == "312388"
+        return [
+            {
+                "id": 5,
+                "caller_id": "312388",
+                "client_id": 9,
+                "prompt_template": (
+                    "<knowledge_base>\n"
+                    "9 мая выходной.\n"
+                    "{{CURRENT_DATETIME_BLOCK}}\n"
+                    "</knowledge_base>"
+                ),
+                "timezone": "Europe/Kaliningrad",
+                "source_hash": "abc",
+                "date_updated": "2026-05-08T08:00:00+00:00",
+            }
+        ]
+
+
+def test_fetch_prompt_context_uses_directus_cache() -> None:
+    context = _PromptContextDirectus().fetch_prompt_context_for_call(_call())
+
+    assert context["status"] == "found"
+    assert context["source"] == "directus:client_prompt_cache"
+    assert context["caller_id"] == "312388"
+    assert context["client_id"] == 9
+    assert "9 мая выходной" in context["rendered_prompt"]
+    assert "7 мая 2026 г." in context["rendered_prompt"]  # noqa: RUF001
+
+
 def test_telegram_payload_uses_russian_brief_and_report_link() -> None:
     call = CallContext.from_payload(
         {
@@ -431,9 +700,13 @@ def test_telegram_payload_uses_russian_brief_and_report_link() -> None:
             "findings": [
                 {
                     "title": "Медленный ответ",
+                    "plain_explanation": (
+                        "Робот ответил заметно позже, чем должен был."
+                    ),
                     "stage": "квалификация заявки",
                     "event_time_or_turn": "после вопроса робота про задачу клиента",
                     "exact_detail": "e2e latency 9000ms",
+                    "source_of_truth": "metrics_events",
                     "evidence": "e2e 9000ms",
                     "implementation_idea": "Проверить slow_response threshold и трассировку turn metrics.",
                 }
@@ -455,14 +728,24 @@ def test_telegram_payload_uses_russian_brief_and_report_link() -> None:
         "codex_full_report:7"
     )
     assert "Вердикт: требует внимания" in payload["telegram_brief"]
-    assert "Цель: локальный" in payload["telegram_brief"]
-    assert "Время звонка: начало 2026-05-07 14:00:00" in payload["telegram_brief"]
+    assert "Звонок: начало 2026-05-07 14:00:00" in payload["telegram_brief"]
+    assert (
+        "Клиент: +7 (999) 000-11-22 | DID/xDID: 312388 | локальный"
+        in payload["telegram_brief"]
+    )
     assert "Прогон aftercall: https://n8n.jcall.io/workflow/yj1KNjeuDOcJZNSS/executions/123" in payload["telegram_brief"]
-    assert "Номер DID/xDID: 312388" in payload["telegram_brief"]
     assert "Полный отчет: https://jcall.io/directus/admin/content/robot_call_audits/7" in payload["telegram_brief"]
-    assert "Этап: квалификация заявки" in payload["telegram_brief"]
-    assert "Деталь: e2e latency 9000ms" in payload["telegram_brief"]
-    assert "Что поменять: Проверить slow_response threshold" in payload["telegram_brief"]
+    assert "Итог:" in payload["telegram_brief"]
+    assert "Главное:" in payload["telegram_brief"]
+    assert "1. Медленный ответ" in payload["telegram_brief"]
+    assert "   Смысл: Робот ответил заметно позже" in payload["telegram_brief"]
+    assert (
+        "   Где: квалификация заявки; после вопроса робота про задачу клиента."
+        in payload["telegram_brief"]
+    )
+    assert "   Почему верю: e2e 9000ms e2e latency 9000ms." in payload["telegram_brief"]
+    assert "   Что сделать: Проверить slow_response threshold" in payload["telegram_brief"]
+    assert "   Источник:" not in payload["telegram_brief"]
     assert "e2e 9000ms" in payload["text"]
 
 

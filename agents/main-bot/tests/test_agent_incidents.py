@@ -1,7 +1,9 @@
 import pytest
 from livekit import rtc
+from livekit.agents.llm.tool_context import StopResponse
 
 from agent import (
+    Assistant,
     event_timestamp_seconds,
     extract_sip_diagnostic_context,
     is_abnormal_close,
@@ -23,6 +25,11 @@ class _Component:
     def __init__(self, *, provider: str, model: str):
         self.provider = provider
         self.model = model
+
+
+class _ChatMessage:
+    def __init__(self, text_content: str):
+        self.text_content = text_content
 
 
 class _FallbackComponent:
@@ -117,37 +124,23 @@ def test_should_not_log_slow_response_latency_below_threshold_or_disabled() -> N
     assert should_log_slow_response_latency(10000, 0) is False
 
 
-def test_initial_greeting_is_skipped_after_user_speech_started() -> None:
-    assert (
-        should_play_initial_greeting(
-            user_speech_started_count=1,
-            session_user_state="listening",
-            close_event_set=False,
-        )
-        is False
-    )
+def test_initial_greeting_plays_regardless_of_user_speech() -> None:
+    assert should_play_initial_greeting(close_event_set=False) is True
 
 
-def test_initial_greeting_is_skipped_while_user_is_speaking() -> None:
-    assert (
-        should_play_initial_greeting(
-            user_speech_started_count=0,
-            session_user_state="speaking",
-            close_event_set=False,
-        )
-        is False
-    )
+def test_initial_greeting_is_skipped_after_close() -> None:
+    assert should_play_initial_greeting(close_event_set=True) is False
 
 
-def test_initial_greeting_can_play_before_user_speech() -> None:
-    assert (
-        should_play_initial_greeting(
-            user_speech_started_count=0,
-            session_user_state="listening",
-            close_event_set=False,
-        )
-        is True
-    )
+@pytest.mark.asyncio
+async def test_initial_greeting_in_progress_ignores_first_user_turn() -> None:
+    assistant = Assistant(prompt="test prompt")
+    assistant.begin_initial_greeting()
+
+    with pytest.raises(StopResponse):
+        await assistant.on_user_turn_completed(None, _ChatMessage("алло"))
+
+    assert assistant._awaiting_first_user_turn is True
 
 
 @pytest.mark.asyncio

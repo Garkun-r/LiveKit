@@ -1,4 +1,5 @@
 import json
+import logging
 
 import pytest
 
@@ -227,3 +228,39 @@ async def test_incident_logger_directus_failure_does_not_raise() -> None:
     )
 
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_incident_logger_failure_emits_structured_fallback(caplog) -> None:
+    async def directus_insert(_):
+        raise RuntimeError("DIRECTUS_TOKEN=secret-token missing")
+
+    logger = IncidentLogger(
+        environment="cloud",
+        room_name="room-1",
+        transport="directus",
+        directus_insert=directus_insert,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="incident_logger"):
+        await logger.record(
+            "session_start_failed",
+            severity="critical",
+            component="llm",
+            description="startup failed",
+            payload={"api_key": "secret-value"},
+        )
+
+    record = next(
+        item
+        for item in caplog.records
+        if hasattr(item, "incident_fallback")
+    )
+    fallback = record.incident_fallback
+    write_error = record.incident_write_error
+    assert fallback["incident_type"] == "session_start_failed"
+    assert fallback["severity"] == "critical"
+    assert fallback["room_name"] == "room-1"
+    assert fallback["component"] == "llm"
+    assert fallback["payload"]["api_key"] == "[redacted]"
+    assert write_error["message"] == "DIRECTUS_TOKEN=[redacted] missing"

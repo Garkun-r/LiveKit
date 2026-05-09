@@ -174,8 +174,10 @@ def _voice_prompt_manager(
     response_delay_sec: float = 0.01,
     response_delay_post_gap_sec: float = 0.0,
     client_silence_sec: float = 0.01,
+    client_silence_max_prompts: int = 2,
     is_closed=lambda: False,
     is_end_call_scheduled=lambda: False,
+    on_client_silence_timeout=None,
 ) -> tuple[agent.VoicePromptManager, _FakePromptSession, _FakeBackgroundAudio]:
     response_delay_audio = tmp_path / "response_delay.wav"
     client_silence_audio = tmp_path / "client_silence.wav"
@@ -183,6 +185,11 @@ def _voice_prompt_manager(
     client_silence_audio.write_bytes(b"fake")
     session = session or _FakePromptSession()
     background_audio = background_audio or _FakeBackgroundAudio()
+    if on_client_silence_timeout is None:
+
+        async def on_client_silence_timeout() -> None:
+            return None
+
     manager = agent.VoicePromptManager(
         session=session,
         background_audio=background_audio,
@@ -200,10 +207,20 @@ def _voice_prompt_manager(
         response_delay_sec=response_delay_sec,
         response_delay_post_gap_sec=response_delay_post_gap_sec,
         client_silence_sec=client_silence_sec,
+        client_silence_max_prompts=client_silence_max_prompts,
         is_closed=is_closed,
         is_end_call_scheduled=is_end_call_scheduled,
+        on_client_silence_timeout=on_client_silence_timeout,
     )
     return manager, session, background_audio
+
+
+async def _wait_until(predicate, *, timeout: float = 0.3) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("condition was not reached before timeout")
+        await asyncio.sleep(0.005)
 
 
 async def _collect_text(adapter: llm.LLM) -> str:
@@ -492,29 +509,45 @@ async def test_response_delay_prompt_does_not_repeat_for_same_user_turn(
 
 @pytest.mark.asyncio
 async def test_client_silence_prompt_uses_background_audio(tmp_path) -> None:
-    manager, session, background_audio = _voice_prompt_manager(tmp_path=tmp_path)
+    close_reasons: list[str] = []
+
+    async def on_client_silence_timeout() -> None:
+        close_reasons.append("client_silence_timeout")
+
+    manager, session, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        on_client_silence_timeout=on_client_silence_timeout,
+    )
 
     manager.on_agent_finished_speaking()
-    await asyncio.sleep(0.05)
+    await _wait_until(lambda: len(background_audio.played) == 1)
     await manager.aclose()
 
     assert background_audio.played == [str(tmp_path / "client_silence.wav")]
     assert session.say_calls == []
+    assert close_reasons == []
 
 
 @pytest.mark.asyncio
-async def test_client_silence_prompt_does_not_repeat_without_user_activity(
-    tmp_path,
-) -> None:
-    manager, session, background_audio = _voice_prompt_manager(tmp_path=tmp_path)
+async def test_client_silence_prompts_twice_then_requests_close(tmp_path) -> None:
+    close_reasons: list[str] = []
+
+    async def on_client_silence_timeout() -> None:
+        close_reasons.append("client_silence_timeout")
+
+    manager, session, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        on_client_silence_timeout=on_client_silence_timeout,
+    )
 
     manager.on_agent_finished_speaking()
-    await asyncio.sleep(0.05)
-    manager.on_agent_finished_speaking()
-    await asyncio.sleep(0.05)
+    await _wait_until(lambda: close_reasons == ["client_silence_timeout"])
     await manager.aclose()
 
-    assert background_audio.played == [str(tmp_path / "client_silence.wav")]
+    assert background_audio.played == [
+        str(tmp_path / "client_silence.wav"),
+        str(tmp_path / "client_silence.wav"),
+    ]
     assert session.say_calls == []
 
 
@@ -531,8 +564,16 @@ async def test_client_silence_prompt_waits_until_agent_has_spoken(tmp_path) -> N
 
 
 @pytest.mark.asyncio
-async def test_user_speech_clears_client_silence_wait_state(tmp_path) -> None:
-    manager, session, background_audio = _voice_prompt_manager(tmp_path=tmp_path)
+async def test_vad_user_speech_pauses_client_silence_prompt(tmp_path) -> None:
+    close_reasons: list[str] = []
+
+    async def on_client_silence_timeout() -> None:
+        close_reasons.append("client_silence_timeout")
+
+    manager, session, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        on_client_silence_timeout=on_client_silence_timeout,
+    )
 
     manager.on_agent_finished_speaking()
     manager.on_user_started_speaking()
@@ -542,13 +583,114 @@ async def test_user_speech_clears_client_silence_wait_state(tmp_path) -> None:
 
     assert background_audio.played == []
     assert session.say_calls == []
+    assert close_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_vad_only_user_speech_does_not_reset_client_silence_deadline(
+    tmp_path,
+) -> None:
+    close_reasons: list[str] = []
+
+    async def on_client_silence_timeout() -> None:
+        close_reasons.append("client_silence_timeout")
+
+    manager, session, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        client_silence_sec=0.05,
+        on_client_silence_timeout=on_client_silence_timeout,
+    )
+
+    manager.on_agent_finished_speaking()
+    await asyncio.sleep(0.04)
+    manager.on_user_started_speaking()
+    await asyncio.sleep(0.04)
+
+    assert background_audio.played == []
+    assert close_reasons == []
+
+    manager.on_user_finished_speaking()
+    await _wait_until(lambda: len(background_audio.played) == 1, timeout=0.02)
+    await manager.aclose()
+
+    assert background_audio.played == [str(tmp_path / "client_silence.wav")]
+    assert session.say_calls == []
+
+
+@pytest.mark.asyncio
+async def test_stt_transcript_resets_client_silence_sequence(tmp_path) -> None:
+    close_reasons: list[str] = []
+
+    async def on_client_silence_timeout() -> None:
+        close_reasons.append("client_silence_timeout")
+
+    manager, session, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        on_client_silence_timeout=on_client_silence_timeout,
+    )
+
+    manager.on_agent_finished_speaking()
+    await _wait_until(lambda: len(background_audio.played) == 1)
+    manager.on_user_transcribed()
+    await asyncio.sleep(0.05)
+
+    assert close_reasons == []
+
+    manager.on_agent_finished_speaking()
+    await _wait_until(lambda: close_reasons == ["client_silence_timeout"])
+    await manager.aclose()
+
+    assert background_audio.played == [
+        str(tmp_path / "client_silence.wav"),
+        str(tmp_path / "client_silence.wav"),
+        str(tmp_path / "client_silence.wav"),
+    ]
+    assert session.say_calls == []
+
+
+@pytest.mark.asyncio
+async def test_user_speech_resets_client_silence_sequence(tmp_path) -> None:
+    close_reasons: list[str] = []
+
+    async def on_client_silence_timeout() -> None:
+        close_reasons.append("client_silence_timeout")
+
+    manager, session, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        on_client_silence_timeout=on_client_silence_timeout,
+    )
+
+    manager.on_agent_finished_speaking()
+    await _wait_until(lambda: len(background_audio.played) == 1)
+    manager.on_user_started_speaking()
+    manager.on_user_transcribed()
+    await asyncio.sleep(0.05)
+
+    assert close_reasons == []
+
+    manager.on_agent_finished_speaking()
+    await _wait_until(lambda: close_reasons == ["client_silence_timeout"])
+    await manager.aclose()
+
+    assert background_audio.played == [
+        str(tmp_path / "client_silence.wav"),
+        str(tmp_path / "client_silence.wav"),
+        str(tmp_path / "client_silence.wav"),
+    ]
+    assert session.say_calls == []
 
 
 @pytest.mark.asyncio
 async def test_client_silence_prompt_does_not_start_during_end_call(tmp_path) -> None:
+    close_reasons: list[str] = []
+
+    async def on_client_silence_timeout() -> None:
+        close_reasons.append("client_silence_timeout")
+
     manager, session, background_audio = _voice_prompt_manager(
         tmp_path=tmp_path,
         is_end_call_scheduled=lambda: True,
+        on_client_silence_timeout=on_client_silence_timeout,
     )
 
     manager.on_agent_finished_speaking()
@@ -557,6 +699,59 @@ async def test_client_silence_prompt_does_not_start_during_end_call(tmp_path) ->
 
     assert background_audio.played == []
     assert session.say_calls == []
+    assert close_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_client_silence_timeout_skips_when_agent_is_not_listening(
+    tmp_path,
+) -> None:
+    close_reasons: list[str] = []
+
+    async def on_client_silence_timeout() -> None:
+        close_reasons.append("client_silence_timeout")
+
+    session = _FakePromptSession()
+    session.agent_state = "speaking"
+    manager, session, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        session=session,
+        on_client_silence_timeout=on_client_silence_timeout,
+    )
+
+    manager.on_agent_finished_speaking()
+    await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    assert background_audio.played == []
+    assert session.say_calls == []
+    assert close_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_client_silence_timeout_skips_when_current_speech_is_active(
+    tmp_path,
+) -> None:
+    close_reasons: list[str] = []
+
+    async def on_client_silence_timeout() -> None:
+        close_reasons.append("client_silence_timeout")
+
+    session = _FakePromptSession()
+    session.current_speech = _FakePromptHandle(done=False)
+    manager, session, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        session=session,
+        on_client_silence_timeout=on_client_silence_timeout,
+    )
+
+    manager.on_agent_finished_speaking()
+    await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    assert background_audio.played == []
+    assert session.say_calls == []
+    assert close_reasons == []
 
 
 @pytest.mark.asyncio
@@ -569,7 +764,9 @@ async def test_user_speech_stops_active_client_silence_prompt(tmp_path) -> None:
     )
 
     manager.on_agent_finished_speaking()
-    await asyncio.sleep(0.05)
+    await _wait_until(
+        lambda: background_audio.played == [str(tmp_path / "client_silence.wav")]
+    )
     assert background_audio.played == [str(tmp_path / "client_silence.wav")]
     assert handle.stopped is False
 

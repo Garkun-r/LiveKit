@@ -16,14 +16,26 @@ The realtime LiveKit agent remains unchanged. Diagnostics run after the call:
    room, caller, or DID.
 5. The worker creates a `robot_call_audits` row.
 6. The worker collects a small read-only LiveKit CLI snapshot.
-7. The worker runs:
+7. The worker reads the matching Directus `robot_call_sessions` row and compact
+   `robot_call_raw_logs` rows by `call_session` or `room_name`. This gives
+   Codex the runtime chain for the call: prompt resolve, STT/VAD, TTS, user
+   state changes, errors, disconnects, and export logs.
+8. The worker calculates deterministic `diagnostic_signals`, including
+   `short_call_no_dialog`, `no_transcript_items`, `no_tag_events`,
+   `user_speech_state_seen`, `initial_greeting_playback_log_seen`,
+   `room_seen_in_livekit_snapshot`, and `egress_active_in_livekit_snapshot`.
+9. The worker reads the matching Directus `client_prompt_cache` row by
+   DID/trunk and attaches the rendered prompt context to the audit input when
+   available. This lets Codex verify facts from client `add_info` and the
+   actual cached production prompt, not only `agents/main-bot/src/prompt.txt`.
+10. The worker runs:
 
    ```console
    codex exec --sandbox read-only --ephemeral --json --output-schema shared/webhooks/codex_diagnostics_report.schema.json
    ```
 
-8. The worker writes the full report back to Directus.
-9. If the matched rule's `telegram_policy` allows it, the worker calls the n8n
+11. The worker writes the full report back to Directus.
+12. If the matched rule's `telegram_policy` allows it, the worker calls the n8n
    audit-notification webhook. n8n sends a Russian Telegram brief to the same
    chat and through the same bot/token path as low-score aftercall alerts. The
    brief includes a link to the specific `robot_call_audits` item in Directus
@@ -32,7 +44,7 @@ The realtime LiveKit agent remains unchanged. Diagnostics run after the call:
    `AFTER CALL` execution that launched diagnostics. Each top finding must
    name the dialog stage, approximate turn/time, exact tag/value/event when
    relevant, concrete evidence, and an implementation idea.
-10. When that button is pressed, n8n receives the Telegram callback, asks the
+13. When that button is pressed, n8n receives the Telegram callback, asks the
     worker for the full report by `audit_id`, and sends the full Russian report
     back to the same chat. The full report is chunked for Telegram limits and
     includes the sections for timeline, pauses/delays, errors/incidents,
@@ -41,14 +53,34 @@ The realtime LiveKit agent remains unchanged. Diagnostics run after the call:
 
 ## Report Quality Contract
 
-Reports should reduce follow-up questions from a non-technical owner. A finding
-is not acceptable if it only says "long pause" or "tag mismatch". It must say:
+Reports should reduce follow-up questions from a non-technical owner. The first
+Telegram message is a short decision brief, not a compressed full report. It
+shows the outcome, the top 1-2 issues, the practical action, and one short proof
+line. Long evidence, source names, raw metric values, and file paths belong in
+the full report opened by the inline button.
+
+```text
+Итог:
+One plain-language outcome sentence.
+
+Главное:
+1. Short title
+   Смысл: what happened and what it means.
+   Где: dialog stage and approximate turn/time.
+   Почему важно: business or UX impact.
+   Что сделать: concrete implementation idea.
+   Почему верю: one short evidence line from transcript/logs.
+```
+
+The full report must still preserve:
 
 - where in the dialog it happened: greeting, qualification, main request,
   closing, or after the conversation looked finished;
 - the approximate timestamp/turn and adjacent phrases, especially for pauses;
 - the exact object: tag name/value/action, event name, metric, node, code path,
   or "not visible in supplied data";
+- the source of truth that was checked: `prompt_context.rendered_prompt`,
+  `transcript_items`, `metrics_events`, a specific repo file, or "not available";
 - evidence versus inference;
 - what evidence is still missing if the cause is uncertain;
 - the concrete implementation idea: what to inspect or change next.
@@ -57,6 +89,27 @@ For example, a tag finding should name the exact tag and explain whether the
 current repository logic hides it, ignores it, or still routes it to an action.
 If the exact tag is not present in the aftercall payload or logs, the report
 must say that explicitly instead of guessing.
+
+For knowledge-base facts, `prompt_context.rendered_prompt` has priority over
+the repository fallback prompt. If that context is unavailable, the report must
+lower confidence and list the missing prompt context as missing evidence.
+
+For no-dialog or "robot was silent" calls, Codex must not stop at "there is no
+transcript". It must inspect `robot_call_sessions`, `robot_call_raw_logs`,
+`diagnostic_signals`, and the LiveKit snapshot, then explain:
+
+- what the robot was expected to do first;
+- what actually happened in the runtime chain;
+- where the chain most likely broke: SIP/room join, prompt resolve, initial
+  greeting, STT/VAD, LLM, TTS/playout, tag parser, close, export, or aftercall;
+- which logs prove it;
+- what is still not provable;
+- what instrumentation or implementation change would make the next diagnosis
+  conclusive.
+
+TTS warmup is not proof that the caller heard the greeting. If greeting/playout
+logs are absent, the report must say whether this is a real absence in runtime
+or an instrumentation gap.
 
 ## Directus Tables
 
@@ -98,6 +151,8 @@ CODEX_DIAGNOSTICS_N8N_WEBHOOK_TOKEN=
 CODEX_DIAGNOSTICS_REPO_DIR=/opt/jcall-livekit-agent/source
 CODEX_DIAGNOSTICS_CODEX_BIN=codex
 CODEX_DIAGNOSTICS_CODEX_TIMEOUT_SEC=900
+CODEX_DIAGNOSTICS_RAW_LOG_LIMIT=500
+CODEX_DIAGNOSTICS_RAW_LOG_TEXT_MAX_CHARS=1200
 # On vm-pico, n8n runs inside the n8n_default Docker network. Bind to that
 # bridge gateway so n8n can reach the host worker without exposing it publicly.
 CODEX_DIAGNOSTICS_HOST=172.18.0.1

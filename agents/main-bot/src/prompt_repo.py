@@ -65,6 +65,7 @@ class PromptResolution:
     source: str
     sip_trunk_number: str | None = None
     sip_client_number: str | None = None
+    client_id: str | int | None = None
     initial_greeting: str | None = None
     error: str | None = None
 
@@ -576,6 +577,7 @@ async def resolve_prompt_for_call(
         source=prompt_template.source,
         sip_trunk_number=normalized_trunk_number,
         sip_client_number=normalized_client_number,
+        client_id=prompt_template.client_id,
         initial_greeting=prompt_template.initial_greeting,
     )
 
