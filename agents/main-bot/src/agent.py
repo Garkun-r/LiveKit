@@ -230,9 +230,11 @@ from config import (
     VOICE_AUDIO_CACHE_ENABLED,
     VOICE_AUDIO_LEGACY_PROFILE_ID,
     VOICE_CLIENT_SILENCE_AUDIO_PATH,
+    VOICE_CLIENT_SILENCE_FIRST_SEC,
     VOICE_CLIENT_SILENCE_MAX_PROMPTS,
     VOICE_CLIENT_SILENCE_PHRASE,
     VOICE_CLIENT_SILENCE_SEC,
+    VOICE_CLIENT_SILENCE_STT_GRACE_SEC,
     VOICE_EMERGENCY_AUDIO_PATH,
     VOICE_EMERGENCY_PHRASE,
     VOICE_INITIAL_GREETING_DELAY_SEC,
@@ -903,7 +905,9 @@ class VoicePromptManager:
         client_silence_prompt: VoicePromptSpec,
         response_delay_sec: float,
         response_delay_post_gap_sec: float,
+        client_silence_first_sec: float,
         client_silence_sec: float,
+        client_silence_stt_grace_sec: float,
         client_silence_max_prompts: int,
         is_closed: Callable[[], bool],
         is_end_call_scheduled: Callable[[], bool],
@@ -916,7 +920,9 @@ class VoicePromptManager:
         self._client_silence_prompt = client_silence_prompt
         self._response_delay_sec = max(0.0, response_delay_sec)
         self._response_delay_post_gap_sec = max(0.0, response_delay_post_gap_sec)
+        self._client_silence_first_sec = max(0.0, client_silence_first_sec)
         self._client_silence_sec = max(0.0, client_silence_sec)
+        self._client_silence_stt_grace_sec = max(0.0, client_silence_stt_grace_sec)
         self._client_silence_max_prompts = max(0, client_silence_max_prompts)
         self._is_closed = is_closed
         self._is_end_call_scheduled = is_end_call_scheduled
@@ -987,20 +993,33 @@ class VoicePromptManager:
 
     def on_user_finished_speaking(self) -> None:
         self._user_is_speaking = False
+        if (
+            self._waiting_for_client_response
+            and self._client_silence_deadline_at is not None
+            and self._client_silence_deadline_at <= time.monotonic()
+        ):
+            self._client_silence_deadline_at = (
+                time.monotonic() + self._client_silence_stt_grace_sec
+            )
         self.start_client_silence_timer()
 
-    def on_user_transcribed(self) -> None:
+    def on_user_transcribed(self, *, is_final: bool) -> None:
         self.cancel_response_delay_timer()
         self.cancel_client_silence_timer()
         self._response_delay_played = False
-        self._client_silence_prompt_count = 0
-        self._waiting_for_client_response = False
-        self._client_silence_deadline_at = None
         self._user_is_speaking = False
         self._stop_active_prompt_task = asyncio.create_task(
             self.stop_active_prompt(),
             name="voice_prompt_stop_on_user_transcript",
         )
+        if is_final:
+            self._client_silence_prompt_count = 0
+            self._waiting_for_client_response = False
+            self._client_silence_deadline_at = None
+            return
+        if self._waiting_for_client_response:
+            self._client_silence_deadline_at = time.monotonic() + self._client_silence_sec
+            self.start_client_silence_timer()
 
     def on_agent_started_speaking(self) -> None:
         self.cancel_response_delay_timer()
@@ -1018,7 +1037,9 @@ class VoicePromptManager:
     def on_agent_finished_speaking(self) -> None:
         self._client_silence_prompt_count = 0
         self._waiting_for_client_response = True
-        self._client_silence_deadline_at = time.monotonic() + self._client_silence_sec
+        self._client_silence_deadline_at = (
+            time.monotonic() + self._client_silence_first_sec
+        )
         self._user_is_speaking = False
         self.start_client_silence_timer()
 
@@ -4306,7 +4327,9 @@ async def my_agent(ctx: JobContext):
         ),
         response_delay_sec=VOICE_RESPONSE_DELAY_SEC,
         response_delay_post_gap_sec=VOICE_RESPONSE_DELAY_POST_GAP_SEC,
+        client_silence_first_sec=VOICE_CLIENT_SILENCE_FIRST_SEC,
         client_silence_sec=VOICE_CLIENT_SILENCE_SEC,
+        client_silence_stt_grace_sec=VOICE_CLIENT_SILENCE_STT_GRACE_SEC,
         client_silence_max_prompts=VOICE_CLIENT_SILENCE_MAX_PROMPTS,
         is_closed=close_event.is_set,
         is_end_call_scheduled=lambda: bool(end_call_task and not end_call_task.done()),
@@ -4357,7 +4380,9 @@ async def my_agent(ctx: JobContext):
             "voice_response_delay_audio_paths": [
                 str(path) for path in _RESPONSE_DELAY_AUDIO_PATHS
             ],
+            "voice_client_silence_first_sec": VOICE_CLIENT_SILENCE_FIRST_SEC,
             "voice_client_silence_sec": VOICE_CLIENT_SILENCE_SEC,
+            "voice_client_silence_stt_grace_sec": VOICE_CLIENT_SILENCE_STT_GRACE_SEC,
             "voice_client_silence_max_prompts": VOICE_CLIENT_SILENCE_MAX_PROMPTS,
             "voice_client_silence_audio_path": str(_CLIENT_SILENCE_AUDIO_PATH)
             if _CLIENT_SILENCE_AUDIO_PATH
@@ -4556,8 +4581,7 @@ async def my_agent(ctx: JobContext):
                 )
                 # Any new user speech cancels a pending auto-hangup timer.
                 user_activity_count += 1
-                if is_final:
-                    voice_prompts.on_user_transcribed()
+                voice_prompts.on_user_transcribed(is_final=is_final)
                 if is_final and pending_user_phrase_end_at is None:
                     pending_user_phrase_end_at = event_timestamp_seconds(
                         ev,

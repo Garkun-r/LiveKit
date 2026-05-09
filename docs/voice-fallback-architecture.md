@@ -140,10 +140,10 @@ Voice prompt catalog:
 - `response_delay`: "Секундочку." Plays if the caller finished speaking and the
   assistant stays silent past `VOICE_RESPONSE_DELAY_SEC`.
 - `client_silence`: "Алло." Plays if the assistant is listening and the caller
-  stays silent past `VOICE_CLIENT_SILENCE_SEC`. The prompt repeats up to
-  `VOICE_CLIENT_SILENCE_MAX_PROMPTS`; if the caller stays silent after the last
-  prompt and one more silence interval, the agent deletes the room without a
-  final LLM-generated phrase.
+  stays silent past `VOICE_CLIENT_SILENCE_FIRST_SEC`. The prompt repeats up to
+  `VOICE_CLIENT_SILENCE_MAX_PROMPTS` with `VOICE_CLIENT_SILENCE_SEC` between
+  prompts; if the caller stays silent after the last prompt and one more silence
+  interval, the agent deletes the room without a final LLM-generated phrase.
 - `emergency`: "Извините, перезвоните ещё раз." Plays for unrecoverable runtime
   errors.
 - Future prompts: `tool_wait`, `transfer`, and `farewell` are reserved for
@@ -156,7 +156,9 @@ Requirements:
 - Technical prompts must not be added to LLM chat context.
 - Only one technical prompt may play at a time. VAD user-speech events pause
   prompt playback so audio does not overlap with the caller; final non-empty
-  STT transcripts reset the client-silence sequence.
+  STT transcripts reset the client-silence sequence. Interim non-empty STT
+  transcripts defer client-silence prompts so delayed finals are not covered by
+  "Алло."; VAD-only noise does not reset the sequence.
 - Do not blindly start a parallel `generate_reply` to cover silence; use audio
   prompts for perceived latency and keep `REPLY_WATCHDOG_SEC` as a later recovery
   path for stuck scheduling.
@@ -193,7 +195,9 @@ Requirements:
 - The client-silence prompt sequence starts only while the assistant is
   listening and no `end_call` is scheduled. VAD-only noise does not reset the
   silence deadline or prompt count; final non-empty STT text is treated as a
-  caller answer and resets the sequence.
+  caller answer and resets the sequence. If VAD ends after the current silence
+  deadline, `VOICE_CLIENT_SILENCE_STT_GRACE_SEC` gives STT a short window to
+  emit transcript text before the prompt plays.
 
 ## Future tool prompts
 

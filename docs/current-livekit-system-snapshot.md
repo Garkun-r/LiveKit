@@ -353,9 +353,10 @@ Current behavior:
 - `REPLY_WATCHDOG_SEC` can force a safety reply if no assistant response appears
   after a final transcript;
 - response-delay audio can start after user transcript if the bot is slow;
-- client-silence audio can say a short "Алло." after inactivity, repeat once,
-  then quietly delete the room if STT still has no final caller text; VAD-only
-  noise pauses playback but does not reset the silence sequence;
+- client-silence audio can say a short "Алло." after a longer first inactivity
+  window, repeat once on a shorter interval, then quietly delete the room if STT
+  still has no final caller text; VAD-only noise pauses playback but does not
+  reset the sequence, while interim STT defers the prompt;
 - unrecoverable errors attempt emergency audio/phrase and may end the call.
 
 Short first user greetings like "алло", "здравствуйте", "добрый день" are

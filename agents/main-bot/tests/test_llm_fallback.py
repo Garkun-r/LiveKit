@@ -173,7 +173,9 @@ def _voice_prompt_manager(
     voice_audio_cache=None,
     response_delay_sec: float = 0.01,
     response_delay_post_gap_sec: float = 0.0,
+    client_silence_first_sec: float | None = None,
     client_silence_sec: float = 0.01,
+    client_silence_stt_grace_sec: float = 0.0,
     client_silence_max_prompts: int = 2,
     is_closed=lambda: False,
     is_end_call_scheduled=lambda: False,
@@ -206,7 +208,13 @@ def _voice_prompt_manager(
         ),
         response_delay_sec=response_delay_sec,
         response_delay_post_gap_sec=response_delay_post_gap_sec,
+        client_silence_first_sec=(
+            client_silence_sec
+            if client_silence_first_sec is None
+            else client_silence_first_sec
+        ),
         client_silence_sec=client_silence_sec,
+        client_silence_stt_grace_sec=client_silence_stt_grace_sec,
         client_silence_max_prompts=client_silence_max_prompts,
         is_closed=is_closed,
         is_end_call_scheduled=is_end_call_scheduled,
@@ -552,6 +560,34 @@ async def test_client_silence_prompts_twice_then_requests_close(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_client_silence_uses_first_delay_then_repeat_delay(tmp_path) -> None:
+    close_reasons: list[str] = []
+
+    async def on_client_silence_timeout() -> None:
+        close_reasons.append("client_silence_timeout")
+
+    manager, _, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        client_silence_first_sec=0.04,
+        client_silence_sec=0.01,
+        on_client_silence_timeout=on_client_silence_timeout,
+    )
+
+    manager.on_agent_finished_speaking()
+    await asyncio.sleep(0.02)
+
+    assert background_audio.played == []
+
+    await _wait_until(lambda: close_reasons == ["client_silence_timeout"])
+    await manager.aclose()
+
+    assert background_audio.played == [
+        str(tmp_path / "client_silence.wav"),
+        str(tmp_path / "client_silence.wav"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_client_silence_prompt_waits_until_agent_has_spoken(tmp_path) -> None:
     manager, session, background_audio = _voice_prompt_manager(tmp_path=tmp_path)
 
@@ -598,6 +634,7 @@ async def test_vad_only_user_speech_does_not_reset_client_silence_deadline(
     manager, session, background_audio = _voice_prompt_manager(
         tmp_path=tmp_path,
         client_silence_sec=0.05,
+        client_silence_stt_grace_sec=0.03,
         on_client_silence_timeout=on_client_silence_timeout,
     )
 
@@ -610,7 +647,11 @@ async def test_vad_only_user_speech_does_not_reset_client_silence_deadline(
     assert close_reasons == []
 
     manager.on_user_finished_speaking()
-    await _wait_until(lambda: len(background_audio.played) == 1, timeout=0.02)
+    await asyncio.sleep(0.01)
+
+    assert background_audio.played == []
+
+    await _wait_until(lambda: len(background_audio.played) == 1, timeout=0.05)
     await manager.aclose()
 
     assert background_audio.played == [str(tmp_path / "client_silence.wav")]
@@ -631,7 +672,7 @@ async def test_stt_transcript_resets_client_silence_sequence(tmp_path) -> None:
 
     manager.on_agent_finished_speaking()
     await _wait_until(lambda: len(background_audio.played) == 1)
-    manager.on_user_transcribed()
+    manager.on_user_transcribed(is_final=True)
     await asyncio.sleep(0.05)
 
     assert close_reasons == []
@@ -649,6 +690,36 @@ async def test_stt_transcript_resets_client_silence_sequence(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_interim_stt_defers_client_silence_prompt(tmp_path) -> None:
+    close_reasons: list[str] = []
+
+    async def on_client_silence_timeout() -> None:
+        close_reasons.append("client_silence_timeout")
+
+    manager, session, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        client_silence_sec=0.05,
+        on_client_silence_timeout=on_client_silence_timeout,
+    )
+
+    manager.on_agent_finished_speaking()
+    await asyncio.sleep(0.04)
+    manager.on_user_transcribed(is_final=False)
+    await asyncio.sleep(0.02)
+
+    assert background_audio.played == []
+    assert close_reasons == []
+
+    manager.on_user_transcribed(is_final=True)
+    await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    assert background_audio.played == []
+    assert session.say_calls == []
+    assert close_reasons == []
+
+
+@pytest.mark.asyncio
 async def test_user_speech_resets_client_silence_sequence(tmp_path) -> None:
     close_reasons: list[str] = []
 
@@ -663,7 +734,7 @@ async def test_user_speech_resets_client_silence_sequence(tmp_path) -> None:
     manager.on_agent_finished_speaking()
     await _wait_until(lambda: len(background_audio.played) == 1)
     manager.on_user_started_speaking()
-    manager.on_user_transcribed()
+    manager.on_user_transcribed(is_final=True)
     await asyncio.sleep(0.05)
 
     assert close_reasons == []
