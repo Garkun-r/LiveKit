@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from livekit import rtc
 from livekit.agents.llm.tool_context import StopResponse
@@ -7,11 +9,13 @@ from agent import (
     event_timestamp_seconds,
     extract_sip_diagnostic_context,
     is_abnormal_close,
+    should_fire_startup_no_dialog_timeout,
     should_log_slow_response_latency,
     should_log_startup_provider_fallback,
     should_play_initial_greeting,
     turn_response_latency_ms,
     wait_for_initial_greeting_delay,
+    wait_for_speech_playout,
 )
 
 
@@ -43,6 +47,25 @@ class _FallbackComponent:
 class _Event:
     def __init__(self, *, created_at=None):
         self.created_at = created_at
+
+
+class _SpeechHandle:
+    def __init__(self, *, done: bool = False):
+        self._done = done
+        self.stopped = False
+        self.interrupted = False
+
+    async def wait_for_playout(self) -> None:
+        while not self._done:
+            await asyncio.sleep(0.01)
+
+    def stop(self) -> None:
+        self.stopped = True
+        self._done = True
+
+    def interrupt(self, *, force: bool = False) -> None:
+        self.interrupted = force
+        self._done = True
 
 
 def test_extract_sip_diagnostic_context_reads_trace_and_call_id() -> None:
@@ -96,6 +119,51 @@ def test_is_abnormal_close_only_flags_error_like_reasons() -> None:
     assert is_abnormal_close("participant_disconnected", None) is False
     assert is_abnormal_close("entrypoint_cancelled", None) is True
     assert is_abnormal_close("anything", "transport lost") is True
+
+
+def test_startup_no_dialog_timeout_only_fires_without_activity() -> None:
+    assert (
+        should_fire_startup_no_dialog_timeout(
+            timeout_sec=12,
+            close_event_set=False,
+            dialog_activity_seen=False,
+            end_call_scheduled=False,
+        )
+        is True
+    )
+    assert (
+        should_fire_startup_no_dialog_timeout(
+            timeout_sec=12,
+            close_event_set=False,
+            dialog_activity_seen=True,
+            end_call_scheduled=False,
+        )
+        is False
+    )
+    assert (
+        should_fire_startup_no_dialog_timeout(
+            timeout_sec=0,
+            close_event_set=False,
+            dialog_activity_seen=False,
+            end_call_scheduled=False,
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_speech_playout_timeout_stops_handle() -> None:
+    handle = _SpeechHandle(done=False)
+
+    played = await wait_for_speech_playout(
+        handle,
+        kind="initial_greeting",
+        log_label="initial greeting",
+        timeout_sec=0.01,
+    )
+
+    assert played is False
+    assert handle.stopped is True
 
 
 def test_turn_response_latency_measures_user_end_to_agent_start() -> None:

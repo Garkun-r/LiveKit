@@ -105,6 +105,9 @@ XAI_EGRESS=direct
 DEEPGRAM_EGRESS=direct
 MINIMAX_TTS_EGRESS=direct
 COSYVOICE_TTS_EGRESS=direct
+YANDEX_STT_EGRESS=direct
+TBANK_VOICEKIT_EGRESS=direct
+SBER_TTS_EGRESS=direct
 LIVEKIT_INFERENCE_EGRESS=proxy
 ```
 
@@ -121,7 +124,8 @@ not to overwrite the server automatically.
 Текущий выбор основан на тестах задержки и geoblock:
 
 - `proxy`: ElevenLabs, Gemini/Google LLM, Google TTS/STT, Vertex TTS, LiveKit Inference.
-- `direct`: xAI, Deepgram, MiniMax, CosyVoice.
+- `direct`: xAI, Deepgram, Yandex STT, T-Bank VoiceKit, MiniMax, CosyVoice,
+  Sber.
 
 Squid принимает только Asterisk-сервер `87.226.145.66/32`, только метод
 `CONNECT`, только порт `443`. Это основной proxy для локального робота. Legacy
@@ -170,6 +174,7 @@ keys = [
     "EGRESS_PROXY_URL", "EGRESS_DEFAULT", "ELEVENLABS_EGRESS", "GEMINI_EGRESS",
     "GOOGLE_TTS_EGRESS", "VERTEX_TTS_EGRESS", "GOOGLE_STT_EGRESS", "XAI_EGRESS",
     "DEEPGRAM_EGRESS", "MINIMAX_TTS_EGRESS", "COSYVOICE_TTS_EGRESS",
+    "YANDEX_STT_EGRESS", "TBANK_VOICEKIT_EGRESS", "SBER_TTS_EGRESS",
     "LIVEKIT_INFERENCE_EGRESS", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
     "AGENT_EXTERNAL_HTTP_PROXY",
 ]

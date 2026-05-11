@@ -6,17 +6,17 @@ through env profiles.
 ## Principle
 
 The runtime environment is flat. The agent reads keys like `AGENT_NAME`,
-`LIVEKIT_SELF_HOSTED`, `TTS_PROVIDER`, `STT_PROVIDER`, and `LLM_PROVIDER`
+`ROBOT_RUNTIME_PROFILE`, `LIVEKIT_SELF_HOSTED`, and provider credential names
 directly from the process environment. Therefore one running process should get
 one resolved env file, not one file containing three prefixed configurations.
 
 Use these layers:
 
 1. Code: shared voice flow, tools, provider builders, diagnostics, exports.
-2. Deployment env: LiveKit URL, dispatch name, self-hosted/cloud mode, secrets,
-   egress, health port, worker sizing.
-3. Project/call profile: prompt, greeting, voice, and later per-client
-   TTS/STT/LLM choices from Directus or another profile store.
+2. Deployment env: LiveKit URL, dispatch name, `ROBOT_RUNTIME_PROFILE`,
+   self-hosted/cloud mode, secrets, egress, health port, worker sizing.
+3. Directus project/call profile: prompt, greeting, voice, STT/TTS/LLM/turn
+   choices, and per-DID overrides.
 
 ## Profiles
 
@@ -30,18 +30,22 @@ Shared defaults live in `agents/main-bot/env/common.env.example`.
 
 ## Dispatch names
 
-The intended dispatch names are:
+The process `AGENT_NAME` must match the dispatch rule that should wake the
+agent. Current Cloud SIP dispatch targets `main-bot`, so the Cloud profile uses
+`AGENT_NAME=main-bot`.
+
+Profile template names are:
 
 ```console
+main-bot
 main-bot-mac
-main-bot-cloud
 main-bot-asterisk
 ```
 
 Changing `AGENT_NAME` is not just cosmetic. SIP dispatch rules, API dispatch,
 or token `room_config.agents` must target the same name. Do not change the
-Asterisk production `AGENT_NAME` until the SIP dispatch rule is changed at the
-same time.
+Cloud or Asterisk production `AGENT_NAME` until the matching dispatch rule is
+changed at the same time.
 
 ## Build env files
 
@@ -92,6 +96,7 @@ Keep shared in `common.env.example`:
 Keep per deployment in `mac/cloud/asterisk.env.example`:
 
 - `AGENT_NAME`;
+- `ROBOT_RUNTIME_PROFILE`;
 - `INCIDENT_ENVIRONMENT`;
 - `LIVEKIT_SELF_HOSTED`;
 - health host/port;

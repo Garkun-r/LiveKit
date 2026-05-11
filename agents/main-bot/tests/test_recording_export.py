@@ -71,3 +71,33 @@ def test_recording_payload_uses_file_result_metadata() -> None:
     assert payload["file_size"] == 12345
     assert payload["duration_sec"] == 7.5
     assert payload["ended_at"]
+
+
+def test_recording_payload_uses_single_file_metadata() -> None:
+    handle = RecordingHandle(
+        egress_id="EG_3",
+        room_name="room-3",
+        object_key="livekit/room-3/recording.mp3",
+        started_at="2026-05-08T12:00:00+00:00",
+    )
+    info = SimpleNamespace(
+        egress_id="EG_3",
+        room_name="room-3",
+        status=api.EgressStatus.EGRESS_COMPLETE,
+        error="",
+        file_results=[],
+        file=SimpleNamespace(
+            filename="livekit/room-3/final.mp3",
+            filepath="",
+            size=45678,
+            duration=301_712_199_651,
+            ended_at=None,
+        ),
+    )
+
+    payload = recording_export.recording_payload_from_egress(handle, info)
+
+    assert payload["status"] == "complete"
+    assert payload["object_key"] == "livekit/room-3/final.mp3"
+    assert payload["file_size"] == 45678
+    assert payload["duration_sec"] == 301.712199651

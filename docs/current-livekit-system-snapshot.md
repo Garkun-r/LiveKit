@@ -1,6 +1,6 @@
 # Слепок текущей LiveKit-системы
 
-Дата слепка: 2026-05-08.
+Дата слепка: 2026-05-11.
 
 Этот документ можно целиком отправить сотруднику или загрузить в нейросеть как
 контекст для обсуждения текущей архитектуры. Он описывает фактическую систему
@@ -54,8 +54,9 @@ SIP/LiveKit room
   -> resolve robot settings from Directus or snapshot/env fallback
   -> build STT + LLM + TTS + turn handling
   -> run AgentSession
+  -> optionally start LiveKit Egress recording
   -> export session to Directus and optionally n8n
-  -> write incidents to Directus/Postgres through shared incident contract
+  -> write incidents and per-call raw logs to Directus best-effort
 ```
 
 ## Главные Файлы
@@ -72,6 +73,8 @@ agents/main-bot/src/routing/model_router_config.yaml
 agents/main-bot/src/egress.py                 per-provider direct/proxy routing
 agents/main-bot/src/incident_logger.py        robot incident logging contract
 agents/main-bot/src/session_export.py         call session export
+agents/main-bot/src/raw_call_logs.py          per-call Directus raw log capture
+agents/main-bot/src/recording_export.py       LiveKit Egress recording indexer
 agents/main-bot/src/robot_tags.py             hidden tag parser/sanitizer
 agents/main-bot/src/robot_skills.py           tag action runtime/placeholders
 agents/main-bot/config/robot_settings_snapshot.json
@@ -113,11 +116,14 @@ For each LiveKit job:
 6. The agent builds LLM, STT, TTS, turn handling, fallback, voice prompts, and
    incident logger.
 7. `AgentSession.start()` starts realtime STT -> LLM -> TTS.
-8. Initial greeting is played from prerecorded/cache audio when available, or
+8. If `CALL_RECORDING_ENABLED=true`, LiveKit Egress recording starts
+   best-effort and is indexed in `robot_call_recordings`.
+9. Initial greeting is played from prerecorded/cache audio when available, or
    generated through TTS as fallback.
-9. Event handlers collect transcript, metrics, usage, tag events, close reason,
-   slow-response incidents, provider fallback incidents, and session errors.
-10. On close/cancel/error, session data is exported and incident writes are
+10. Event handlers collect transcript, metrics, usage, tag events, close reason,
+   slow-response incidents, provider fallback incidents, raw per-call logs, and
+   session errors.
+11. On close/cancel/error, session data is exported and incident/log writes are
     drained best-effort.
 
 ## Settings Model
@@ -130,6 +136,7 @@ Runtime env is the bootstrap layer. It keeps:
 - egress route defaults;
 - n8n/session export settings;
 - incident logging settings;
+- per-call raw log and call recording settings;
 - safety knobs such as prerecorded audio, watchdog, health port.
 
 Provider/model/tuning selection should normally come from Directus component
@@ -414,6 +421,8 @@ Payload includes:
 - usage and metrics;
 - component metrics;
 - summary counts.
+- recording and raw-log rows are linked to the Directus call session when the
+  matching collections exist.
 
 Directus export is best-effort. n8n export is also best-effort and logs
 `n8n_export_failed` if it fails or times out.
@@ -434,9 +443,14 @@ agent_session_error
 provider_fallback
 slow_response
 reply_watchdog_fired
+no_dialog_startup_timeout
+speech_playout_timeout
+speech_playout_failed
+initial_greeting_failed
 tool_failed
 abnormal_close
 n8n_export_failed
+call_recording_failed
 ```
 
 The logger redacts obvious secret-like values, but code should still never put

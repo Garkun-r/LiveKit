@@ -245,6 +245,8 @@ from config import (
     VOICE_RESPONSE_DELAY_POST_GAP_SEC,
     VOICE_RESPONSE_DELAY_SEC,
     VOICE_SHORT_GREETING_PHRASE,
+    VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
+    VOICE_STARTUP_NO_DIALOG_TIMEOUT_SEC,
     XAI_API_KEY,
     XAI_BASE_URL,
     XAI_ENABLE_TOOLS,
@@ -275,7 +277,11 @@ from raw_call_logs import (
     bind_raw_call_log_sink,
     reset_raw_call_log_sink,
 )
-from recording_export import finalize_room_recording, start_room_recording
+from recording_export import (
+    finalize_room_recording,
+    start_room_recording,
+    stop_room_recording,
+)
 from robot_settings import (
     ComponentSelection,
     ResolvedRobotSettings,
@@ -705,6 +711,21 @@ def is_abnormal_close(reason: str | None, error: str | None) -> bool:
     )
 
 
+def should_fire_startup_no_dialog_timeout(
+    *,
+    timeout_sec: float,
+    close_event_set: bool,
+    dialog_activity_seen: bool,
+    end_call_scheduled: bool,
+) -> bool:
+    return (
+        timeout_sec > 0
+        and not close_event_set
+        and not dialog_activity_seen
+        and not end_call_scheduled
+    )
+
+
 def register_stt_fallback_incident_listener(
     stt_client: Any,
     incident_log: IncidentLogger,
@@ -856,6 +877,91 @@ def resolve_audio_output_sample_rate(
     return 24000
 
 
+def speech_handle_id(handle: Any | None) -> str | None:
+    value = getattr(handle, "id", None)
+    return str(value) if value is not None else None
+
+
+def stop_speech_handle(handle: Any | None) -> None:
+    if handle is None:
+        return
+    with suppress(Exception):
+        if hasattr(handle, "stop"):
+            handle.stop()
+        elif hasattr(handle, "interrupt"):
+            handle.interrupt(force=True)
+
+
+async def wait_for_speech_playout(
+    handle: Any,
+    *,
+    kind: str,
+    log_label: str,
+    timeout_sec: float | None = None,
+    incident_log: IncidentLogger | None = None,
+    payload: dict[str, Any] | None = None,
+) -> bool:
+    resolved_timeout_sec = (
+        VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC if timeout_sec is None else timeout_sec
+    )
+    started_at = time.monotonic()
+    details = {
+        "kind": kind,
+        "speech_id": speech_handle_id(handle),
+        "timeout_sec": resolved_timeout_sec,
+        **(payload or {}),
+    }
+    try:
+        if resolved_timeout_sec and resolved_timeout_sec > 0:
+            await asyncio.wait_for(
+                handle.wait_for_playout(),
+                timeout=resolved_timeout_sec,
+            )
+        else:
+            await handle.wait_for_playout()
+        return True
+    except asyncio.TimeoutError:
+        elapsed_ms = round((time.monotonic() - started_at) * 1000, 1)
+        logger.warning(
+            "%s playback timeout",
+            log_label,
+            extra={**details, "elapsed_ms": elapsed_ms},
+        )
+        stop_speech_handle(handle)
+        if incident_log is not None:
+            incident_log.record_nowait(
+                "speech_playout_timeout",
+                severity="warning",
+                component="voice_pipeline",
+                latency_ms=elapsed_ms,
+                error_type="TimeoutError",
+                description=f"{log_label} playback did not finish before timeout",
+                payload={**details, "elapsed_ms": elapsed_ms},
+            )
+        return False
+    except asyncio.CancelledError:
+        stop_speech_handle(handle)
+        raise
+    except Exception as e:
+        elapsed_ms = round((time.monotonic() - started_at) * 1000, 1)
+        logger.exception(
+            "%s playback failed: %s",
+            log_label,
+            e,
+            extra={**details, "elapsed_ms": elapsed_ms},
+        )
+        if incident_log is not None:
+            incident_log.record_exception_nowait(
+                "speech_playout_failed",
+                e,
+                severity="warning",
+                component="voice_pipeline",
+                description=f"{log_label} playback failed",
+                payload={**details, "elapsed_ms": elapsed_ms},
+            )
+        return False
+
+
 async def play_prerecorded_audio(
     *,
     session: AgentSession,
@@ -864,9 +970,17 @@ async def play_prerecorded_audio(
     allow_interruptions: bool,
     add_to_chat_ctx: bool,
     text: str = "",
+    playback_kind: str = "prerecorded_audio",
+    timeout_sec: float | None = None,
+    incident_log: IncidentLogger | None = None,
 ) -> bool:
+    log_label = playback_kind.replace("_", " ")
     if not audio_path.exists():
-        logger.warning("prerecorded audio file not found: %s", audio_path)
+        logger.warning(
+            "%s audio file not found",
+            log_label,
+            extra={"kind": playback_kind, "audio_path": str(audio_path)},
+        )
         return False
 
     try:
@@ -880,10 +994,62 @@ async def play_prerecorded_audio(
             allow_interruptions=allow_interruptions,
             add_to_chat_ctx=add_to_chat_ctx,
         )
-        await handle.wait_for_playout()
-        return True
+        logger.info(
+            "%s playback started",
+            log_label,
+            extra={
+                "kind": playback_kind,
+                "audio_path": str(audio_path),
+                "sample_rate": sample_rate,
+                "text_len": len(text or ""),
+                "speech_id": speech_handle_id(handle),
+            },
+        )
+        played = await wait_for_speech_playout(
+            handle,
+            kind=playback_kind,
+            log_label=log_label,
+            timeout_sec=timeout_sec,
+            incident_log=incident_log,
+            payload={
+                "audio_path": str(audio_path),
+                "sample_rate": sample_rate,
+                "text_len": len(text or ""),
+            },
+        )
+        if played:
+            logger.info(
+                "%s playback finished",
+                log_label,
+                extra={
+                    "kind": playback_kind,
+                    "audio_path": str(audio_path),
+                    "speech_id": speech_handle_id(handle),
+                },
+            )
+        return played
     except Exception as e:
-        logger.exception("failed to play prerecorded audio '%s': %s", audio_path, e)
+        logger.exception(
+            "failed to schedule %s audio '%s': %s",
+            log_label,
+            audio_path,
+            e,
+            extra={"kind": playback_kind, "audio_path": str(audio_path)},
+        )
+        if incident_log is not None:
+            incident_log.record_exception_nowait(
+                "speech_playout_failed",
+                e,
+                severity="warning",
+                component="voice_pipeline",
+                description=f"{log_label} audio could not be scheduled",
+                payload={
+                    "kind": playback_kind,
+                    "audio_path": str(audio_path),
+                    "sample_rate": sample_rate,
+                    "text_len": len(text or ""),
+                },
+            )
         return False
 
 
@@ -912,6 +1078,8 @@ class VoicePromptManager:
         is_closed: Callable[[], bool],
         is_end_call_scheduled: Callable[[], bool],
         on_client_silence_timeout: Callable[[], Awaitable[None]],
+        speech_playout_timeout_sec: float = VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
+        incident_log: IncidentLogger | None = None,
     ) -> None:
         self._session = session
         self._background_audio = background_audio
@@ -924,6 +1092,8 @@ class VoicePromptManager:
         self._client_silence_sec = max(0.0, client_silence_sec)
         self._client_silence_stt_grace_sec = max(0.0, client_silence_stt_grace_sec)
         self._client_silence_max_prompts = max(0, client_silence_max_prompts)
+        self._speech_playout_timeout_sec = max(0.0, speech_playout_timeout_sec)
+        self._incident_log = incident_log
         self._is_closed = is_closed
         self._is_end_call_scheduled = is_end_call_scheduled
         self._on_client_silence_timeout = on_client_silence_timeout
@@ -1052,8 +1222,13 @@ class VoicePromptManager:
             await self.stop_active_prompt()
             return
         if handle is not None and not self._handle_done(handle):
-            with suppress(Exception):
-                await handle.wait_for_playout()
+            await wait_for_speech_playout(
+                handle,
+                kind=kind or "voice_prompt",
+                log_label=f"{kind or 'voice prompt'} voice prompt",
+                timeout_sec=self._speech_playout_timeout_sec,
+                incident_log=self._incident_log,
+            )
 
     async def stop_active_prompt(self) -> None:
         async with self._active_lock:
@@ -1169,7 +1344,16 @@ class VoicePromptManager:
                 "voice prompt started",
                 extra={"kind": prompt.kind, "audio_path": str(audio_path)},
             )
-            await handle.wait_for_playout()
+            played = await wait_for_speech_playout(
+                handle,
+                kind=prompt.kind,
+                log_label=f"{prompt.kind} voice prompt",
+                timeout_sec=self._speech_playout_timeout_sec,
+                incident_log=self._incident_log,
+                payload={"audio_path": str(audio_path)},
+            )
+            if not played:
+                return False
             if prompt.kind == "response_delay":
                 self._last_response_delay_finished_at = asyncio.get_running_loop().time()
             logger.info("voice prompt finished", extra={"kind": prompt.kind})
@@ -3884,12 +4068,14 @@ async def my_agent(ctx: JobContext):
     response_delay_started_for_turn = False
     end_call_task: asyncio.Task | None = None
     reply_watchdog_task: asyncio.Task | None = None
+    startup_no_dialog_task: asyncio.Task | None = None
     export_wait_sec = 20.0
     export_task: asyncio.Task | None = None
     session_close_task: asyncio.Task | None = None
     runtime_warmup_task: asyncio.Task | None = None
     unrecoverable_error_task: asyncio.Task | None = None
     unrecoverable_error_response_started = False
+    startup_dialog_activity_seen = False
     session_started = False
     startup_failure_recorded = False
     prompt_resolution = PromptResolution(
@@ -3908,6 +4094,7 @@ async def my_agent(ctx: JobContext):
     participant = None
     robot_settings: ResolvedRobotSettings | None = None
     recording_handle = None
+    recording_stop_requested = False
     raw_log_sink = RawCallLogSink(
         room_name=ctx.room.name,
         session_id=ctx.room.name,
@@ -4334,6 +4521,8 @@ async def my_agent(ctx: JobContext):
         is_closed=close_event.is_set,
         is_end_call_scheduled=lambda: bool(end_call_task and not end_call_task.done()),
         on_client_silence_timeout=on_client_silence_timeout,
+        speech_playout_timeout_sec=VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
+        incident_log=incident_log,
     )
     logger.info(
         "session latency guards configured",
@@ -4375,6 +4564,8 @@ async def my_agent(ctx: JobContext):
             ),
             "stt_early_interim_final_min_stable_interims": STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS,
             "voice_initial_greeting_delay_sec": VOICE_INITIAL_GREETING_DELAY_SEC,
+            "voice_speech_playout_timeout_sec": VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
+            "voice_startup_no_dialog_timeout_sec": VOICE_STARTUP_NO_DIALOG_TIMEOUT_SEC,
             "voice_response_delay_sec": VOICE_RESPONSE_DELAY_SEC,
             "voice_response_delay_post_gap_sec": VOICE_RESPONSE_DELAY_POST_GAP_SEC,
             "voice_response_delay_audio_paths": [
@@ -4406,6 +4597,19 @@ async def my_agent(ctx: JobContext):
             return
         response_delay_started_for_turn = True
         voice_prompts.start_response_delay_timer()
+
+    def mark_startup_dialog_activity(activity: str, **payload: Any) -> None:
+        nonlocal startup_dialog_activity_seen, startup_no_dialog_task
+        if startup_dialog_activity_seen:
+            return
+        startup_dialog_activity_seen = True
+        logger.info(
+            "startup dialog activity observed",
+            extra={"activity": activity, **payload},
+        )
+        if startup_no_dialog_task and not startup_no_dialog_task.done():
+            startup_no_dialog_task.cancel()
+            startup_no_dialog_task = None
 
     async def handle_unrecoverable_error(ev: Any) -> None:
         nonlocal unrecoverable_error_response_started
@@ -4439,6 +4643,9 @@ async def my_agent(ctx: JobContext):
                 allow_interruptions=False,
                 add_to_chat_ctx=False,
                 text=VOICE_EMERGENCY_PHRASE,
+                playback_kind="emergency",
+                timeout_sec=VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
+                incident_log=incident_log,
             )
             if played:
                 if err_type == "tts_error":
@@ -4460,7 +4667,14 @@ async def my_agent(ctx: JobContext):
                 allow_interruptions=False,
                 add_to_chat_ctx=False,
             )
-            await handle.wait_for_playout()
+            await wait_for_speech_playout(
+                handle,
+                kind="emergency",
+                log_label="emergency fallback",
+                timeout_sec=VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
+                incident_log=incident_log,
+                payload={"source": "session.say"},
+            )
         except Exception as e:
             logger.exception("failed to play emergency fallback phrase: %s", e)
 
@@ -4522,6 +4736,27 @@ async def my_agent(ctx: JobContext):
         except Exception as e:
             logger.exception("reply watchdog failed: %s", e)
 
+    @session.on("speech_created")
+    def on_speech_created(ev):
+        try:
+            handle = getattr(ev, "speech_handle", None)
+            source = getattr(ev, "source", None)
+            logger.info(
+                "speech created",
+                extra={
+                    "source": source,
+                    "user_initiated": getattr(ev, "user_initiated", None),
+                    "speech_id": speech_handle_id(handle),
+                },
+            )
+            mark_startup_dialog_activity(
+                "speech_created",
+                source=source,
+                speech_id=speech_handle_id(handle),
+            )
+        except Exception as e:
+            logger.exception("speech_created handler failed: %s", e)
+
     @session.on("conversation_item_added")
     def on_conversation_item_added(ev):
         nonlocal assistant_message_count, reply_watchdog_task
@@ -4579,6 +4814,11 @@ async def my_agent(ctx: JobContext):
                         "language": getattr(ev, "language", None),
                     },
                 )
+                mark_startup_dialog_activity(
+                    "user_input_transcribed",
+                    is_final=is_final,
+                    transcript_len=len(transcript),
+                )
                 # Any new user speech cancels a pending auto-hangup timer.
                 user_activity_count += 1
                 voice_prompts.on_user_transcribed(is_final=is_final)
@@ -4626,6 +4866,11 @@ async def my_agent(ctx: JobContext):
                 extra={"old_state": old_state_value, "new_state": new_state_value},
             )
             if new_state_value == "speaking":
+                mark_startup_dialog_activity(
+                    "user_state_speaking",
+                    old_state=old_state_value,
+                    new_state=new_state_value,
+                )
                 pending_user_phrase_end_at = None
                 pending_user_phrase_end_source = None
                 response_delay_has_final_transcript = False
@@ -4681,7 +4926,7 @@ async def my_agent(ctx: JobContext):
         try:
             old_state = getattr(ev, "old_state", None)
             new_state = getattr(ev, "new_state", None)
-            logger.debug(
+            logger.info(
                 "agent state changed",
                 extra={
                     "old_state": old_state,
@@ -4697,6 +4942,11 @@ async def my_agent(ctx: JobContext):
                 reply_watchdog_task.cancel()
                 reply_watchdog_task = None
             if new_state in {"thinking", "speaking"}:
+                mark_startup_dialog_activity(
+                    f"agent_state_{new_state}",
+                    old_state=old_state,
+                    new_state=new_state,
+                )
                 voice_prompts.cancel_client_silence_timer()
             if new_state == "speaking":
                 tts_first_frame_ready_at = assistant._tts_first_frame_ready_at
@@ -4911,6 +5161,56 @@ async def my_agent(ctx: JobContext):
         except BaseException as e:
             logger.exception("session close failed: %s", e)
 
+    async def stop_recording_safely(reason: str) -> None:
+        nonlocal recording_stop_requested
+        if recording_handle is None:
+            return
+        if recording_stop_requested:
+            return
+        recording_stop_requested = True
+        logger.info(
+            "stopping room recording",
+            extra={
+                "reason": reason,
+                "egress_id": recording_handle.egress_id,
+                "room": recording_handle.room_name,
+            },
+        )
+        try:
+            info = await stop_room_recording(recording_handle)
+            logger.info(
+                "room recording stop requested",
+                extra={
+                    "reason": reason,
+                    "egress_id": recording_handle.egress_id,
+                    "status": state_value(getattr(info, "status", None))
+                    if info is not None
+                    else None,
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                "failed to stop room recording: %s",
+                e,
+                extra={
+                    "reason": reason,
+                    "egress_id": recording_handle.egress_id,
+                    "room": recording_handle.room_name,
+                },
+            )
+            incident_log.record_exception_nowait(
+                "call_recording_failed",
+                e,
+                severity="warning",
+                component="livekit_egress",
+                description="Failed to stop LiveKit room recording during cleanup",
+                payload={
+                    "reason": reason,
+                    "egress_id": recording_handle.egress_id,
+                    "room": recording_handle.room_name,
+                },
+            )
+
     async def delete_room_safely(
         reason: str,
         *,
@@ -4934,6 +5234,14 @@ async def my_agent(ctx: JobContext):
             await asyncio.wait_for(
                 asyncio.shield(ctx.delete_room(ctx.room.name)), timeout=3.0
             )
+            logger.info(
+                "room delete completed",
+                extra={
+                    "room": ctx.room.name,
+                    "reason": reason,
+                    "close_reason": resolved_close_reason,
+                },
+            )
         except asyncio.TimeoutError:
             logger.warning("delete_room timed out; forcing local shutdown")
             incident_log.record_nowait(
@@ -4948,6 +5256,7 @@ async def my_agent(ctx: JobContext):
                     "room": ctx.room.name,
                 },
             )
+            await stop_recording_safely(resolved_close_reason)
         except Exception as e:
             logger.exception("failed to delete room: %s", e)
             resolved_close_reason = (
@@ -4966,6 +5275,7 @@ async def my_agent(ctx: JobContext):
                     "room": ctx.room.name,
                 },
             )
+            await stop_recording_safely(resolved_close_reason)
         finally:
             # Unblock main entrypoint even if LiveKit close signal arrives late.
             close_event.set()
@@ -5018,9 +5328,76 @@ async def my_agent(ctx: JobContext):
         )
         return "END_CALL_SCHEDULED"
 
+    async def request_no_dialog_startup_end_call() -> str:
+        nonlocal end_call_task
+        if end_call_task and not end_call_task.done():
+            return "END_CALL_ALREADY_SCHEDULED"
+
+        voice_prompts.cancel_response_delay_timer()
+        voice_prompts.cancel_client_silence_timer()
+
+        async def end_after_no_dialog() -> None:
+            try:
+                await delete_room_safely(
+                    "no_dialog_startup_timeout",
+                    close_reason="no_dialog_startup_timeout",
+                )
+            except asyncio.CancelledError:
+                logger.info("no-dialog startup end-call task canceled")
+            except Exception as e:
+                logger.exception("no-dialog startup end-call task failed: %s", e)
+
+        end_call_task = asyncio.create_task(
+            end_after_no_dialog(),
+            name="no_dialog_startup_end_call",
+        )
+        return "END_CALL_SCHEDULED"
+
+    async def startup_no_dialog_watchdog() -> None:
+        try:
+            await asyncio.sleep(VOICE_STARTUP_NO_DIALOG_TIMEOUT_SEC)
+            if not should_fire_startup_no_dialog_timeout(
+                timeout_sec=VOICE_STARTUP_NO_DIALOG_TIMEOUT_SEC,
+                close_event_set=close_event.is_set(),
+                dialog_activity_seen=startup_dialog_activity_seen,
+                end_call_scheduled=bool(end_call_task and not end_call_task.done()),
+            ):
+                return
+            logger.warning(
+                "startup no-dialog timeout reached",
+                extra={
+                    "timeout_sec": VOICE_STARTUP_NO_DIALOG_TIMEOUT_SEC,
+                    "agent_state": session.agent_state,
+                    "user_activity_count": user_activity_count,
+                    "assistant_message_count": assistant_message_count,
+                },
+            )
+            incident_log.record_nowait(
+                "no_dialog_startup_timeout",
+                severity="warning",
+                component="turn_runtime",
+                latency_ms=VOICE_STARTUP_NO_DIALOG_TIMEOUT_SEC * 1000,
+                error_type="TimeoutError",
+                description=(
+                    "No assistant speech, user speech, or transcript appeared after "
+                    "session start"
+                ),
+                payload={
+                    "timeout_sec": VOICE_STARTUP_NO_DIALOG_TIMEOUT_SEC,
+                    "agent_state": session.agent_state,
+                    "user_activity_count": user_activity_count,
+                    "assistant_message_count": assistant_message_count,
+                },
+            )
+            await request_no_dialog_startup_end_call()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.exception("startup no-dialog watchdog failed: %s", e)
+
     @session.on("close")
     def on_close(ev):
-        nonlocal reply_watchdog_task
+        nonlocal reply_watchdog_task, startup_no_dialog_task
         if close_event.is_set():
             return
         close_info["reason"] = str(getattr(ev, "reason", None))
@@ -5038,6 +5415,9 @@ async def my_agent(ctx: JobContext):
         if reply_watchdog_task and not reply_watchdog_task.done():
             reply_watchdog_task.cancel()
             reply_watchdog_task = None
+        if startup_no_dialog_task and not startup_no_dialog_task.done():
+            startup_no_dialog_task.cancel()
+            startup_no_dialog_task = None
         voice_prompts.cancel_response_delay_timer()
         voice_prompts.cancel_client_silence_timer()
         if end_call_task and not end_call_task.done():
@@ -5153,6 +5533,11 @@ async def my_agent(ctx: JobContext):
                 payload={"phase": "session.start"},
             )
             raise
+        if VOICE_STARTUP_NO_DIALOG_TIMEOUT_SEC > 0:
+            startup_no_dialog_task = asyncio.create_task(
+                startup_no_dialog_watchdog(),
+                name="startup_no_dialog_watchdog",
+            )
         await background_audio.start(room=ctx.room, agent_session=session)
 
         runtime_warmup_task = asyncio.create_task(
@@ -5183,10 +5568,27 @@ async def my_agent(ctx: JobContext):
                 default_greeting=VOICE_INITIAL_GREETING_PHRASE,
                 prerecorded_path=_INITIAL_GREETING_AUDIO_PATH,
             )
+            logger.info(
+                "initial greeting resolved",
+                extra={
+                    "source": "directus"
+                    if (prompt_resolution.initial_greeting or "").strip()
+                    else "default",
+                    "text_len": len(initial_greeting or ""),
+                    "audio_path": str(initial_greeting_audio_path)
+                    if initial_greeting_audio_path is not None
+                    else None,
+                    "voice_audio_cache_enabled": VOICE_AUDIO_CACHE_ENABLED,
+                },
+            )
         else:
             initial_greeting = (
                 prompt_resolution.initial_greeting or ""
             ).strip() or VOICE_INITIAL_GREETING_PHRASE
+            logger.info(
+                "initial greeting skipped",
+                extra={"reason": "close_event_set", "text_len": len(initial_greeting)},
+            )
         played_initial_greeting = False
         if should_greet:
             assistant.begin_initial_greeting()
@@ -5210,6 +5612,9 @@ async def my_agent(ctx: JobContext):
                             allow_interruptions=False,
                             add_to_chat_ctx=False,
                             text=initial_greeting,
+                            playback_kind="initial_greeting",
+                            timeout_sec=VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
+                            incident_log=incident_log,
                         )
                 # Do not block call flow if warmup is still in progress.
                 if runtime_warmup_task and not runtime_warmup_task.done():
@@ -5221,15 +5626,51 @@ async def my_agent(ctx: JobContext):
                 if not played_initial_greeting and should_play_initial_greeting(
                     close_event_set=close_event.is_set(),
                 ):
-                    await session.generate_reply(
+                    logger.info(
+                        "initial greeting fallback generation started",
+                        extra={"text_len": len(initial_greeting or "")},
+                    )
+                    handle = session.generate_reply(
                         instructions=(
                             "Сразу после подключения скажи клиенту ровно эту фразу: "
                             f"{initial_greeting}"
                         ),
                         allow_interruptions=False,
                     )
+                    played_initial_greeting = await wait_for_speech_playout(
+                        handle,
+                        kind="initial_greeting",
+                        log_label="initial greeting fallback",
+                        timeout_sec=VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
+                        incident_log=incident_log,
+                        payload={"source": "generate_reply"},
+                    )
+                    if played_initial_greeting:
+                        logger.info("initial greeting fallback generation finished")
+                    else:
+                        logger.warning("initial greeting was not completed")
             finally:
                 assistant.finish_initial_greeting()
+        if played_initial_greeting:
+            voice_prompts.on_agent_finished_speaking()
+        elif should_greet and not close_event.is_set():
+            incident_log.record_nowait(
+                "initial_greeting_failed",
+                severity="warning",
+                component="voice_pipeline",
+                description="Initial greeting did not complete by any playback path",
+                payload={
+                    "audio_path": str(initial_greeting_audio_path)
+                    if initial_greeting_audio_path is not None
+                    else None,
+                    "text_len": len(initial_greeting or ""),
+                    "timeout_sec": VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
+                },
+            )
+            await delete_room_safely(
+                "initial_greeting_failed",
+                close_reason="initial_greeting_failed",
+            )
         elif runtime_warmup_task and not runtime_warmup_task.done():
             # Do not block call flow if warmup is still in progress.
             with suppress(Exception):
@@ -5258,6 +5699,13 @@ async def my_agent(ctx: JobContext):
             description="LiveKit agent entrypoint was cancelled",
             payload={"close": dict(close_info)},
         )
+        with suppress(BaseException):
+            await stop_recording_safely(close_info["reason"] or "entrypoint_cancelled")
+        with suppress(BaseException):
+            await delete_room_safely(
+                "entrypoint_cancelled",
+                close_reason=close_info["reason"] or "entrypoint_cancelled",
+            )
         await export_best_effort(timeout_sec=export_wait_sec)
         await ensure_session_closed(timeout_sec=1.0)
     except Exception as e:
@@ -5280,6 +5728,8 @@ async def my_agent(ctx: JobContext):
             end_call_task.cancel()
         if reply_watchdog_task and not reply_watchdog_task.done():
             reply_watchdog_task.cancel()
+        if startup_no_dialog_task and not startup_no_dialog_task.done():
+            startup_no_dialog_task.cancel()
         if unrecoverable_error_task and not unrecoverable_error_task.done():
             unrecoverable_error_task.cancel()
         if runtime_warmup_task and not runtime_warmup_task.done():

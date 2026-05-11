@@ -177,6 +177,7 @@ def _voice_prompt_manager(
     client_silence_sec: float = 0.01,
     client_silence_stt_grace_sec: float = 0.0,
     client_silence_max_prompts: int = 2,
+    speech_playout_timeout_sec: float = 12.0,
     is_closed=lambda: False,
     is_end_call_scheduled=lambda: False,
     on_client_silence_timeout=None,
@@ -219,6 +220,7 @@ def _voice_prompt_manager(
         is_closed=is_closed,
         is_end_call_scheduled=is_end_call_scheduled,
         on_client_silence_timeout=on_client_silence_timeout,
+        speech_playout_timeout_sec=speech_playout_timeout_sec,
     )
     return manager, session, background_audio
 
@@ -534,6 +536,23 @@ async def test_client_silence_prompt_uses_background_audio(tmp_path) -> None:
     assert background_audio.played == [str(tmp_path / "client_silence.wav")]
     assert session.say_calls == []
     assert close_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_client_silence_prompt_timeout_stops_background_audio(tmp_path) -> None:
+    handle = _FakePromptHandle(done=False)
+    background_audio = _FakeBackgroundAudio(handle=handle)
+    manager, _, _ = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        background_audio=background_audio,
+        speech_playout_timeout_sec=0.01,
+    )
+
+    manager.on_agent_finished_speaking()
+    await _wait_until(lambda: handle.stopped)
+    await manager.aclose()
+
+    assert background_audio.played == [str(tmp_path / "client_silence.wav")]
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,6 @@
 # Agent sleep and cold starts
 
-Last reviewed: 2026-04-24.
+Last reviewed: 2026-05-11.
 
 ## Summary
 
@@ -10,15 +10,16 @@ LiveKit docs state that Build plan projects might shut deployed agents down afte
 
 ## Current project state
 
-Read-only check on 2026-04-24:
+Read-only check on 2026-05-11:
 
 - Agent ID: `CA_oaEZ279sgQGr`
 - Region: `eu-central`
-- Version: `v20260421162443`
-- Status: `Sleeping`
-- Replicas: `0 / 1 / 1`
+- Version: `QVi3bHhnuoSL`
+- Status: `Running`
+- Replicas: `1 / 1 / 8`
 
-This matches the documented cold-start behavior.
+The agent was running during this check. The cold-start note above still
+applies when Cloud scales the deployment down after idle periods.
 
 ## Code-level latency checks
 
@@ -38,14 +39,14 @@ No-cost options:
 - For development and repeated testing, run a local worker and keep it alive:
 
 ```bash
-cd /Users/romangarkun/Documents/LiveKit/agents/main-bot
+cd /Users/romangarkun/Documents/Проекты/LiveKit/agents/main-bot
 UV_CACHE_DIR=/tmp/uv-cache uv run src/agent.py dev
 ```
 
 - For terminal-only behavior tests, use console mode:
 
 ```bash
-cd /Users/romangarkun/Documents/LiveKit/agents/main-bot
+cd /Users/romangarkun/Documents/Проекты/LiveKit/agents/main-bot
 UV_CACHE_DIR=/tmp/uv-cache uv run src/agent.py console
 ```
 

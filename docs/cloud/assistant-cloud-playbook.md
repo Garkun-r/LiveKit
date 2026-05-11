@@ -1,6 +1,6 @@
 # Assistant cloud playbook
 
-Last reviewed: 2026-04-24 11:25:02 +07.
+Last reviewed: 2026-05-11.
 
 This document tells a future coding agent how to work with the LiveKit Cloud part of this project.
 
@@ -10,7 +10,7 @@ With the right access, Codex can help manage:
 
 - LiveKit Cloud projects visible to the local `lk` CLI.
 - Cloud agents: create, deploy, update, restart, rollback, delete, list versions, inspect status, and tail logs.
-- Agent secrets: list secret names, sync from `.env.local`, update secrets, and add file-mounted secrets.
+- Agent secrets: list secret names, sync from a generated Cloud env file, update secrets, and add file-mounted secrets.
 - Runtime diagnostics: build logs, deploy logs, agent status, active rooms, participants, ingress, egress, and sessions visible in LiveKit Cloud.
 - Telephony: LiveKit Phone Numbers, SIP inbound trunks, SIP outbound trunks, dispatch rules, and SIP participants for outbound calls.
 - Room service operations: create/list/delete rooms, list/remove participants, mute tracks, update metadata, send data packets.
@@ -30,7 +30,10 @@ With the right access, Codex can help manage:
   - `roomAdmin` for participant moderation.
   - `roomRecord` for egress.
   - `ingressAdmin` for ingress.
-- Provider secrets for this agent's runtime: Google/Gemini, Deepgram, ElevenLabs, xAI, MiniMax, CosyVoice, Postgres, and n8n as configured.
+- Provider/runtime secrets for this agent: Directus, n8n, Google/Gemini,
+  Deepgram, ElevenLabs, xAI, MiniMax, CosyVoice, Yandex, T-Bank VoiceKit, Sber,
+  call-recording S3/MinIO, and any legacy Postgres fallback values that are
+  still configured.
 
 ## Safety rules
 
@@ -47,7 +50,7 @@ With the right access, Codex can help manage:
 Start from the agent directory:
 
 ```bash
-cd /Users/romangarkun/Documents/LiveKit/agents/main-bot
+cd /Users/romangarkun/Documents/Проекты/LiveKit/agents/main-bot
 ```
 
 Check docs first:
@@ -78,7 +81,8 @@ lk egress list
 Deploy after local verification:
 
 ```bash
-uv run python scripts/sync_cloud_secrets.py --env-file .env.local
+uv run python scripts/build_env.py --profile cloud --secrets env/cloud.secrets.env --output .env.cloud.local
+uv run python scripts/sync_cloud_secrets.py --env-file .env.cloud.local
 lk agent deploy
 lk agent status
 lk agent logs --log-type deploy
@@ -99,6 +103,9 @@ lk agent status
 - The configured project subdomain is `jcallio-g451240m`.
 - Current deployed region is `eu-central`.
 - The code default `AGENT_NAME` is `main-bot`, and the current SIP dispatch rule targets `main-bot`.
+- `env/cloud.env.example` also uses `AGENT_NAME=main-bot`; do not change it to
+  a profile-specific name unless the SIP dispatch rule changes at the same
+  time.
 - The current inbound SIP path uses one inbound trunk and one dispatch rule; see [current-cloud-state.md](current-cloud-state.md).
 
 ## Telephony workflow
@@ -129,13 +136,14 @@ For outbound calls:
 Preferred sync path for this repository:
 
 ```bash
-uv run python scripts/sync_cloud_secrets.py --env-file .env.local
+uv run python scripts/build_env.py --profile cloud --secrets env/cloud.secrets.env --output .env.cloud.local
+uv run python scripts/sync_cloud_secrets.py --env-file .env.cloud.local
 ```
 
 Direct LiveKit CLI alternative:
 
 ```bash
-lk agent update-secrets --secrets-file .env.local
+lk agent update-secrets --secrets-file .env.cloud.local
 ```
 
 The repository sync helper performs an additive update by default so an

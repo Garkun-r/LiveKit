@@ -112,7 +112,7 @@ LiveKit local agent log markers:
 - `participant connected`
 - `user_input_transcribed`
 - `[MODEL_ROUTER] selected_model="fast|complex"`
-- `llm fallback adapter configured`
+- `using LiveKit LLM fallback adapter` or `LiveKit LLM fallback adapter disabled`
 - `llm availability changed`
 - `reply watchdog fired`
 - `reply watchdog skipped`

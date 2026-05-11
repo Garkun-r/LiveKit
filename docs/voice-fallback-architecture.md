@@ -165,22 +165,31 @@ Requirements:
 
 ## TTS fallback
 
-- Primary TTS today: ElevenLabs v3 through the custom plugin.
-- Backup TTS candidate: MiniMax, because it has a similar or same voice.
+- Primary TTS is selected by Directus profile. In the local snapshot, `base`
+  uses ElevenLabs v3 through the custom HTTP adapter, while `asterisk` uses
+  T-Bank VoiceKit.
+- Backup TTS candidate for an ElevenLabs path remains MiniMax, because it has a
+  similar or same voice.
 - Keep the fallback voice as similar as possible.
-- Runtime TTS fallback is needed, but it may be implemented as a separate stage
-  if that reduces risk for the first LLM fallback refactor.
+- Full runtime TTS fallback is still not a general chain. Some provider
+  construction paths fall back to ElevenLabs when credentials are missing or a
+  provider is unavailable, but a mid-call TTS fallback chain needs a separate
+  implementation.
 - Emergency prerecorded audio path is still required, because TTS itself can
   fail.
 
 ## STT fallback
 
-- Primary STT today: Deepgram Nova 3.
-- STT fallback is needed.
-- The concrete backup STT is not selected yet.
-- Fast backup STT options need to be tested.
-- STT fallback may be implemented as a separate stage if that reduces risk for
-  the first LLM fallback refactor.
+- Primary STT is selected by Directus profile. In the local snapshot, `base`
+  uses Deepgram Flux (`flux-general-multi`) and `asterisk` uses Yandex
+  SpeechKit.
+- Code supports STT fallback chains for `provider=inference` and
+  `provider=google`: inference can add Google STT and an optional second
+  inference model; Google can fall back to inference STT.
+- Deepgram, Yandex, and T-Bank direct profiles currently do not have a generic
+  mid-call fallback chain in `build_stt()`.
+- Fast backup STT options still need provider-specific testing before changing
+  production Directus profiles.
 
 ## Watchdog / latency guard
 
@@ -240,7 +249,8 @@ Requirements:
 - Exact model IDs for Gemini primary and Gemini Lite backup.
 - Whether fast and complex branches need one shared backup or different backup
   models.
-- Which STT to use as backup for Deepgram Nova 3.
+- Whether to add a generic fallback chain for Deepgram Flux, Yandex, or T-Bank
+  direct STT profiles.
 - Whether to connect MiniMax TTS fallback in the first refactor or as a separate
   stage.
 - Whether a feature flag is needed for quick rollback to the old fallback

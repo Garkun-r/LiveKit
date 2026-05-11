@@ -1,23 +1,22 @@
-<a href="https://livekit.io/">
-  <img src="./.github/assets/livekit-mark.png" alt="LiveKit logo" width="100" height="100">
-</a>
+# JCall LiveKit Main Bot
 
-# LiveKit Agents Starter - Python
+Production voice agent for inbound SIP calls through LiveKit. The current code
+is no longer a vanilla LiveKit starter: it resolves prompts and runtime profiles
+from Directus, supports several STT/TTS/LLM providers, records call metadata,
+writes per-call raw logs and incidents, and can run in Cloud, Mac, or
+self-hosted Asterisk/local LiveKit profiles.
 
-A complete starter project for building voice AI apps with [LiveKit Agents for Python](https://github.com/livekit/agents) and [LiveKit Cloud](https://cloud.livekit.io/).
+Main runtime files:
 
-The starter project includes:
-
-- A simple voice AI assistant, ready for extension and customization
-- A voice AI pipeline built on [LiveKit Inference](https://docs.livekit.io/agents/models/inference)
-  with [models](https://docs.livekit.io/agents/models) from OpenAI, Cartesia, and Deepgram. More than 50 other model providers are supported, including [Realtime models](https://docs.livekit.io/agents/models/realtime)
-- Eval suite based on the LiveKit Agents [testing & evaluation framework](https://docs.livekit.io/agents/start/testing/)
-- [LiveKit Turn Detector](https://docs.livekit.io/agents/logic/turns/turn-detector/) for contextually-aware speaker detection, with multilingual support
-- [Background voice cancellation](https://docs.livekit.io/transport/media/noise-cancellation/)
-- Deep session insights from LiveKit [Agent Observability](https://docs.livekit.io/deploy/observability/)
-- A Dockerfile ready for [production deployment to LiveKit Cloud](https://docs.livekit.io/deploy/agents/)
-
-This starter app is compatible with any [custom web/mobile frontend](https://docs.livekit.io/frontends/) or [telephony](https://docs.livekit.io/telephony/).
+- `src/agent.py` - LiveKit entrypoint, session lifecycle, provider builders,
+  turn guards, voice prompts, recording and export orchestration.
+- `src/config.py` - env bootstrap defaults and legacy fallback values.
+- `src/robot_settings.py` - Directus/snapshot runtime profile resolver.
+- `src/prompt_repo.py` - Directus prompt assembly and prompt cache.
+- `src/incident_logger.py` - shared incident logging contract.
+- `src/raw_call_logs.py` - per-call Directus raw log sink.
+- `src/recording_export.py` - LiveKit Egress recording indexer.
+- `env/*.env.example` - flat env profile templates.
 
 ## Using coding agents
 
@@ -56,43 +55,27 @@ The project includes a complete [AGENTS.md](AGENTS.md) file for these assistants
 
 ## Dev Setup
 
-Create a project from this template with the LiveKit CLI (recommended):
-
-```bash
-lk cloud auth
-lk agent init my-agent --template agent-starter-python
-```
-
-The CLI clones the template and configures your environment. Then follow the rest of this guide from [Run the agent](#run-the-agent).
-
-<details>
-<summary>Alternative: Manual setup without the CLI</summary>
-
-Clone the repository and install dependencies to a virtual environment:
+Install dependencies from this checked-out agent directory:
 
 ```console
-cd agent-starter-python
+cd /Users/romangarkun/Documents/Проекты/LiveKit/agents/main-bot
 uv sync
 ```
 
-Sign up for [LiveKit Cloud](https://cloud.livekit.io/) then set up the environment by copying `.env.example` to `.env.local` and filling in the required keys:
+Build a local `.env.local` from the shared/profile templates and ignored
+secrets:
 
-- `LIVEKIT_URL`
-- `LIVEKIT_API_KEY`
-- `LIVEKIT_API_SECRET`
-
-You can load the LiveKit environment automatically using the [LiveKit CLI](https://docs.livekit.io/intro/basics/cli/):
-
-```bash
-lk cloud auth
-lk app env -w -d .env.local
+```console
+uv run python scripts/build_env.py --profile mac --secrets env/mac.secrets.env --output .env.local
 ```
 
-</details>
+For a one-off local Cloud-connected run you can also copy `.env.example` to
+`.env.local` and fill the required keys manually, but do not commit real
+secrets.
 
 ## Run the agent
 
-Before your first run, you must download certain models such as [Silero VAD](https://docs.livekit.io/agents/logic/turns/vad/) and the [LiveKit turn detector](https://docs.livekit.io/agents/logic/turns/turn-detector/):
+Before your first run, download the local model files used by the agent:
 
 ```console
 uv run python src/agent.py download-files
@@ -162,6 +145,8 @@ VERTEX_TTS_EGRESS=proxy
 GOOGLE_STT_EGRESS=proxy
 XAI_EGRESS=direct
 DEEPGRAM_EGRESS=direct
+YANDEX_STT_EGRESS=direct
+TBANK_VOICEKIT_EGRESS=direct
 MINIMAX_TTS_EGRESS=direct
 COSYVOICE_TTS_EGRESS=direct
 SBER_TTS_EGRESS=direct
@@ -216,7 +201,8 @@ TTS profiles currently support:
 3. `provider=vertex` - Vertex Gemini API streaming path (`google.genai`, `vertexai=True`).
 4. `provider=minimax` - official `livekit.plugins.minimax.TTS` path (`speech-2.8-turbo`).
 5. `provider=cosyvoice` - custom Alibaba CosyVoice WebSocket path.
-6. `provider=sber` - custom Sber SaluteSpeech gRPC streaming path.
+6. `provider=tbank` - custom T-Bank VoiceKit gRPC streaming synthesis.
+7. `provider=sber` - custom Sber SaluteSpeech gRPC streaming path.
 
 The snippets below are legacy env fallback references. For production, put the
 same non-secret tuning values into Directus profile `config_json` and keep only
@@ -263,6 +249,7 @@ STT profiles currently support:
 2. `provider=inference` - LiveKit Agent Gateway STT.
 3. `provider=google` - Google Cloud STT plugin (uses Google credentials).
 4. `provider=yandex` - Yandex SpeechKit v3 direct gRPC STT.
+5. `provider=tbank` - T-Bank VoiceKit gRPC streaming STT.
 
 If you see `429 Too Many Requests` from `agent-gateway.livekit.cloud` for STT, either:
 
@@ -288,6 +275,10 @@ TTS_PROVIDER=vertex
 GOOGLE_TTS_MODEL=gemini-3.1-flash-tts-preview
 GOOGLE_TTS_LOCATION=global
 ```
+
+If a configured Google TTS model is rejected by the current API in the selected
+region/project, the agent can retry the Google TTS path with
+`GOOGLE_TTS_FALLBACK_MODEL` (default: `gemini-2.5-flash-tts`).
 
 MiniMax example:
 
@@ -339,7 +330,8 @@ STT_INFERENCE_INCLUDE_GOOGLE_FALLBACK=true
 STT_INFERENCE_FALLBACK_MODEL=
 ```
 
-Deepgram STT example (default):
+Deepgram STT example (legacy env default; active production choice normally
+comes from Directus):
 
 ```console
 STT_PROVIDER=deepgram
@@ -370,7 +362,16 @@ STT_YANDEX_EOU_SENSITIVITY=high
 STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS=500
 ```
 
-If this model is rejected by current API in your region/project, the agent auto-falls back to `GOOGLE_TTS_FALLBACK_MODEL` (default: `gemini-2.5-flash-tts`).
+T-Bank VoiceKit STT/TTS infrastructure example:
+
+```console
+TBANK_VOICEKIT_API_KEY=<your_tbank_voicekit_api_key>
+TBANK_VOICEKIT_SECRET_KEY=<your_tbank_voicekit_secret_key>
+TBANK_VOICEKIT_ENDPOINT=api.tinkoff.ai:443
+TBANK_VOICEKIT_AUTHORITY=
+STT_PROVIDER=tbank
+TTS_PROVIDER=tbank
+```
 
 If needed, provide Google credentials via `GOOGLE_TTS_CREDENTIALS_FILE` (or `GOOGLE_APPLICATION_CREDENTIALS`).
 
@@ -427,7 +428,8 @@ slightly less accurate than a late provider final.
 To make cloud updates seamless, keep secrets sync + deploy in one flow:
 
 ```console
-uv run python scripts/sync_cloud_secrets.py --working-dir .
+uv run python scripts/build_env.py --profile cloud --secrets env/cloud.secrets.env --output .env.cloud.local
+uv run python scripts/sync_cloud_secrets.py --env-file .env.cloud.local
 lk agent deploy
 ```
 
@@ -445,21 +447,13 @@ In production, use the `start` command:
 uv run python src/agent.py start
 ```
 
-## Frontend & Telephony
+## Telephony
 
-Get started quickly with our pre-built frontend starter apps, or add telephony support:
-
-| Platform | Link | Description |
-|----------|----------|-------------|
-| **Web** | [`livekit-examples/agent-starter-react`](https://github.com/livekit-examples/agent-starter-react) | Web voice AI assistant with React & Next.js |
-| **iOS/macOS** | [`livekit-examples/agent-starter-swift`](https://github.com/livekit-examples/agent-starter-swift) | Native iOS, macOS, and visionOS voice AI assistant |
-| **Flutter** | [`livekit-examples/agent-starter-flutter`](https://github.com/livekit-examples/agent-starter-flutter) | Cross-platform voice AI assistant app |
-| **React Native** | [`livekit-examples/voice-assistant-react-native`](https://github.com/livekit-examples/voice-assistant-react-native) | Native mobile app with React Native & Expo |
-| **Android** | [`livekit-examples/agent-starter-android`](https://github.com/livekit-examples/agent-starter-android) | Native Android app with Kotlin & Jetpack Compose |
-| **Web Embed** | [`livekit-examples/agent-starter-embed`](https://github.com/livekit-examples/agent-starter-embed) | Voice AI widget for any website |
-| **Telephony** | [Documentation](https://docs.livekit.io/telephony/) | Add inbound or outbound calling to your agent |
-
-For advanced customization, see the [complete frontend guide](https://docs.livekit.io/frontends/).
+The current production path is inbound SIP through LiveKit, not a starter web
+frontend. Cloud SIP dispatch currently targets agent name `main-bot`; do not
+change `AGENT_NAME` without updating the matching dispatch rule. For the
+self-hosted Asterisk/local LiveKit route, use
+[`../../docs/local-livekit-server.md`](../../docs/local-livekit-server.md).
 
 ## Call Recordings Index
 
@@ -518,53 +512,46 @@ RAW_CALL_LOG_LEVEL=INFO
 RAW_CALL_LOG_FLUSH_INTERVAL_SEC=2.0
 RAW_CALL_LOG_BATCH_SIZE=50
 RAW_CALL_LOG_MAX_PENDING=1000
+RAW_CALL_LOG_MAX_MESSAGE_CHARS=8000
+RAW_CALL_LOG_MAX_EXTRA_CHARS=12000
 ```
 
 Rows are redacted and truncated before upload. The writer is best-effort and
 must not affect the customer-visible voice flow when Directus is slow or
 unavailable.
 
-## Tests and evals
-
-This project includes a complete suite of evals, based on the LiveKit Agents [testing & evaluation framework](https://docs.livekit.io/agents/start/testing/). To run them, use `pytest`.
+## Tests
 
 ```console
-uv run pytest
+uv run python -m pytest
 ```
-
-## Using this template repo for your own project
-
-Once you've started your own project based on this repo, you should:
-
-1. **Check in your `uv.lock`**: This file is currently untracked for the template, but you should commit it to your repository for reproducible builds and proper configuration management. (The same applies to `livekit.toml`, if you run your agents in LiveKit Cloud)
-
-2. **Remove the git tracking test**: Delete the "Check files not tracked in git" step from `.github/workflows/tests.yml` since you'll now want this file to be tracked. These are just there for development purposes in the template repo itself.
-
-3. **Add your own repository secrets**: You must [add secrets](https://docs.github.com/en/actions/how-tos/writing-workflows/choosing-what-your-workflow-does/using-secrets-in-github-actions) for `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` so that the tests can run in CI.
 
 ## Deploying to production
 
-This project is production-ready and includes a working `Dockerfile`. To deploy it to LiveKit Cloud or another environment, see the [deploying to production](https://docs.livekit.io/deploy/agents/) guide.
+This project includes a `Dockerfile` and `livekit.toml` for LiveKit Cloud.
+Before Cloud operations, read [`../../docs/cloud/README.md`](../../docs/cloud/README.md)
+and check current LiveKit docs with `lk docs`.
 
 ### Sync env to Cloud secrets
 
-Sync `.env.local` to LiveKit Cloud before deploy so bootstrap values and
-provider secrets are available to the worker. Provider/model/tuning settings
-are read from Directus, not from active env.
+Build the Cloud env from templates and ignored Cloud secrets, sync it, then
+deploy. Provider/model/tuning settings are read from Directus, not from active
+env.
 
 ```console
 cd agents/main-bot
-uv run python scripts/sync_cloud_secrets.py --env-file .env.local
+uv run python scripts/build_env.py --profile cloud --secrets env/cloud.secrets.env --output .env.cloud.local
+uv run python scripts/sync_cloud_secrets.py --env-file .env.cloud.local
 lk agent deploy
 ```
 
-The sync command updates secrets as a full set (`--overwrite`) to keep Cloud env equal to your local env file.
-It syncs all non-empty keys from `.env.local` automatically (except `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`).
+The sync helper updates provided keys additively by default. It syncs all
+non-empty keys from the env file except `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and
+`LIVEKIT_API_SECRET`, which LiveKit Cloud injects for the deployed worker. Use
+`--overwrite` only for an intentional full replacement after confirming the env
+file contains every required secret.
 
 ## Self-hosted LiveKit
 
-You can also self-host LiveKit instead of using LiveKit Cloud. See the [self-hosting](https://docs.livekit.io/transport/self-hosting/local/) guide for more information. If you choose to self-host, you'll need to also use [model plugins](https://docs.livekit.io/agents/models/#plugins) instead of LiveKit Inference and will need to remove the [LiveKit Cloud noise cancellation](https://docs.livekit.io/transport/media/noise-cancellation/) plugin.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+The self-hosted Asterisk/local LiveKit path is documented in
+[`../../docs/local-livekit-server.md`](../../docs/local-livekit-server.md).

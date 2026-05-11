@@ -18,6 +18,7 @@ from config import (
     CALL_RECORDING_S3_FORCE_PATH_STYLE,
     CALL_RECORDING_S3_REGION,
     CALL_RECORDING_S3_SECRET_KEY,
+    CALL_RECORDING_STOP_TIMEOUT_SEC,
     DIRECTUS_REQUEST_TIMEOUT_SEC,
     DIRECTUS_TOKEN,
     DIRECTUS_URL,
@@ -196,11 +197,19 @@ def _file_result_object_key(file_info: Any, fallback: str) -> str:
     )
 
 
+def _egress_file_info(info: api.EgressInfo) -> Any | None:
+    file_results = getattr(info, "file_results", None)
+    if file_results:
+        return file_results[0]
+    file_info = getattr(info, "file", None)
+    return file_info or None
+
+
 def recording_payload_from_egress(
     handle: RecordingHandle,
     info: api.EgressInfo,
 ) -> dict[str, Any]:
-    file_info = info.file_results[0] if info.file_results else None
+    file_info = _egress_file_info(info)
     object_key = (
         _file_result_object_key(file_info, handle.object_key)
         if file_info
@@ -312,6 +321,24 @@ async def _list_egress(egress_id: str) -> api.EgressInfo | None:
     finally:
         await lk.aclose()
     return response.items[0] if response.items else None
+
+
+async def stop_room_recording(handle: RecordingHandle | None) -> api.EgressInfo | None:
+    if not handle:
+        return None
+
+    lk = api.LiveKitAPI(
+        url=LIVEKIT_URL,
+        api_key=LIVEKIT_API_KEY,
+        api_secret=LIVEKIT_API_SECRET,
+    )
+    try:
+        return await asyncio.wait_for(
+            lk.egress.stop_egress(api.StopEgressRequest(egress_id=handle.egress_id)),
+            timeout=max(CALL_RECORDING_STOP_TIMEOUT_SEC, 0.5),
+        )
+    finally:
+        await lk.aclose()
 
 
 async def finalize_room_recording(handle: RecordingHandle | None) -> None:

@@ -15,6 +15,12 @@ env file.
 Use `common.env.example` for settings that should normally stay the same across
 all three profiles. Use the profile files only for deployment identity,
 networking, dispatch, local/cloud behavior, and measured provider routing.
+Each profile file must also set `ROBOT_RUNTIME_PROFILE` so Directus settings
+resolve through the intended runtime: `mac`, `base`, or `asterisk`.
+
+Cloud SIP dispatch currently targets agent name `main-bot`. Do not change the
+Cloud `AGENT_NAME` template without updating the matching LiveKit SIP dispatch
+rule at the same time.
 
 Secrets are not stored here. Put real values in ignored local files such as:
 
