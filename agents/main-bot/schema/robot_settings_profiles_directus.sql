@@ -408,7 +408,7 @@ insert into public.robot_provider_profiles (
         'Google Gemini default',
         'Draft non-secret Gemini profile for primary or fallback LLM use.',
         'draft',
-        '{"model":"gemini-3-flash-preview","fallback_model":"gemini-3.1-flash-lite-preview","temperature":0.7,"max_output_tokens":512,"top_p":1,"thinking_level":"minimal"}'::jsonb
+        '{"model":"gemini-3-flash-preview","fallback_model":"gemini-3.1-flash-lite","temperature":0.7,"max_output_tokens":512,"top_p":1,"thinking_level":"minimal"}'::jsonb
     ),
     (
         'tts_elevenlabs_v3_default',

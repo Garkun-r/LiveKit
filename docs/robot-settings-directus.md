@@ -1,5 +1,9 @@
 # Directus-настройки LiveKit-робота
 
+Операционный порядок изменения профилей описан в
+[`docs/profile-management.md`](profile-management.md). Этот файл описывает модель
+Directus-настроек и исторический контекст.
+
 Эта схема делает Directus основным источником настроек LLM/TTS/STT/Turn для
 рабочего звонка. `.env.local` остается bootstrap-слоем: подключение к LiveKit,
 доступ к Directus, секреты провайдеров, egress, n8n, incident logging и
@@ -130,6 +134,8 @@ LLM fallback теперь принадлежит LLM-профилю:
 
 - `fallback_provider`;
 - `fallback_model`;
+- `fallback_location` для Vertex backup;
+- `fallback_egress` для direct/proxy маршрута backup;
 - `use_livekit_fallback_adapter`;
 - `attempt_timeout_sec`;
 - `max_retry_per_llm`;

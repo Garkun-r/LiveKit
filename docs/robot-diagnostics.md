@@ -228,6 +228,16 @@ configured STT/TTS provider не был использован на старте
 : запуск, остановка или финализация LiveKit Egress-записи упала. Это не должно
   блокировать realtime call path, но должно быть видно в incident log.
 
+`egress_finalize_lag`
+: LiveKit Egress-запись все еще находится в starting/active/ending после
+  локального окна финализации. Это не блокирует экспорт сессии, но требует
+  последующей сверки статуса записи.
+
+`voice_prompt_after_disconnect`
+: фонная подсказка (`response_delay` или `client_silence`) попыталась стартовать
+  после отключения связанного SIP/клиентского участника и была заблокирована до
+  синтеза или проигрывания.
+
 Дополнительно в существующий n8n session payload добавлены
 `component_metrics_events`. Это per-plugin `metrics_collected`, а не новая
 логика на deprecated session-level metrics.

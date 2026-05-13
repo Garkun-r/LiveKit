@@ -1,3 +1,5 @@
+# ruff: noqa: RUF001
+
 import base64
 
 import pytest
@@ -223,3 +225,48 @@ def test_build_tts_uses_tbank_provider(monkeypatch) -> None:
     assert captured["pitch"] == 0.8
     assert captured["endpoint"] == "api.tinkoff.ai:443"
     assert captured["authority"] == ""
+
+
+def test_build_tts_tbank_uses_profile_config(monkeypatch) -> None:
+    captured = {}
+
+    class _FakeTBankTTS:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(agent, "TTS_PROVIDER", "elevenlabs")
+    monkeypatch.setattr(agent, "TBANK_VOICEKIT_API_KEY", "test-key")
+    monkeypatch.setattr(agent, "TBANK_VOICEKIT_SECRET_KEY", "test-secret")
+    monkeypatch.setattr(agent, "TBankVoiceKitTTS", _FakeTBankTTS)
+
+    profile = agent.ComponentSelection(
+        category="tts",
+        slot="primary",
+        profile_key="tts_tbank_profile",
+        kind="tts",
+        provider="tbank",
+        config={
+            "voice_name": "profile-voice",
+            "format": "linear16",
+            "sample_rate": 22050,
+            "speaking_rate": 1.15,
+            "pitch": 0.2,
+            "endpoint": "profile.tbank.example:443",
+            "authority": "profile-authority",
+            "min_sentence_len": 5,
+            "stream_context_len": 3,
+        },
+        source_owner_type="runtime",
+        source_owner_key="base",
+    )
+
+    result = agent.build_tts(tts_profile=profile)
+
+    assert isinstance(result, _FakeTBankTTS)
+    assert captured["voice_name"] == "profile-voice"
+    assert captured["sample_rate"] == 22050
+    assert captured["speaking_rate"] == 1.15
+    assert captured["pitch"] == 0.2
+    assert captured["endpoint"] == "profile.tbank.example:443"
+    assert captured["authority"] == "profile-authority"
+    assert agent.resolve_audio_output_sample_rate(profile) == 22050

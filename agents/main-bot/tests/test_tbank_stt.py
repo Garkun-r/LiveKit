@@ -94,7 +94,9 @@ def test_tbank_grpc_channel_options_use_authority_override() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tbank_stream_sends_bearer_metadata_config_first_and_50ms_chunks() -> None:
+async def test_tbank_stream_sends_bearer_metadata_config_first_and_50ms_chunks() -> (
+    None
+):
     stt_client, seen_requests, seen_metadata = _stt_with_responses([])
     frame = rtc.AudioFrame(
         data=bytes(1600 * 2),
@@ -201,4 +203,52 @@ def test_build_stt_uses_tbank_provider(monkeypatch) -> None:
         "interim_interval_sec": 0.1,
         "endpoint": "api.tinkoff.ai:443",
         "authority": "",
+    }
+
+
+def test_build_stt_tbank_uses_profile_config(monkeypatch) -> None:
+    captured = {}
+
+    class _FakeTBankSTT:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(agent, "STT_PROVIDER", "deepgram")
+    monkeypatch.setattr(agent, "TBANK_VOICEKIT_API_KEY", "test-key")
+    monkeypatch.setattr(agent, "TBANK_VOICEKIT_SECRET_KEY", "test-secret")
+    monkeypatch.setattr(agent, "STT_EARLY_INTERIM_FINAL_ENABLED", False)
+    monkeypatch.setattr(agent, "TBankVoiceKitSTT", _FakeTBankSTT)
+
+    profile = agent.ComponentSelection(
+        category="stt",
+        slot="primary",
+        profile_key="stt_tbank_profile",
+        kind="stt",
+        provider="tbank",
+        config={
+            "model": "profile-model",
+            "language": "ru-RU",
+            "sample_rate": 8000,
+            "chunk_ms": 40,
+            "interim_interval_sec": 0.2,
+            "endpoint": "profile.tbank.example:443",
+            "authority": "profile-authority",
+        },
+        source_owner_type="runtime",
+        source_owner_key="base",
+    )
+
+    result = agent.build_stt(stt_profile=profile)
+
+    assert isinstance(result, _FakeTBankSTT)
+    assert captured == {
+        "api_key": "test-key",
+        "secret_key": "test-secret",
+        "model": "profile-model",
+        "language": "ru-RU",
+        "sample_rate": 8000,
+        "chunk_ms": 40,
+        "interim_interval_sec": 0.2,
+        "endpoint": "profile.tbank.example:443",
+        "authority": "profile-authority",
     }

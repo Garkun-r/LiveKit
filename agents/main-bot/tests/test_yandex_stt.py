@@ -78,7 +78,9 @@ def test_build_yandex_streaming_options_uses_low_latency_defaults() -> None:
     assert model.model == "general"
     assert model.audio_processing_type == yandex_pb.RecognitionModelOptions.REAL_TIME
     assert model.audio_format.WhichOneof("AudioFormat") == "raw_audio"
-    assert model.audio_format.raw_audio.audio_encoding == yandex_pb.RawAudio.LINEAR16_PCM
+    assert (
+        model.audio_format.raw_audio.audio_encoding == yandex_pb.RawAudio.LINEAR16_PCM
+    )
     assert model.audio_format.raw_audio.sample_rate_hertz == 16000
     assert model.audio_format.raw_audio.audio_channel_count == 1
     assert model.language_restriction.restriction_type == (
@@ -89,8 +91,7 @@ def test_build_yandex_streaming_options_uses_low_latency_defaults() -> None:
         yandex_pb.DefaultEouClassifier.HIGH
     )
     assert (
-        options.eou_classifier.default_classifier.max_pause_between_words_hint_ms
-        == 500
+        options.eou_classifier.default_classifier.max_pause_between_words_hint_ms == 500
     )
 
 
@@ -103,8 +104,7 @@ def test_build_yandex_streaming_options_clamps_pause_hint_to_yandex_minimum() ->
     )
 
     assert (
-        options.eou_classifier.default_classifier.max_pause_between_words_hint_ms
-        == 500
+        options.eou_classifier.default_classifier.max_pause_between_words_hint_ms == 500
     )
 
 
@@ -180,9 +180,7 @@ async def test_yandex_stream_ignores_empty_status_and_final_refinement() -> None
             final_refinement=yandex_pb.FinalRefinement(
                 final_index=1,
                 normalized_text=yandex_pb.AlternativeUpdate(
-                    alternatives=[
-                        yandex_pb.Alternative(text="нормализованный текст")
-                    ]
+                    alternatives=[yandex_pb.Alternative(text="нормализованный текст")]
                 ),
             ),
         ),
@@ -244,6 +242,50 @@ def test_build_stt_uses_yandex_provider(monkeypatch) -> None:
         "chunk_ms": 50,
         "eou_sensitivity": "high",
         "max_pause_between_words_hint_ms": 500,
+    }
+
+
+def test_build_stt_yandex_uses_profile_config(monkeypatch) -> None:
+    captured = {}
+
+    class _FakeYandexSTT:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(agent, "STT_PROVIDER", "deepgram")
+    monkeypatch.setattr(agent, "YANDEX_SPEECHKIT_API_KEY", "test-key")
+    monkeypatch.setattr(agent, "STT_EARLY_INTERIM_FINAL_ENABLED", False)
+    monkeypatch.setattr(agent, "YandexSpeechKitSTT", _FakeYandexSTT)
+
+    profile = agent.ComponentSelection(
+        category="stt",
+        slot="primary",
+        profile_key="stt_yandex_profile",
+        kind="stt",
+        provider="yandex",
+        config={
+            "model": "profile-model",
+            "language": "ru-RU",
+            "sample_rate": 8000,
+            "chunk_ms": 40,
+            "eou_sensitivity": "default",
+            "max_pause_between_words_hint_ms": 700,
+        },
+        source_owner_type="runtime",
+        source_owner_key="base",
+    )
+
+    result = agent.build_stt(stt_profile=profile)
+
+    assert isinstance(result, _FakeYandexSTT)
+    assert captured == {
+        "api_key": "test-key",
+        "model": "profile-model",
+        "language": "ru-RU",
+        "sample_rate": 8000,
+        "chunk_ms": 40,
+        "eou_sensitivity": "default",
+        "max_pause_between_words_hint_ms": 700,
     }
 
 

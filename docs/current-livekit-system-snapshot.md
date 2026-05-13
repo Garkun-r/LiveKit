@@ -1,6 +1,6 @@
 # Слепок текущей LiveKit-системы
 
-Дата слепка: 2026-05-11.
+Дата слепка: 2026-05-12.
 
 Этот документ можно целиком отправить сотруднику или загрузить в нейросеть как
 контекст для обсуждения текущей архитектуры. Он описывает фактическую систему
@@ -167,7 +167,7 @@ runtime=base
   llm.primary        -> llm_gemini
   llm_routing.fast  -> llm_xai
   llm_routing.complex -> llm_gemini
-  stt.primary        -> stt_deepgram_flux_multilingual_direct
+  stt.primary        -> stt_deepgram_ru_phone
   tts.primary        -> tts_elevenlabs_v3
   turn.selected      -> turn_fast_phone
 
@@ -185,7 +185,7 @@ Important profile values from snapshot:
 llm_gemini
   provider: google
   model: gemini-3-flash-preview
-  fallback: google / gemini-3.1-flash-lite-preview
+  fallback: google / gemini-3.1-flash-lite
   use_livekit_fallback_adapter: true
   attempt_timeout_sec: 2.5
 
@@ -193,16 +193,14 @@ llm_xai
   provider: xai
   model: grok-4-1-fast-non-reasoning-latest
   tools disabled
-  fallback: google / gemini-3.1-flash-lite-preview
+  fallback: google / gemini-3.1-flash-lite
   use_livekit_fallback_adapter: true
 
-stt_deepgram_flux_multilingual_direct
+stt_deepgram_ru_phone
   provider: deepgram
-  model: flux-general-multi
+  model: nova-3
   language: ru
-  api_version: v2
-  eot_threshold: 0.7
-  eot_timeout_ms: 5000
+  endpointing_ms: 90
 
 stt_yandex_ru
   provider: yandex
@@ -366,9 +364,11 @@ Current behavior:
   reset the sequence, while interim STT defers the prompt;
 - unrecoverable errors attempt emergency audio/phrase and may end the call.
 
-Short first user greetings like "алло", "здравствуйте", "добрый день" are
-recognized and can trigger prerecorded/cache follow-up audio instead of a full
-LLM response.
+Short first user greetings like "алло", "здравствуйте", "доброе утро", and
+"добрый день" are recognized and can trigger prerecorded/cache follow-up audio
+instead of a full LLM response. The follow-up waits for
+`VOICE_SHORT_GREETING_DELAY_SEC` and is canceled if the caller resumes speaking
+during that window.
 
 ## Hidden Tags And Skills
 
@@ -562,7 +562,7 @@ Use this map for common work:
 ```text
 Change voice/LLM/STT/TTS choice for runtime/client
   -> Directus profiles/bindings first
-  -> then update snapshot if cold-start fallback must match
+  -> then export snapshot and compare it with Directus
 
 Add provider tuning field
   -> Directus field catalog/schema if needed

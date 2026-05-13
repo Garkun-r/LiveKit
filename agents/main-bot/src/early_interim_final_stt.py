@@ -21,6 +21,7 @@ from livekit.agents.utils import AudioBuffer
 logger = logging.getLogger("early_interim_final_stt")
 
 _WHITESPACE_RE = re.compile(r"\s+")
+_TRAILING_PUNCTUATION_RE = re.compile(r"[\s.,!?;:…]+$")
 
 
 class EarlyInterimFinalSTT(stt.STT):
@@ -198,9 +199,11 @@ class EarlyInterimFinalStream(stt.SpeechStream):
 
         if ev.type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
             async with self._state_lock:
-                if self._final_seen or self._synthetic_committed:
+                if self._synthetic_committed:
                     self._log_late_interim_locked(ev)
                     return
+                if self._final_seen:
+                    self._reset_after_provider_final_for_interim_locked(ev)
                 if self._speech_ended and self._pending_eos is None:
                     self._reset_segment_locked()
                 if _event_text(ev):
@@ -341,10 +344,12 @@ class EarlyInterimFinalStream(stt.SpeechStream):
                 self._pending_eos_due = True
                 emitted = self._emit_synthetic_final_and_pending_eos_locked()
                 if not emitted and self._pending_eos is not None:
-                    logger.debug(
-                        "STT EOS early interim final waiting for provider final or stable interim",
+                    logger.info(
+                        "early interim final skipped",
                         extra={
                             "delay_sec": self._delay_sec,
+                            "source": "stt_eos",
+                            "reason": self._synthetic_skip_reason_locked(),
                             "min_stable_interims": self._min_stable_interims,
                             "has_interim": self._last_interim is not None,
                             "interim_stable_count": self._last_interim_stable_count,
@@ -367,10 +372,12 @@ class EarlyInterimFinalStream(stt.SpeechStream):
                 self._local_eos_due = True
                 emitted = self._emit_synthetic_final_locked(source="local_vad")
                 if not emitted:
-                    logger.debug(
-                        "local VAD early interim final waiting for next interim",
+                    logger.info(
+                        "early interim final skipped",
                         extra={
                             "delay_sec": self._delay_sec,
+                            "source": "local_vad",
+                            "reason": self._synthetic_skip_reason_locked(),
                             "min_stable_interims": self._min_stable_interims,
                             "ended_at": ended_at,
                             "has_interim": self._last_interim is not None,
@@ -510,6 +517,30 @@ class EarlyInterimFinalStream(stt.SpeechStream):
         self._last_interim = ev
         self._last_interim_normalized_text = normalized_text
 
+    def _synthetic_skip_reason_locked(self) -> str:
+        if self._synthetic_committed:
+            return "synthetic_already_committed"
+        if self._final_seen:
+            return "provider_final_already_seen"
+        if self._last_interim is None:
+            return "no_interim"
+        if not _event_text(self._last_interim):
+            return "empty_interim"
+        if self._last_interim_stable_count < self._min_stable_interims:
+            return "interim_not_stable"
+        return "unknown"
+
+    def _reset_after_provider_final_for_interim_locked(self, ev: stt.SpeechEvent) -> None:
+        text = _event_text(ev)
+        logger.info(
+            "interim after provider final started new STT segment",
+            extra={
+                "request_id": ev.request_id,
+                "characters_count": len(text),
+            },
+        )
+        self._reset_segment_locked()
+
     def _reset_segment_locked(self) -> None:
         self._pending_eos = None
         self._pending_eos_deadline = None
@@ -631,7 +662,8 @@ def _event_text(ev: stt.SpeechEvent) -> str:
 
 
 def _normalize_text(text: str) -> str:
-    return _WHITESPACE_RE.sub(" ", text.strip().lower())
+    normalized = _WHITESPACE_RE.sub(" ", text.strip().lower())
+    return _TRAILING_PUNCTUATION_RE.sub("", normalized)
 
 
 def _texts_equivalent(left: str, right: str) -> bool:

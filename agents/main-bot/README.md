@@ -121,8 +121,10 @@ project by DID -> runtime by ROBOT_RUNTIME_PROFILE -> base
 Directus is cached in memory by `ROBOT_SETTINGS_CACHE_TTL_SEC`. If Directus is
 unavailable, the agent uses the last cache, then
 `config/robot_settings_snapshot.json` on cold start. See
+[`../../docs/profile-management.md`](../../docs/profile-management.md) for the
+operating workflow and
 [`../../docs/robot-settings-directus.md`](../../docs/robot-settings-directus.md)
-for the full model and migration rules.
+for the storage model and migration rules.
 
 ## Provider egress routing
 
@@ -187,7 +189,8 @@ not active env variables.
 LLM profiles currently support:
 
 1. `provider=google` - direct Gemini API path.
-2. `provider=xai` - xAI Grok via `livekit.plugins.xai.responses.LLM`.
+2. `provider=google_vertex` - Gemini through Vertex AI.
+3. `provider=xai` - xAI Grok via `livekit.plugins.xai.responses.LLM`.
 
 LLM fallback also lives in each LLM profile: `fallback_provider`,
 `fallback_model`, `use_livekit_fallback_adapter`, timeout, retry, and chunk

@@ -180,9 +180,8 @@ Requirements:
 
 ## STT fallback
 
-- Primary STT is selected by Directus profile. In the local snapshot, `base`
-  uses Deepgram Flux (`flux-general-multi`) and `asterisk` uses Yandex
-  SpeechKit.
+- Primary STT is selected by Directus profile. In the current local snapshot,
+  `base` uses Deepgram Nova (`nova-3`) and `asterisk` uses Yandex SpeechKit.
 - Code supports STT fallback chains for `provider=inference` and
   `provider=google`: inference can add Google STT and an optional second
   inference model; Google can fall back to inference STT.

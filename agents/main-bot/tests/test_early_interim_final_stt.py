@@ -392,6 +392,35 @@ async def test_local_vad_creates_synthetic_after_stable_interim_repeats() -> Non
 
 
 @pytest.mark.asyncio
+async def test_terminal_punctuation_changes_do_not_break_interim_stability() -> None:
+    wrapped = EarlyInterimFinalSTT(
+        _ScriptedSTT(
+            [
+                (0, _event(stt.SpeechEventType.START_OF_SPEECH)),
+                (0, _event(stt.SpeechEventType.INTERIM_TRANSCRIPT, "Алло,")),
+                (0.05, _event(stt.SpeechEventType.INTERIM_TRANSCRIPT, "Алло.")),
+                (0.05, _event(stt.SpeechEventType.RECOGNITION_USAGE)),
+            ]
+        ),
+        delay_sec=0.01,
+        min_stable_interims=2,
+    )
+
+    events = await _collect_events_with_local_vad_notify(
+        wrapped,
+        notify_after_sec=0.001,
+    )
+
+    assert [event.type for event in events[:4]] == [
+        stt.SpeechEventType.START_OF_SPEECH,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+    ]
+    assert events[3].alternatives[0].text == "Алло."
+
+
+@pytest.mark.asyncio
 async def test_unstable_interim_after_stt_eos_waits_for_provider_final() -> None:
     wrapped = EarlyInterimFinalSTT(
         _ScriptedSTT(
@@ -500,6 +529,33 @@ async def test_late_interim_after_synthetic_is_suppressed() -> None:
         stt.SpeechEventType.INTERIM_TRANSCRIPT,
         stt.SpeechEventType.FINAL_TRANSCRIPT,
     ]
+
+
+@pytest.mark.asyncio
+async def test_interim_after_provider_final_starts_new_segment() -> None:
+    wrapped = EarlyInterimFinalSTT(
+        _ScriptedSTT(
+            [
+                (0, _event(stt.SpeechEventType.START_OF_SPEECH)),
+                (0, _event(stt.SpeechEventType.INTERIM_TRANSCRIPT, "первая часть")),
+                (0, _event(stt.SpeechEventType.FINAL_TRANSCRIPT, "первая часть")),
+                (0.01, _event(stt.SpeechEventType.INTERIM_TRANSCRIPT, "вторая часть")),
+                (0, _event(stt.SpeechEventType.FINAL_TRANSCRIPT, "вторая часть")),
+            ]
+        ),
+        delay_sec=0.01,
+    )
+
+    events = await _collect_events(wrapped)
+
+    assert [event.type for event in events] == [
+        stt.SpeechEventType.START_OF_SPEECH,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+    ]
+    assert events[3].alternatives[0].text == "вторая часть"
 
 
 @pytest.mark.asyncio

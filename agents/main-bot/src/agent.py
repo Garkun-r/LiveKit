@@ -66,6 +66,8 @@ from config import (
     AGENT_NAME,
     AGENT_NUM_IDLE_PROCESSES,
     AUDIO_INPUT_ENHANCEMENT,
+    CALL_RECORDING_FINALIZE_TIMEOUT_SEC,
+    CALL_RECORDING_STOP_TIMEOUT_SEC,
     COMPLEX_LLM_BACKUP_MODEL,
     COMPLEX_LLM_BACKUP_PROVIDER,
     COMPLEX_LLM_PROVIDER,
@@ -244,6 +246,7 @@ from config import (
     VOICE_RESPONSE_DELAY_PHRASE,
     VOICE_RESPONSE_DELAY_POST_GAP_SEC,
     VOICE_RESPONSE_DELAY_SEC,
+    VOICE_SHORT_GREETING_DELAY_SEC,
     VOICE_SHORT_GREETING_PHRASE,
     VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
     VOICE_STARTUP_NO_DIALOG_TIMEOUT_SEC,
@@ -278,6 +281,7 @@ from raw_call_logs import (
     reset_raw_call_log_sink,
 )
 from recording_export import (
+    ACTIVE_EGRESS_STATUSES,
     finalize_room_recording,
     start_room_recording,
     stop_room_recording,
@@ -339,9 +343,10 @@ _SIP_CALL_ID_ATTRIBUTE_KEYS = (
 )
 _WHITESPACE_RE = re.compile(r"\s+")
 _SHORT_GREETING_RE = re.compile(
-    r"^(?:алло|алло алло|ало|ало ало|алё|алё алё|але|але але|доброе утро|алло доброе утро|ало доброе утро|алё доброе утро|добрый день|алло добрый день|ало добрый день|алё добрый день|здравствуйте|да здравствуйте|алло здравствуйте|ало здравствуйте|алё здравствуйте|девушка здравствуйте|алло девушка здравствуйте|здрасьте|алло здрасьте|ало здрасьте|алё здрасьте|девушка здрасьте|алло девушка здрасьте)[\.!\?, ]*$",
+    r"^(?:алло|алло алло|ало|ало ало|алё|алё алё|але|але але|доброе утро|алло доброе утро|ало доброе утро|алё доброе утро|добрый день|алло добрый день|ало добрый день|алё добрый день|здравствуйте|да[,\s]+здравствуйте|да[,\s]+да[,\s]+здравствуйте|алло здравствуйте|ало здравствуйте|алё здравствуйте|девушка здравствуйте|алло девушка здравствуйте|здрасьте|здрасте|да[,\s]+(?:здрасьте|здрасте)|да[,\s]+да[,\s]+(?:здрасьте|здрасте)|алло здрасьте|ало здрасьте|алё здрасьте|девушка здрасьте|алло девушка здрасьте)[\.!\?, ]*$",
     re.IGNORECASE,
 )
+
 
 @dataclass(frozen=True)
 class LLMBranchMetadata:
@@ -555,6 +560,14 @@ def state_value(state: Any) -> Any:
     return getattr(state, "value", state)
 
 
+def disconnect_reason_name(reason: Any) -> str | None:
+    if reason is None:
+        return None
+    with suppress(Exception):
+        return rtc.DisconnectReason.Name(reason)
+    return str(reason)
+
+
 def should_play_initial_greeting(
     *,
     close_event_set: bool,
@@ -565,6 +578,21 @@ def should_play_initial_greeting(
 async def wait_for_initial_greeting_delay(delay_sec: float) -> None:
     if delay_sec > 0:
         await asyncio.sleep(delay_sec)
+
+
+async def wait_for_short_greeting_delay(delay_sec: float) -> None:
+    if delay_sec > 0:
+        await asyncio.sleep(delay_sec)
+
+
+def clear_initial_greeting_user_turn(session: AgentSession) -> bool:
+    try:
+        session.clear_user_turn()
+    except Exception as e:
+        logger.warning("failed to clear user turn after initial greeting: %s", e)
+        return False
+    logger.info("user turn buffer cleared after initial greeting")
+    return True
 
 
 def extract_sip_call_numbers(participant: Any | None) -> dict[str, str | None]:
@@ -638,7 +666,9 @@ def get_job_id(ctx: JobContext) -> str | None:
     return None
 
 
-def event_timestamp_seconds(event: Any, *, default: float | None = None) -> float | None:
+def event_timestamp_seconds(
+    event: Any, *, default: float | None = None
+) -> float | None:
     created_at = getattr(event, "created_at", None)
     if isinstance(created_at, datetime):
         return created_at.timestamp()
@@ -709,6 +739,11 @@ def is_abnormal_close(reason: str | None, error: str | None) -> bool:
         marker in normalized
         for marker in ("error", "failed", "cancelled", "timeout", "abnormal")
     )
+
+
+def should_stop_recording_on_close(reason: str | None) -> bool:
+    normalized = (reason or "").lower()
+    return "participant_disconnected" in normalized
 
 
 def should_fire_startup_no_dialog_timeout(
@@ -854,6 +889,18 @@ def should_start_response_delay_after_vad(
     return has_final_transcript and user_stopped_speaking and not already_started
 
 
+def should_cancel_pending_reply_for_user_speech(
+    *,
+    stream_user_speech_revision: int,
+    current_user_speech_revision: int,
+    user_is_speaking: bool,
+) -> bool:
+    return (
+        user_is_speaking
+        or current_user_speech_revision > stream_user_speech_revision
+    )
+
+
 def should_log_slow_response_latency(
     latency_ms: int | float | None,
     threshold_ms: int,
@@ -873,7 +920,9 @@ def resolve_audio_output_sample_rate(
     if provider == "cosyvoice":
         return _config_int(profile_config, "sample_rate", COSYVOICE_TTS_SAMPLE_RATE)
     if provider == "tbank":
-        return TTS_TBANK_SAMPLE_RATE
+        return _config_int(profile_config, "sample_rate", TTS_TBANK_SAMPLE_RATE)
+    if provider == "sber":
+        return _config_int(profile_config, "sample_rate", SBER_TTS_SAMPLE_RATE)
     return 24000
 
 
@@ -1078,6 +1127,8 @@ class VoicePromptManager:
         is_closed: Callable[[], bool],
         is_end_call_scheduled: Callable[[], bool],
         on_client_silence_timeout: Callable[[], Awaitable[None]],
+        is_client_disconnected: Callable[[], bool],
+        client_disconnect_info: Callable[[], dict[str, Any]],
         speech_playout_timeout_sec: float = VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
         incident_log: IncidentLogger | None = None,
     ) -> None:
@@ -1096,6 +1147,8 @@ class VoicePromptManager:
         self._incident_log = incident_log
         self._is_closed = is_closed
         self._is_end_call_scheduled = is_end_call_scheduled
+        self._is_client_disconnected = is_client_disconnected
+        self._client_disconnect_info = client_disconnect_info
         self._on_client_silence_timeout = on_client_silence_timeout
 
         self._response_delay_task: asyncio.Task | None = None
@@ -1110,11 +1163,13 @@ class VoicePromptManager:
         self._client_silence_deadline_at: float | None = None
         self._user_is_speaking = False
         self._last_response_delay_finished_at: float | None = None
+        self._prompt_after_disconnect_logged: set[tuple[str, str]] = set()
 
     def start_response_delay_timer(self) -> None:
         if (
             self._response_delay_sec <= 0
             or self._is_closed()
+            or self._is_client_disconnected()
             or self._response_delay_played
         ):
             return
@@ -1128,6 +1183,7 @@ class VoicePromptManager:
         if (
             self._client_silence_sec <= 0
             or self._is_closed()
+            or self._is_client_disconnected()
             or self._is_end_call_scheduled()
             or not self._waiting_for_client_response
         ):
@@ -1188,7 +1244,9 @@ class VoicePromptManager:
             self._client_silence_deadline_at = None
             return
         if self._waiting_for_client_response:
-            self._client_silence_deadline_at = time.monotonic() + self._client_silence_sec
+            self._client_silence_deadline_at = (
+                time.monotonic() + self._client_silence_sec
+            )
             self.start_client_silence_timer()
 
     def on_agent_started_speaking(self) -> None:
@@ -1205,6 +1263,8 @@ class VoicePromptManager:
             self._client_silence_prompt_count = 0
 
     def on_agent_finished_speaking(self) -> None:
+        if self._is_client_disconnected():
+            return
         self._client_silence_prompt_count = 0
         self._waiting_for_client_response = True
         self._client_silence_deadline_at = (
@@ -1212,6 +1272,17 @@ class VoicePromptManager:
         )
         self._user_is_speaking = False
         self.start_client_silence_timer()
+
+    def on_client_disconnected(self) -> None:
+        self.cancel_response_delay_timer()
+        self.cancel_client_silence_timer()
+        self._waiting_for_client_response = False
+        self._client_silence_deadline_at = None
+        self._user_is_speaking = False
+        self._stop_active_prompt_task = asyncio.create_task(
+            self.stop_active_prompt(),
+            name="voice_prompt_stop_on_client_disconnect",
+        )
 
     async def wait_for_active_prompt(self) -> None:
         kind, handle = await self._wait_for_reserved_prompt_handle()
@@ -1261,6 +1332,11 @@ class VoicePromptManager:
             await asyncio.sleep(self._response_delay_sec)
             if self._is_closed() or self._response_delay_played:
                 return
+            if self._voice_prompt_blocked_after_disconnect(
+                self._response_delay_prompt.kind,
+                phase="timer_elapsed",
+            ):
+                return
             if self._session.agent_state == "speaking":
                 return
             played = await self._play_background_prompt(self._response_delay_prompt)
@@ -1279,6 +1355,11 @@ class VoicePromptManager:
                 self._client_silence_deadline_at = deadline_at
             await asyncio.sleep(max(0.0, deadline_at - time.monotonic()))
             if self._is_closed() or self._is_end_call_scheduled():
+                return
+            if self._voice_prompt_blocked_after_disconnect(
+                self._client_silence_prompt.kind,
+                phase="timer_elapsed",
+            ):
                 return
             if not self._waiting_for_client_response or self._user_is_speaking:
                 return
@@ -1312,7 +1393,9 @@ class VoicePromptManager:
                     },
                 )
             self._waiting_for_client_response = True
-            self._client_silence_deadline_at = time.monotonic() + self._client_silence_sec
+            self._client_silence_deadline_at = (
+                time.monotonic() + self._client_silence_sec
+            )
             self._schedule_client_silence_timer()
         except asyncio.CancelledError:
             return
@@ -1320,8 +1403,18 @@ class VoicePromptManager:
             logger.exception("client silence voice prompt failed: %s", e)
 
     async def _play_background_prompt(self, prompt: VoicePromptSpec) -> bool:
+        if self._voice_prompt_blocked_after_disconnect(
+            prompt.kind,
+            phase="before_resolve_audio",
+        ):
+            return False
         audio_path = await self._resolve_audio_path(prompt)
         if audio_path is None:
+            return False
+        if self._voice_prompt_blocked_after_disconnect(
+            prompt.kind,
+            phase="before_playback",
+        ):
             return False
         if prompt.kind == "response_delay" and self._session.agent_state == "speaking":
             return False
@@ -1355,7 +1448,9 @@ class VoicePromptManager:
             if not played:
                 return False
             if prompt.kind == "response_delay":
-                self._last_response_delay_finished_at = asyncio.get_running_loop().time()
+                self._last_response_delay_finished_at = (
+                    asyncio.get_running_loop().time()
+                )
             logger.info("voice prompt finished", extra={"kind": prompt.kind})
             return True
         except asyncio.CancelledError:
@@ -1441,6 +1536,39 @@ class VoicePromptManager:
             kind=prompt.kind,
             text=prompt.phrase,
             legacy_path=legacy_path,
+        )
+
+    def _voice_prompt_blocked_after_disconnect(self, kind: str, *, phase: str) -> bool:
+        if not self._is_client_disconnected():
+            return False
+        self.cancel_response_delay_timer()
+        self.cancel_client_silence_timer()
+        self._waiting_for_client_response = False
+        self._client_silence_deadline_at = None
+        self._record_voice_prompt_after_disconnect(kind, phase=phase)
+        return True
+
+    def _record_voice_prompt_after_disconnect(self, kind: str, *, phase: str) -> None:
+        if self._incident_log is None:
+            return
+        key = (kind, phase)
+        if key in self._prompt_after_disconnect_logged:
+            return
+        self._prompt_after_disconnect_logged.add(key)
+        disconnect_info = self._client_disconnect_info() or {}
+        self._incident_log.record_nowait(
+            "voice_prompt_after_disconnect",
+            severity="warning",
+            component="voice_pipeline",
+            description="Voice prompt was blocked after linked participant disconnect",
+            payload={
+                "prompt_kind": kind,
+                "phase": phase,
+                "prompt_time": datetime.now(timezone.utc).isoformat(),
+                "disconnect_time": disconnect_info.get("disconnect_time"),
+                "disconnect_reason": disconnect_info.get("disconnect_reason"),
+                "participant_identity": disconnect_info.get("participant_identity"),
+            },
         )
 
     @staticmethod
@@ -1795,6 +1923,14 @@ def _genai_http_options(
     return genai_types.HttpOptions(**options)
 
 
+def _load_google_cloud_credentials_for_vertex() -> tuple[Any, str | None]:
+    scope = ["https://www.googleapis.com/auth/cloud-platform"]
+    creds_file = _resolve_google_tts_credentials_file()
+    if creds_file:
+        return google_auth_load_credentials_from_file(creds_file, scopes=scope)
+    return google_auth_default(scopes=scope)
+
+
 def build_google_llm(
     model_name: str | None = None,
     llm_profile: ComponentSelection | None = None,
@@ -1857,6 +1993,86 @@ def build_google_llm(
     return llm
 
 
+def build_google_vertex_llm(
+    model_name: str | None = None,
+    llm_profile: ComponentSelection | None = None,
+) -> google.LLM:
+    profile_config = _component_config(llm_profile)
+    credentials, inferred_project = _load_google_cloud_credentials_for_vertex()
+    resolved_project = (
+        _config_optional_str(profile_config, "project")
+        or os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+        or (inferred_project or "")
+    ).strip()
+    if not resolved_project:
+        raise RuntimeError(
+            "Google Vertex project is not set. Configure project in the LLM profile, "
+            "GOOGLE_CLOUD_PROJECT, or Google service account credentials."
+        )
+
+    resolved_location = (
+        _config_optional_str(profile_config, "location")
+        or os.getenv("GOOGLE_CLOUD_LOCATION", "").strip()
+        or "global"
+    )
+    resolved_model = (
+        model_name or _config_optional_str(profile_config, "model") or GEMINI_MODEL
+    ).strip()
+    temperature = _config_float(profile_config, "temperature", GEMINI_TEMPERATURE)
+    max_output_tokens = _config_int(
+        profile_config,
+        "max_output_tokens",
+        GEMINI_MAX_OUTPUT_TOKENS,
+    )
+    top_p = _config_float(profile_config, "top_p", GEMINI_TOP_P)
+    thinking_level = _config_str(
+        profile_config,
+        "thinking_level",
+        GEMINI_THINKING_LEVEL,
+    )
+    egress_mode = _component_egress(llm_profile)
+    logger.info(
+        "using Google Vertex LLM provider",
+        extra={
+            "provider": "google_vertex",
+            "model": resolved_model,
+            "project": resolved_project,
+            "location": resolved_location,
+            "temperature": temperature,
+            "http_timeout_sec": max(GEMINI_HTTP_TIMEOUT_SEC, 10.0),
+            "egress": provider_egress("google_vertex_llm", mode_override=egress_mode),
+        },
+    )
+
+    http_options = _genai_http_options(
+        "google_vertex_llm",
+        timeout_ms=_gemini_http_timeout_ms(),
+        egress_mode=egress_mode,
+    )
+    llm = google.LLM(
+        model=resolved_model,
+        vertexai=True,
+        project=resolved_project,
+        location=resolved_location,
+        credentials=credentials,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        top_p=top_p,
+        thinking_config={"thinking_level": thinking_level},
+        http_options=http_options,
+    )
+    # LiveKit's Google LLM stores per-call http_options but constructs the
+    # GenAI client without them, so replace the client to preserve egress route.
+    llm._client = GenAIClient(
+        vertexai=True,
+        project=resolved_project,
+        location=resolved_location,
+        credentials=credentials,
+        http_options=http_options,
+    )
+    return llm
+
+
 def build_xai_llm(
     model_name: str | None = None,
     llm_profile: ComponentSelection | None = None,
@@ -1908,8 +2124,20 @@ def build_llm_for_provider(
     model_name: str | None = None,
     llm_profile: ComponentSelection | None = None,
 ) -> Any:
+    provider = provider.strip().lower()
     if provider == "google":
         return build_google_llm(model_name=model_name, llm_profile=llm_profile)
+    if provider in {
+        "google_vertex",
+        "google-vertex",
+        "gemini_vertex",
+        "vertex",
+        "vertexai",
+    }:
+        return build_google_vertex_llm(
+            model_name=model_name,
+            llm_profile=llm_profile,
+        )
     if provider == "xai":
         return build_xai_llm(model_name=model_name, llm_profile=llm_profile)
 
@@ -1929,6 +2157,8 @@ def _default_llm_model_for_provider(
         return configured
     if provider == "google":
         return GEMINI_MODEL
+    if provider == "google_vertex":
+        return GEMINI_MODEL
     if provider == "xai":
         return XAI_MODEL
     return ""
@@ -1945,7 +2175,9 @@ def _backup_config_for_branch(
     fallback_provider = _config_optional_str(profile_config, "fallback_provider")
     fallback_model = _config_optional_str(profile_config, "fallback_model")
     if fallback_model:
-        return fallback_provider or ("google" if primary_provider == "google" else ""), fallback_model
+        return fallback_provider or (
+            "google" if primary_provider == "google" else ""
+        ), fallback_model
 
     fallback_profile = robot_settings.fallback if robot_settings is not None else None
     fallback_config = _component_config(fallback_profile)
@@ -1977,6 +2209,59 @@ def _llm_identity(llm_client: Any) -> tuple[str, str]:
     return (
         str(getattr(llm_client, "provider", "unknown")),
         str(getattr(llm_client, "model", "unknown")),
+    )
+
+
+_LLM_FALLBACK_CONFIG_KEYS: dict[str, str] = {
+    "fallback_project": "project",
+    "fallback_location": "location",
+    "fallback_egress": "egress",
+    "fallback_egress_mode": "egress",
+    "fallback_temperature": "temperature",
+    "fallback_max_output_tokens": "max_output_tokens",
+    "fallback_top_p": "top_p",
+    "fallback_thinking_level": "thinking_level",
+}
+
+
+def _llm_fallback_profile(
+    primary_profile: ComponentSelection | None,
+    *,
+    provider: str,
+    model: str,
+) -> ComponentSelection | None:
+    primary_config = _component_config(primary_profile)
+    fallback_config: dict[str, Any] = {"provider": provider, "model": model}
+    for source_key, target_key in _LLM_FALLBACK_CONFIG_KEYS.items():
+        value = primary_config.get(source_key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        fallback_config[target_key] = value
+
+    if set(fallback_config) == {"provider", "model"}:
+        return None
+
+    source_owner_type = (
+        primary_profile.source_owner_type if primary_profile is not None else "runtime"
+    )
+    source_owner_key = (
+        primary_profile.source_owner_key if primary_profile is not None else "base"
+    )
+    return ComponentSelection(
+        category="llm",
+        slot="backup",
+        profile_key=(
+            f"{primary_profile.profile_key}.fallback"
+            if primary_profile is not None
+            else "llm_fallback"
+        ),
+        kind="llm",
+        provider=provider,
+        config=fallback_config,
+        source_owner_type=source_owner_type,
+        source_owner_key=source_owner_key,
     )
 
 
@@ -2090,7 +2375,15 @@ def build_llm_client_for_branch(
         )
         return primary_llm, metadata
 
-    backup_llm = build_llm_for_provider(backup_provider, model_name=backup_model)
+    backup_profile = _llm_fallback_profile(
+        primary_profile,
+        provider=backup_provider,
+        model=backup_model,
+    )
+    backup_kwargs: dict[str, Any] = {"model_name": backup_model}
+    if backup_profile is not None:
+        backup_kwargs["llm_profile"] = backup_profile
+    backup_llm = build_llm_for_provider(backup_provider, **backup_kwargs)
     backup_provider_name, backup_model_name = _llm_identity(backup_llm)
     fallback_metadata = LLMBranchMetadata(
         branch=branch,
@@ -2248,14 +2541,8 @@ def build_elevenlabs_tts(tts_profile: ComponentSelection | None = None) -> Any:
     )
     if voice_use_speaker_boost is None:
         voice_use_speaker_boost = ELEVENLABS_VOICE_USE_SPEAKER_BOOST
-    if (
-        voice_stability is not None
-        or voice_similarity_boost is not None
-    ):
-        if (
-            voice_stability is None
-            or voice_similarity_boost is None
-        ):
+    if voice_stability is not None or voice_similarity_boost is not None:
+        if voice_stability is None or voice_similarity_boost is None:
             logger.warning(
                 "ElevenLabs voice settings ignored: both ELEVENLABS_VOICE_STABILITY and "
                 "ELEVENLABS_VOICE_SIMILARITY_BOOST must be set together."
@@ -2264,16 +2551,8 @@ def build_elevenlabs_tts(tts_profile: ComponentSelection | None = None) -> Any:
             voice_settings = elevenlabs.VoiceSettings(
                 stability=voice_stability,
                 similarity_boost=voice_similarity_boost,
-                style=(
-                    voice_style
-                    if voice_style is not None
-                    else NOT_GIVEN
-                ),
-                speed=(
-                    voice_speed
-                    if voice_speed is not None
-                    else NOT_GIVEN
-                ),
+                style=(voice_style if voice_style is not None else NOT_GIVEN),
+                speed=(voice_speed if voice_speed is not None else NOT_GIVEN),
                 use_speaker_boost=(
                     voice_use_speaker_boost
                     if voice_use_speaker_boost is not None
@@ -2439,35 +2718,73 @@ def build_tts(
                 "or TBANK_VOICEKIT_SECRET_KEY is missing."
             )
 
+        tbank_voice_name = _config_str(
+            profile_config,
+            "voice_name",
+            TTS_TBANK_VOICE_NAME,
+        )
+        tbank_format = _config_str(profile_config, "format", TTS_TBANK_FORMAT)
+        tbank_sample_rate = _config_int(
+            profile_config,
+            "sample_rate",
+            TTS_TBANK_SAMPLE_RATE,
+        )
+        tbank_speaking_rate = _config_float(
+            profile_config,
+            "speaking_rate",
+            TTS_TBANK_SPEAKING_RATE,
+        )
+        tbank_pitch = _config_float(profile_config, "pitch", TTS_TBANK_PITCH)
+        tbank_min_sentence_len = _config_int(
+            profile_config,
+            "min_sentence_len",
+            TTS_TBANK_MIN_SENTENCE_LEN,
+        )
+        tbank_stream_context_len = _config_int(
+            profile_config,
+            "stream_context_len",
+            TTS_TBANK_STREAM_CONTEXT_LEN,
+        )
+        tbank_endpoint = _config_str(
+            profile_config,
+            "endpoint",
+            TBANK_VOICEKIT_ENDPOINT,
+        )
+        tbank_authority = _config_str(
+            profile_config,
+            "authority",
+            TBANK_VOICEKIT_AUTHORITY,
+        )
+        egress_mode = _component_egress(tts_profile)
         logger.info(
             "using T-Bank VoiceKit TTS provider",
             extra={
-                "voice": TTS_TBANK_VOICE_NAME,
-                "format": TTS_TBANK_FORMAT,
-                "sample_rate": TTS_TBANK_SAMPLE_RATE,
-                "speaking_rate": TTS_TBANK_SPEAKING_RATE,
-                "pitch": TTS_TBANK_PITCH,
-                "min_sentence_len": max(2, TTS_TBANK_MIN_SENTENCE_LEN),
-                "stream_context_len": max(1, TTS_TBANK_STREAM_CONTEXT_LEN),
-                "endpoint": TBANK_VOICEKIT_ENDPOINT,
-                "authority": TBANK_VOICEKIT_AUTHORITY or None,
-                "egress": provider_egress("tbank_tts"),
+                "voice": tbank_voice_name,
+                "format": tbank_format,
+                "sample_rate": tbank_sample_rate,
+                "speaking_rate": tbank_speaking_rate,
+                "pitch": tbank_pitch,
+                "min_sentence_len": max(2, tbank_min_sentence_len),
+                "stream_context_len": max(1, tbank_stream_context_len),
+                "endpoint": tbank_endpoint,
+                "authority": tbank_authority or None,
+                "egress": provider_egress("tbank_tts", mode_override=egress_mode),
             },
         )
-        with provider_egress_env("tbank_tts"):
+        with provider_egress_env("tbank_tts", mode_override=egress_mode):
             return TBankVoiceKitTTS(
                 api_key=TBANK_VOICEKIT_API_KEY,
                 secret_key=TBANK_VOICEKIT_SECRET_KEY,
-                voice_name=TTS_TBANK_VOICE_NAME,
-                audio_format=TTS_TBANK_FORMAT,
-                sample_rate=TTS_TBANK_SAMPLE_RATE,
-                speaking_rate=TTS_TBANK_SPEAKING_RATE,
-                pitch=TTS_TBANK_PITCH,
-                endpoint=TBANK_VOICEKIT_ENDPOINT,
-                authority=TBANK_VOICEKIT_AUTHORITY,
+                voice_name=tbank_voice_name,
+                audio_format=tbank_format,
+                sample_rate=tbank_sample_rate,
+                speaking_rate=tbank_speaking_rate,
+                pitch=tbank_pitch,
+                endpoint=tbank_endpoint,
+                authority=tbank_authority,
                 tokenizer_obj=tokenize.blingfire.SentenceTokenizer(
-                    min_sentence_len=max(2, TTS_TBANK_MIN_SENTENCE_LEN),
-                    stream_context_len=max(1, TTS_TBANK_STREAM_CONTEXT_LEN),
+                    min_sentence_len=max(2, tbank_min_sentence_len),
+                    stream_context_len=max(1, tbank_stream_context_len),
                 ),
             )
 
@@ -2489,9 +2806,7 @@ def build_tts(
             COSYVOICE_API_KEY_ENV_NAME,
         )
         resolved_api_key = (
-            os.getenv(api_key_env_name)
-            or COSYVOICE_API_KEY
-            or ""
+            os.getenv(api_key_env_name) or COSYVOICE_API_KEY or ""
         ).strip()
         if not resolved_api_key:
             raise RuntimeError(
@@ -2599,41 +2914,75 @@ def build_tts(
                 "Sber SaluteSpeech provider is configured without auth key."
             )
 
+        sber_endpoint = _config_str(profile_config, "endpoint", SBER_TTS_ENDPOINT)
+        sber_voice = _config_str(profile_config, "voice", SBER_TTS_VOICE)
+        sber_language = _config_str(profile_config, "language", SBER_TTS_LANGUAGE)
+        sber_sample_rate = _config_int(
+            profile_config,
+            "sample_rate",
+            SBER_TTS_SAMPLE_RATE,
+        )
+        sber_paint_pitch = _config_str(
+            profile_config,
+            "paint_pitch",
+            SBER_TTS_PAINT_PITCH,
+        )
+        sber_paint_speed = _config_str(
+            profile_config,
+            "paint_speed",
+            SBER_TTS_PAINT_SPEED,
+        )
+        sber_paint_loudness = _config_str(
+            profile_config,
+            "paint_loudness",
+            SBER_TTS_PAINT_LOUDNESS,
+        )
+        sber_min_sentence_len = _config_int(
+            profile_config,
+            "min_sentence_len",
+            SBER_TTS_MIN_SENTENCE_LEN,
+        )
+        sber_stream_context_len = _config_int(
+            profile_config,
+            "stream_context_len",
+            SBER_TTS_STREAM_CONTEXT_LEN,
+        )
+        egress_mode = _component_egress(tts_profile)
         logger.info(
             "using Sber SaluteSpeech TTS provider",
             extra={
-                "endpoint": SBER_TTS_ENDPOINT,
-                "voice": SBER_TTS_VOICE,
-                "language": SBER_TTS_LANGUAGE,
-                "sample_rate": SBER_TTS_SAMPLE_RATE,
+                "endpoint": sber_endpoint,
+                "voice": sber_voice,
+                "language": sber_language,
+                "sample_rate": sber_sample_rate,
                 "ca_cert_file": bool(SBER_TTS_CA_CERT_FILE),
-                "paint_pitch": SBER_TTS_PAINT_PITCH,
-                "paint_speed": SBER_TTS_PAINT_SPEED,
-                "paint_loudness": SBER_TTS_PAINT_LOUDNESS,
-                "min_sentence_len": max(2, SBER_TTS_MIN_SENTENCE_LEN),
-                "stream_context_len": max(1, SBER_TTS_STREAM_CONTEXT_LEN),
-                "egress": provider_egress("sber_tts"),
+                "paint_pitch": sber_paint_pitch,
+                "paint_speed": sber_paint_speed,
+                "paint_loudness": sber_paint_loudness,
+                "min_sentence_len": max(2, sber_min_sentence_len),
+                "stream_context_len": max(1, sber_stream_context_len),
+                "egress": provider_egress("sber_tts", mode_override=egress_mode),
             },
         )
-        with provider_egress_env("sber_tts"):
+        with provider_egress_env("sber_tts", mode_override=egress_mode):
             return SberSaluteTTS(
                 auth_key=SBER_SALUTESPEECH_AUTH_KEY,
                 oauth_scope=SBER_TTS_OAUTH_SCOPE,
                 oauth_url=SBER_TTS_OAUTH_URL,
-                endpoint=SBER_TTS_ENDPOINT,
-                voice=SBER_TTS_VOICE,
-                language=SBER_TTS_LANGUAGE,
-                sample_rate=SBER_TTS_SAMPLE_RATE,
+                endpoint=sber_endpoint,
+                voice=sber_voice,
+                language=sber_language,
+                sample_rate=sber_sample_rate,
                 ca_cert_file=SBER_TTS_CA_CERT_FILE or None,
-                paint_pitch=SBER_TTS_PAINT_PITCH,
-                paint_speed=SBER_TTS_PAINT_SPEED,
-                paint_loudness=SBER_TTS_PAINT_LOUDNESS,
+                paint_pitch=sber_paint_pitch,
+                paint_speed=sber_paint_speed,
+                paint_loudness=sber_paint_loudness,
                 request_timeout=SBER_TTS_REQUEST_TIMEOUT_SEC,
                 rebuild_cache=SBER_TTS_REBUILD_CACHE,
-                http_proxy=provider_proxy_url("sber_tts"),
+                http_proxy=provider_proxy_url("sber_tts", mode_override=egress_mode),
                 tokenizer_obj=tokenize.blingfire.SentenceTokenizer(
-                    min_sentence_len=max(2, SBER_TTS_MIN_SENTENCE_LEN),
-                    stream_context_len=max(1, SBER_TTS_STREAM_CONTEXT_LEN),
+                    min_sentence_len=max(2, sber_min_sentence_len),
+                    stream_context_len=max(1, sber_stream_context_len),
                 ),
             )
 
@@ -2663,7 +3012,8 @@ def build_tts(
         )
         return VertexGeminiTTS(
             model=_config_str(profile_config, "model", GOOGLE_TTS_MODEL).strip(),
-            voice_name=_config_str(profile_config, "voice_name", GOOGLE_TTS_VOICE_NAME) or "Zephyr",
+            voice_name=_config_str(profile_config, "voice_name", GOOGLE_TTS_VOICE_NAME)
+            or "Zephyr",
             prompt=_config_str(profile_config, "prompt", GOOGLE_TTS_PROMPT),
             location=_config_str(profile_config, "location", GOOGLE_TTS_LOCATION),
             http_proxy=provider_proxy_url("vertex_tts"),
@@ -2826,9 +3176,7 @@ def build_tts(
         )
         minimax_timbre_raw = profile_config.get("timbre", MINIMAX_TTS_TIMBRE)
         minimax_timbre = (
-            int(minimax_timbre_raw)
-            if minimax_timbre_raw not in (None, "")
-            else None
+            int(minimax_timbre_raw) if minimax_timbre_raw not in (None, "") else None
         )
         minimax_sound_effects = _config_str(
             profile_config,
@@ -2973,7 +3321,9 @@ def build_stt(
                     ),
                 )
             ]
-        fallback_descriptions = [_config_str(profile_config, "model", STT_INFERENCE_MODEL)]
+        fallback_descriptions = [
+            _config_str(profile_config, "model", STT_INFERENCE_MODEL)
+        ]
 
         if STT_INFERENCE_INCLUDE_GOOGLE_FALLBACK:
             google_stt = _build_google_stt_or_none(
@@ -3052,8 +3402,12 @@ def build_stt(
             "using Google STT provider",
             extra={
                 "model": _config_str(profile_config, "model", STT_GOOGLE_MODEL),
-                "language": _config_str(profile_config, "language", STT_GOOGLE_LANGUAGE),
-                "location": _config_str(profile_config, "location", STT_GOOGLE_LOCATION),
+                "language": _config_str(
+                    profile_config, "language", STT_GOOGLE_LANGUAGE
+                ),
+                "location": _config_str(
+                    profile_config, "location", STT_GOOGLE_LOCATION
+                ),
                 "egress": provider_egress("google_stt"),
             },
         )
@@ -3095,32 +3449,48 @@ def build_stt(
 
         yandex_model = _config_str(profile_config, "model", STT_YANDEX_MODEL)
         yandex_language = _config_str(profile_config, "language", STT_YANDEX_LANGUAGE)
+        yandex_sample_rate = _config_int(
+            profile_config,
+            "sample_rate",
+            STT_YANDEX_SAMPLE_RATE,
+        )
+        yandex_chunk_ms = _config_int(
+            profile_config,
+            "chunk_ms",
+            STT_YANDEX_CHUNK_MS,
+        )
+        yandex_eou_sensitivity = _config_str(
+            profile_config,
+            "eou_sensitivity",
+            STT_YANDEX_EOU_SENSITIVITY,
+        )
         yandex_max_pause = _config_int(
             profile_config,
             "max_pause_between_words_hint_ms",
             STT_YANDEX_MAX_PAUSE_BETWEEN_WORDS_HINT_MS,
         )
+        egress_mode = _component_egress(stt_profile)
         logger.info(
             "using Yandex SpeechKit STT provider",
             extra={
                 "model": yandex_model,
                 "language": yandex_language,
-                "sample_rate": STT_YANDEX_SAMPLE_RATE,
-                "chunk_ms": STT_YANDEX_CHUNK_MS,
-                "eou_sensitivity": STT_YANDEX_EOU_SENSITIVITY,
+                "sample_rate": yandex_sample_rate,
+                "chunk_ms": yandex_chunk_ms,
+                "eou_sensitivity": yandex_eou_sensitivity,
                 "max_pause_between_words_hint_ms": yandex_max_pause,
-                "egress": provider_egress("yandex_stt"),
+                "egress": provider_egress("yandex_stt", mode_override=egress_mode),
             },
         )
-        with provider_egress_env("yandex_stt"):
+        with provider_egress_env("yandex_stt", mode_override=egress_mode):
             return _wrap_stt_for_early_interim_final(
                 YandexSpeechKitSTT(
                     api_key=YANDEX_SPEECHKIT_API_KEY,
                     model=yandex_model,
                     language=yandex_language,
-                    sample_rate=STT_YANDEX_SAMPLE_RATE,
-                    chunk_ms=STT_YANDEX_CHUNK_MS,
-                    eou_sensitivity=STT_YANDEX_EOU_SENSITIVITY,
+                    sample_rate=yandex_sample_rate,
+                    chunk_ms=yandex_chunk_ms,
+                    eou_sensitivity=yandex_eou_sensitivity,
                     max_pause_between_words_hint_ms=yandex_max_pause,
                 ),
                 turn_profile=turn_profile,
@@ -3133,31 +3503,55 @@ def build_stt(
                 "or TBANK_VOICEKIT_SECRET_KEY is missing."
             )
 
+        tbank_model = _config_str(profile_config, "model", STT_TBANK_MODEL)
+        tbank_language = _config_str(profile_config, "language", STT_TBANK_LANGUAGE)
+        tbank_sample_rate = _config_int(
+            profile_config,
+            "sample_rate",
+            STT_TBANK_SAMPLE_RATE,
+        )
+        tbank_chunk_ms = _config_int(profile_config, "chunk_ms", STT_TBANK_CHUNK_MS)
+        tbank_interim_interval_sec = _config_float(
+            profile_config,
+            "interim_interval_sec",
+            STT_TBANK_INTERIM_INTERVAL_SEC,
+        )
+        tbank_endpoint = _config_str(
+            profile_config,
+            "endpoint",
+            TBANK_VOICEKIT_ENDPOINT,
+        )
+        tbank_authority = _config_str(
+            profile_config,
+            "authority",
+            TBANK_VOICEKIT_AUTHORITY,
+        )
+        egress_mode = _component_egress(stt_profile)
         logger.info(
             "using T-Bank VoiceKit STT provider",
             extra={
-                "model": STT_TBANK_MODEL or "default",
-                "language": STT_TBANK_LANGUAGE,
-                "sample_rate": STT_TBANK_SAMPLE_RATE,
-                "chunk_ms": STT_TBANK_CHUNK_MS,
-                "interim_interval_sec": STT_TBANK_INTERIM_INTERVAL_SEC,
-                "endpoint": TBANK_VOICEKIT_ENDPOINT,
-                "authority": TBANK_VOICEKIT_AUTHORITY or None,
-                "egress": provider_egress("tbank_stt"),
+                "model": tbank_model or "default",
+                "language": tbank_language,
+                "sample_rate": tbank_sample_rate,
+                "chunk_ms": tbank_chunk_ms,
+                "interim_interval_sec": tbank_interim_interval_sec,
+                "endpoint": tbank_endpoint,
+                "authority": tbank_authority or None,
+                "egress": provider_egress("tbank_stt", mode_override=egress_mode),
             },
         )
-        with provider_egress_env("tbank_stt"):
+        with provider_egress_env("tbank_stt", mode_override=egress_mode):
             return _wrap_stt_for_early_interim_final(
                 TBankVoiceKitSTT(
                     api_key=TBANK_VOICEKIT_API_KEY,
                     secret_key=TBANK_VOICEKIT_SECRET_KEY,
-                    model=STT_TBANK_MODEL,
-                    language=STT_TBANK_LANGUAGE,
-                    sample_rate=STT_TBANK_SAMPLE_RATE,
-                    chunk_ms=STT_TBANK_CHUNK_MS,
-                    interim_interval_sec=STT_TBANK_INTERIM_INTERVAL_SEC,
-                    endpoint=TBANK_VOICEKIT_ENDPOINT,
-                    authority=TBANK_VOICEKIT_AUTHORITY,
+                    model=tbank_model,
+                    language=tbank_language,
+                    sample_rate=tbank_sample_rate,
+                    chunk_ms=tbank_chunk_ms,
+                    interim_interval_sec=tbank_interim_interval_sec,
+                    endpoint=tbank_endpoint,
+                    authority=tbank_authority,
                 ),
                 turn_profile=turn_profile,
             )
@@ -3295,6 +3689,7 @@ class Assistant(Agent):
         fallback_llm_provider: str = "google",
         first_turn_short_greeting_audio_path: Path = _SHORT_GREETING_AUDIO_PATH,
         first_turn_short_greeting_phrase: str = VOICE_SHORT_GREETING_PHRASE,
+        first_turn_short_greeting_delay_sec: float = VOICE_SHORT_GREETING_DELAY_SEC,
         prerecorded_audio_sample_rate: int = 24000,
         voice_audio_cache: VoiceAudioCache | None = None,
         voice_prompts: VoicePromptManager | None = None,
@@ -3312,6 +3707,10 @@ class Assistant(Agent):
             first_turn_short_greeting_audio_path
         )
         self._first_turn_short_greeting_phrase = first_turn_short_greeting_phrase
+        self._first_turn_short_greeting_delay_sec = max(
+            0.0,
+            first_turn_short_greeting_delay_sec,
+        )
         self._prerecorded_audio_sample_rate = prerecorded_audio_sample_rate
         self._voice_audio_cache = voice_audio_cache
         self._voice_prompts = voice_prompts
@@ -3323,6 +3722,8 @@ class Assistant(Agent):
         self._tts_first_frame_ready_at: float | None = None
         self._tts_first_frame_yielded_at: float | None = None
         self._user_speech_revision = 0
+        self._user_is_speaking = False
+        self._speech_start_user_revisions: dict[str, int] = {}
         resolved_prompt = prompt if prompt is not None else get_active_prompt()
         super().__init__(instructions=resolved_prompt)
         self._register_llm_availability_listeners()
@@ -3335,6 +3736,75 @@ class Assistant(Agent):
 
     def note_user_started_speaking(self) -> None:
         self._user_speech_revision += 1
+        self._user_is_speaking = True
+
+    def note_user_finished_speaking(self) -> None:
+        self._user_is_speaking = False
+
+    def _current_speech_handle(self) -> Any | None:
+        try:
+            from livekit.agents.voice.agent_activity import _SpeechHandleContextVar
+
+            return _SpeechHandleContextVar.get(None)
+        except Exception:
+            return None
+
+    def _current_speech_id(self) -> str | None:
+        return speech_handle_id(self._current_speech_handle())
+
+    def _remember_speech_start_revision(self) -> int:
+        revision = self._user_speech_revision
+        speech_id = self._current_speech_id()
+        if speech_id:
+            self._speech_start_user_revisions.setdefault(speech_id, revision)
+        return revision
+
+    def _speech_start_revision(self, speech_id: str | None) -> int:
+        if not speech_id:
+            return self._user_speech_revision
+        return self._speech_start_user_revisions.get(
+            speech_id,
+            self._user_speech_revision,
+        )
+
+    def _user_spoke_since(self, revision: int) -> bool:
+        return should_cancel_pending_reply_for_user_speech(
+            stream_user_speech_revision=revision,
+            current_user_speech_revision=self._user_speech_revision,
+            user_is_speaking=self._user_is_speaking,
+        )
+
+    def _cancel_current_speech_before_audio(
+        self,
+        *,
+        speech_id: str | None,
+        started_revision: int,
+        phase: str,
+    ) -> bool:
+        if not self._user_spoke_since(started_revision):
+            return False
+
+        handle = self._current_speech_handle()
+        if handle is not None and not bool(getattr(handle, "allow_interruptions", True)):
+            return False
+
+        logger.info(
+            "assistant speech canceled before first audio because user started speaking",
+            extra={
+                "speech_id": speech_id,
+                "phase": phase,
+                "speech_start_user_revision": started_revision,
+                "current_user_revision": self._user_speech_revision,
+                "user_is_speaking": self._user_is_speaking,
+            },
+        )
+        if handle is not None:
+            with suppress(Exception):
+                handle.interrupt(force=True)
+        else:
+            with suppress(Exception):
+                self.session.interrupt(force=True)
+        return True
 
     async def on_user_turn_completed(self, _: Any, new_message: ChatMessage) -> None:
         if not self._awaiting_first_user_turn:
@@ -3352,6 +3822,29 @@ class Assistant(Agent):
         if not is_short_greeting_response(user_text):
             return
 
+        short_greeting_revision = self._user_speech_revision
+        if self._first_turn_short_greeting_delay_sec > 0:
+            logger.info(
+                "first user turn matched short greeting regex; waiting before prerecorded follow-up audio",
+                extra={
+                    "delay_sec": self._first_turn_short_greeting_delay_sec,
+                    "speech_start_user_revision": short_greeting_revision,
+                },
+            )
+            await wait_for_short_greeting_delay(
+                self._first_turn_short_greeting_delay_sec
+            )
+            if self._user_spoke_since(short_greeting_revision):
+                logger.info(
+                    "short greeting follow-up canceled because user started speaking",
+                    extra={
+                        "speech_start_user_revision": short_greeting_revision,
+                        "current_user_revision": self._user_speech_revision,
+                        "user_is_speaking": self._user_is_speaking,
+                    },
+                )
+                raise StopResponse()
+
         logger.info(
             "first user turn matched short greeting regex; playing prerecorded follow-up audio"
         )
@@ -3365,6 +3858,16 @@ class Assistant(Agent):
         )
         if audio_path is None:
             return
+        if self._user_spoke_since(short_greeting_revision):
+            logger.info(
+                "short greeting follow-up canceled before playback because user started speaking",
+                extra={
+                    "speech_start_user_revision": short_greeting_revision,
+                    "current_user_revision": self._user_speech_revision,
+                    "user_is_speaking": self._user_is_speaking,
+                },
+            )
+            raise StopResponse()
 
         played = await play_prerecorded_audio(
             session=self.session,
@@ -3380,21 +3883,40 @@ class Assistant(Agent):
     async def tts_node(
         self, text: AsyncIterable[str], model_settings: Any
     ) -> AsyncIterator[rtc.AudioFrame]:
+        speech_handle = self._current_speech_handle()
+        speech_id = speech_handle_id(speech_handle)
+        speech_start_revision = self._speech_start_revision(speech_id)
         audio_stream = Agent.default.tts_node(
             self,
             sanitize_tagged_text_stream(text),
             model_settings,
         )
         waited_for_prompt = False
-        async for frame in audio_stream:
-            if not waited_for_prompt:
-                self._tts_first_frame_ready_at = time.time()
-                self._tts_first_frame_yielded_at = None
-                if self._voice_prompts is not None:
-                    await self._voice_prompts.wait_for_active_prompt()
-                self._tts_first_frame_yielded_at = time.time()
-                waited_for_prompt = True
-            yield frame
+        try:
+            async for frame in audio_stream:
+                if not waited_for_prompt:
+                    self._tts_first_frame_ready_at = time.time()
+                    self._tts_first_frame_yielded_at = None
+                    if self._cancel_current_speech_before_audio(
+                        speech_id=speech_id,
+                        started_revision=speech_start_revision,
+                        phase="first_frame_ready",
+                    ):
+                        return
+                    if self._voice_prompts is not None:
+                        await self._voice_prompts.wait_for_active_prompt()
+                    if self._cancel_current_speech_before_audio(
+                        speech_id=speech_id,
+                        started_revision=speech_start_revision,
+                        phase="after_voice_prompt_wait",
+                    ):
+                        return
+                    self._tts_first_frame_yielded_at = time.time()
+                    waited_for_prompt = True
+                yield frame
+        finally:
+            if speech_id:
+                self._speech_start_user_revisions.pop(speech_id, None)
 
     async def transcription_node(
         self, text: AsyncIterable[str], model_settings: Any
@@ -3490,7 +4012,7 @@ class Assistant(Agent):
         stream: AsyncIterable[Any],
     ) -> AsyncIterator[Any]:
         raw_parts: list[str] = []
-        stream_user_speech_revision = self._user_speech_revision
+        stream_user_speech_revision = self._remember_speech_start_revision()
         try:
             async for chunk in stream:
                 self._capture_robot_tag_text(raw_parts, chunk)
@@ -3980,6 +4502,7 @@ class Assistant(Agent):
         ):
             yield chunk
 
+
 def compute_server_load(agent_server: AgentServer) -> float:
     return min(len(agent_server.active_jobs) / AGENT_MAX_CONCURRENT_JOBS, 1.0)
 
@@ -4035,6 +4558,17 @@ def build_audio_input_options() -> room_io.AudioInputOptions:
     return room_io.AudioInputOptions()
 
 
+def build_agent_room_options(*, audio_output_sample_rate: int) -> room_io.RoomOptions:
+    return room_io.RoomOptions(
+        audio_input=build_audio_input_options(),
+        audio_output=room_io.AudioOutputOptions(
+            sample_rate=audio_output_sample_rate,
+            num_channels=1,
+        ),
+        delete_room_on_close=True,
+    )
+
+
 @server.rtc_session(agent_name=AGENT_NAME)
 async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {
@@ -4069,6 +4603,7 @@ async def my_agent(ctx: JobContext):
     end_call_task: asyncio.Task | None = None
     reply_watchdog_task: asyncio.Task | None = None
     startup_no_dialog_task: asyncio.Task | None = None
+    recording_stop_task: asyncio.Task | None = None
     export_wait_sec = 20.0
     export_task: asyncio.Task | None = None
     session_close_task: asyncio.Task | None = None
@@ -4092,6 +4627,10 @@ async def my_agent(ctx: JobContext):
         "sip_call_id": None,
     }
     participant = None
+    client_disconnect_context: dict[str, Any] = {}
+    participant_disconnect_cleanup_handler: Callable[
+        [rtc.RemoteParticipant], None
+    ] | None = None
     robot_settings: ResolvedRobotSettings | None = None
     recording_handle = None
     recording_stop_requested = False
@@ -4333,7 +4872,9 @@ async def my_agent(ctx: JobContext):
         "endpointing_mode",
         TURN_ENDPOINTING_MODE,
     )
-    endpointing_mode = "dynamic" if configured_endpointing_mode == "dynamic" else "fixed"
+    endpointing_mode = (
+        "dynamic" if configured_endpointing_mode == "dynamic" else "fixed"
+    )
     configured_turn_detection_mode = _config_str(
         turn_config,
         "detection_mode",
@@ -4348,7 +4889,10 @@ async def my_agent(ctx: JobContext):
             robot_settings.stt_primary if robot_settings else None,
             STT_PROVIDER,
         )
-        if configured_turn_detection_mode == "stt" and configured_stt_provider == "google":
+        if (
+            configured_turn_detection_mode == "stt"
+            and configured_stt_provider == "google"
+        ):
             # turn_detection="stt" with Google STT requires enable_voice_activity_events=True,
             # but that causes the streaming session to close after first utterance on latest_short.
             # VAD-based detection (Silero) is the reliable alternative: no Google stream dependency.
@@ -4496,6 +5040,12 @@ async def my_agent(ctx: JobContext):
     async def on_client_silence_timeout() -> None:
         await request_client_silence_end_call()
 
+    def is_client_disconnected() -> bool:
+        return bool(client_disconnect_context)
+
+    def client_disconnect_info() -> dict[str, Any]:
+        return dict(client_disconnect_context)
+
     voice_prompts = VoicePromptManager(
         session=session,
         background_audio=background_audio,
@@ -4521,15 +5071,57 @@ async def my_agent(ctx: JobContext):
         is_closed=close_event.is_set,
         is_end_call_scheduled=lambda: bool(end_call_task and not end_call_task.done()),
         on_client_silence_timeout=on_client_silence_timeout,
+        is_client_disconnected=is_client_disconnected,
+        client_disconnect_info=client_disconnect_info,
         speech_playout_timeout_sec=VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
         incident_log=incident_log,
     )
+
+    def on_linked_participant_disconnected(
+        disconnected_participant: rtc.RemoteParticipant,
+    ) -> None:
+        nonlocal client_disconnect_context, reply_watchdog_task, startup_no_dialog_task
+        identity = str(getattr(disconnected_participant, "identity", "") or "")
+        linked_identity = str(getattr(participant, "identity", "") or "")
+        if linked_identity and identity != linked_identity:
+            return
+
+        reason = disconnect_reason_name(
+            getattr(disconnected_participant, "disconnect_reason", None)
+        )
+        if not client_disconnect_context:
+            client_disconnect_context = {
+                "disconnect_time": datetime.now(timezone.utc).isoformat(),
+                "disconnect_reason": reason,
+                "participant_identity": identity or None,
+            }
+            logger.info(
+                "linked participant disconnected; canceling voice prompt timers",
+                extra={
+                    "participant": identity or None,
+                    "reason": reason,
+                },
+            )
+        voice_prompts.on_client_disconnected()
+        request_recording_stop("participant_disconnected")
+        if reply_watchdog_task and not reply_watchdog_task.done():
+            reply_watchdog_task.cancel()
+            reply_watchdog_task = None
+        if startup_no_dialog_task and not startup_no_dialog_task.done():
+            startup_no_dialog_task.cancel()
+            startup_no_dialog_task = None
+
+    participant_disconnect_cleanup_handler = on_linked_participant_disconnected
+    ctx.room.on("participant_disconnected", participant_disconnect_cleanup_handler)
+
     logger.info(
         "session latency guards configured",
         extra={
             "llm_first_token_timeout_sec": LLM_FIRST_TOKEN_TIMEOUT_SEC,
             "llm_fallback_first_token_timeout_sec": LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
-            "llm_attempt_timeout_sec": routed_llm_metadata["complex"].attempt_timeout_sec
+            "llm_attempt_timeout_sec": routed_llm_metadata[
+                "complex"
+            ].attempt_timeout_sec
             if "complex" in routed_llm_metadata
             else LLM_ATTEMPT_TIMEOUT_SEC,
             "llm_max_retry_per_llm": routed_llm_metadata["complex"].max_retry_per_llm
@@ -4538,7 +5130,9 @@ async def my_agent(ctx: JobContext):
             "llm_retry_interval_sec": routed_llm_metadata["complex"].retry_interval_sec
             if "complex" in routed_llm_metadata
             else LLM_RETRY_INTERVAL_SEC,
-            "llm_retry_on_chunk_sent": routed_llm_metadata["complex"].retry_on_chunk_sent
+            "llm_retry_on_chunk_sent": routed_llm_metadata[
+                "complex"
+            ].retry_on_chunk_sent
             if "complex" in routed_llm_metadata
             else LLM_RETRY_ON_CHUNK_SENT,
             "use_livekit_fallback_adapter": routed_llm_metadata[
@@ -4575,6 +5169,7 @@ async def my_agent(ctx: JobContext):
             "voice_client_silence_sec": VOICE_CLIENT_SILENCE_SEC,
             "voice_client_silence_stt_grace_sec": VOICE_CLIENT_SILENCE_STT_GRACE_SEC,
             "voice_client_silence_max_prompts": VOICE_CLIENT_SILENCE_MAX_PROMPTS,
+            "voice_short_greeting_delay_sec": VOICE_SHORT_GREETING_DELAY_SEC,
             "voice_client_silence_audio_path": str(_CLIENT_SILENCE_AUDIO_PATH)
             if _CLIENT_SILENCE_AUDIO_PATH
             else None,
@@ -4747,8 +5342,29 @@ async def my_agent(ctx: JobContext):
                     "source": source,
                     "user_initiated": getattr(ev, "user_initiated", None),
                     "speech_id": speech_handle_id(handle),
+                    "allow_interruptions": getattr(handle, "allow_interruptions", None),
                 },
             )
+            if handle is not None and hasattr(handle, "add_done_callback"):
+
+                def _on_speech_done(done_handle: Any) -> None:
+                    with suppress(Exception):
+                        logger.info(
+                            "speech completed",
+                            extra={
+                                "source": source,
+                                "user_initiated": getattr(ev, "user_initiated", None),
+                                "speech_id": speech_handle_id(done_handle),
+                                "interrupted": getattr(done_handle, "interrupted", None),
+                                "allow_interruptions": getattr(
+                                    done_handle,
+                                    "allow_interruptions",
+                                    None,
+                                ),
+                            },
+                        )
+
+                handle.add_done_callback(_on_speech_done)
             mark_startup_dialog_activity(
                 "speech_created",
                 source=source,
@@ -4756,6 +5372,48 @@ async def my_agent(ctx: JobContext):
             )
         except Exception as e:
             logger.exception("speech_created handler failed: %s", e)
+
+    @session.on("overlapping_speech")
+    def on_overlapping_speech(ev):
+        try:
+            logger.info(
+                "overlapping speech detected",
+                extra={
+                    "is_interruption": getattr(ev, "is_interruption", None),
+                    "probability": getattr(ev, "probability", None),
+                    "num_requests": getattr(ev, "num_requests", None),
+                    "total_duration_ms": round(
+                        float(getattr(ev, "total_duration", 0.0) or 0.0) * 1000,
+                        1,
+                    ),
+                    "prediction_duration_ms": round(
+                        float(getattr(ev, "prediction_duration", 0.0) or 0.0)
+                        * 1000,
+                        1,
+                    ),
+                    "detection_delay_ms": round(
+                        float(getattr(ev, "detection_delay", 0.0) or 0.0) * 1000,
+                        1,
+                    ),
+                    "overlap_started_at": getattr(ev, "overlap_started_at", None),
+                    "detected_at": getattr(ev, "detected_at", None),
+                },
+            )
+        except Exception as e:
+            logger.exception("overlapping_speech handler failed: %s", e)
+
+    @session.on("agent_false_interruption")
+    def on_agent_false_interruption(ev):
+        try:
+            logger.info(
+                "agent false interruption detected",
+                extra={
+                    "resumed": getattr(ev, "resumed", None),
+                    "created_at": getattr(ev, "created_at", None),
+                },
+            )
+        except Exception as e:
+            logger.exception("agent_false_interruption handler failed: %s", e)
 
     @session.on("conversation_item_added")
     def on_conversation_item_added(ev):
@@ -4905,6 +5563,7 @@ async def my_agent(ctx: JobContext):
                 )
                 if callable(notify_local_end_of_speech):
                     notify_local_end_of_speech(ended_at=ended_at)
+                assistant.note_user_finished_speaking()
                 response_delay_user_stopped_speaking = True
                 maybe_start_response_delay_timer()
                 voice_prompts.on_user_finished_speaking()
@@ -5130,8 +5789,37 @@ async def my_agent(ctx: JobContext):
         }
 
         logger.info("sending session data to n8n")
+        if recording_stop_task and not recording_stop_task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(recording_stop_task),
+                    timeout=max(CALL_RECORDING_STOP_TIMEOUT_SEC, 0.5) + 0.5,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "room recording stop still pending before export",
+                    extra={"room": ctx.room.name},
+                )
         try:
-            await finalize_room_recording(recording_handle)
+            egress_info = await finalize_room_recording(recording_handle)
+            if (
+                egress_info is not None
+                and getattr(egress_info, "status", None) in ACTIVE_EGRESS_STATUSES
+            ):
+                incident_log.record_nowait(
+                    "egress_finalize_lag",
+                    severity="warning",
+                    component="livekit_egress",
+                    description=(
+                        "LiveKit room recording was still active after finalize timeout"
+                    ),
+                    payload={
+                        "room": ctx.room.name,
+                        "egress_id": getattr(egress_info, "egress_id", None),
+                        "status": state_value(getattr(egress_info, "status", None)),
+                        "finalize_timeout_sec": CALL_RECORDING_FINALIZE_TIMEOUT_SEC,
+                    },
+                )
         except Exception as e:
             logger.warning("failed to finalize room recording metadata: %s", e)
             incident_log.record_exception_nowait(
@@ -5211,6 +5899,17 @@ async def my_agent(ctx: JobContext):
                 },
             )
 
+    def request_recording_stop(reason: str) -> None:
+        nonlocal recording_stop_task
+        if recording_handle is None:
+            return
+        if recording_stop_task and not recording_stop_task.done():
+            return
+        recording_stop_task = asyncio.create_task(
+            stop_recording_safely(reason),
+            name=f"stop_room_recording:{reason}",
+        )
+
     async def delete_room_safely(
         reason: str,
         *,
@@ -5260,7 +5959,9 @@ async def my_agent(ctx: JobContext):
         except Exception as e:
             logger.exception("failed to delete room: %s", e)
             resolved_close_reason = (
-                f"{close_reason}_failed" if close_reason else f"tag_action_failed:{reason}"
+                f"{close_reason}_failed"
+                if close_reason
+                else f"tag_action_failed:{reason}"
             )
             close_info["reason"] = resolved_close_reason
             incident_log.record_exception_nowait(
@@ -5420,6 +6121,8 @@ async def my_agent(ctx: JobContext):
             startup_no_dialog_task = None
         voice_prompts.cancel_response_delay_timer()
         voice_prompts.cancel_client_silence_timer()
+        if should_stop_recording_on_close(close_info["reason"]):
+            request_recording_stop(close_info["reason"] or "session_close")
         if end_call_task and not end_call_task.done():
             return
         close_event.set()
@@ -5501,6 +6204,7 @@ async def my_agent(ctx: JobContext):
             fallback_llm_provider=fallback_llm_provider_name,
             first_turn_short_greeting_audio_path=_SHORT_GREETING_AUDIO_PATH,
             first_turn_short_greeting_phrase=VOICE_SHORT_GREETING_PHRASE,
+            first_turn_short_greeting_delay_sec=VOICE_SHORT_GREETING_DELAY_SEC,
             prerecorded_audio_sample_rate=audio_output_sample_rate,
             voice_audio_cache=voice_audio_cache,
             voice_prompts=voice_prompts,
@@ -5513,12 +6217,8 @@ async def my_agent(ctx: JobContext):
             await session.start(
                 agent=assistant,
                 room=ctx.room,
-                room_options=room_io.RoomOptions(
-                    audio_input=build_audio_input_options(),
-                    audio_output=room_io.AudioOutputOptions(
-                        sample_rate=audio_output_sample_rate,
-                        num_channels=1,
-                    ),
+                room_options=build_agent_room_options(
+                    audio_output_sample_rate=audio_output_sample_rate,
                 ),
             )
             session_started = True
@@ -5650,6 +6350,7 @@ async def my_agent(ctx: JobContext):
                     else:
                         logger.warning("initial greeting was not completed")
             finally:
+                clear_initial_greeting_user_turn(session)
                 assistant.finish_initial_greeting()
         if played_initial_greeting:
             voice_prompts.on_agent_finished_speaking()
@@ -5724,6 +6425,12 @@ async def my_agent(ctx: JobContext):
             )
         raise
     finally:
+        if participant_disconnect_cleanup_handler is not None:
+            with suppress(Exception):
+                ctx.room.off(
+                    "participant_disconnected",
+                    participant_disconnect_cleanup_handler,
+                )
         if end_call_task and not end_call_task.done():
             end_call_task.cancel()
         if reply_watchdog_task and not reply_watchdog_task.done():

@@ -165,6 +165,14 @@ class _FakeVoiceAudioCache:
         return self.path
 
 
+class _FakeIncidentLog:
+    def __init__(self) -> None:
+        self.records: list[dict[str, object]] = []
+
+    def record_nowait(self, incident_type: str, **kwargs) -> None:
+        self.records.append({"incident_type": incident_type, **kwargs})
+
+
 def _voice_prompt_manager(
     *,
     tmp_path,
@@ -180,7 +188,10 @@ def _voice_prompt_manager(
     speech_playout_timeout_sec: float = 12.0,
     is_closed=lambda: False,
     is_end_call_scheduled=lambda: False,
+    is_client_disconnected=lambda: False,
+    client_disconnect_info=lambda: {},
     on_client_silence_timeout=None,
+    incident_log=None,
 ) -> tuple[agent.VoicePromptManager, _FakePromptSession, _FakeBackgroundAudio]:
     response_delay_audio = tmp_path / "response_delay.wav"
     client_silence_audio = tmp_path / "client_silence.wav"
@@ -220,7 +231,10 @@ def _voice_prompt_manager(
         is_closed=is_closed,
         is_end_call_scheduled=is_end_call_scheduled,
         on_client_silence_timeout=on_client_silence_timeout,
+        is_client_disconnected=is_client_disconnected,
+        client_disconnect_info=client_disconnect_info,
         speech_playout_timeout_sec=speech_playout_timeout_sec,
+        incident_log=incident_log,
     )
     return manager, session, background_audio
 
@@ -419,6 +433,67 @@ def test_build_complex_branch_fallback_uses_google_backup(monkeypatch) -> None:
     assert metadata.backup_provider == "google"
     assert metadata.backup_model == "gemini-lite"
     assert metadata.uses_fallback_adapter is True
+
+
+def test_build_branch_fallback_uses_profile_backup_route(monkeypatch) -> None:
+    build_calls: list[
+        tuple[str, str | None, agent.ComponentSelection | None]
+    ] = []
+
+    def fake_build(
+        provider: str,
+        model_name: str | None = None,
+        llm_profile: agent.ComponentSelection | None = None,
+    ) -> _FakeLLM:
+        build_calls.append((provider, model_name, llm_profile))
+        return _FakeLLM(
+            provider=provider,
+            model=model_name or f"{provider}-default",
+            behavior="success",
+        )
+
+    monkeypatch.setattr(agent, "USE_LIVEKIT_FALLBACK_ADAPTER", False)
+    monkeypatch.setattr(agent, "build_llm_for_provider", fake_build)
+    primary_profile = agent.ComponentSelection(
+        category="llm",
+        slot="primary",
+        profile_key="llm_gemini_31_flash_lite_proxy",
+        kind="llm",
+        provider="google",
+        config={
+            "provider": "google",
+            "model": "gemini-3.1-flash-lite",
+            "fallback_provider": "google_vertex",
+            "fallback_model": "gemini-3.1-flash-lite",
+            "fallback_location": "eu",
+            "fallback_egress": "proxy",
+            "use_livekit_fallback_adapter": True,
+        },
+        source_owner_type="runtime",
+        source_owner_key="base",
+    )
+
+    client, metadata = agent.build_llm_client_for_branch(
+        branch="complex",
+        primary_provider="google",
+        primary_profile=primary_profile,
+    )
+
+    assert isinstance(client, llm.FallbackAdapter)
+    assert metadata.backup_provider == "google_vertex"
+    assert metadata.backup_model == "gemini-3.1-flash-lite"
+    assert metadata.uses_fallback_adapter is True
+    assert len(build_calls) == 2
+    backup_provider, backup_model, backup_profile = build_calls[1]
+    assert backup_provider == "google_vertex"
+    assert backup_model == "gemini-3.1-flash-lite"
+    assert backup_profile is not None
+    assert backup_profile.config == {
+        "provider": "google_vertex",
+        "model": "gemini-3.1-flash-lite",
+        "location": "eu",
+        "egress": "proxy",
+    }
 
 
 @pytest.mark.asyncio
@@ -790,6 +865,58 @@ async def test_client_silence_prompt_does_not_start_during_end_call(tmp_path) ->
     assert background_audio.played == []
     assert session.say_calls == []
     assert close_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_client_silence_prompt_does_not_resolve_audio_after_disconnect(
+    tmp_path,
+) -> None:
+    disconnected = False
+    incident_log = _FakeIncidentLog()
+    voice_audio_cache = _FakeVoiceAudioCache(tmp_path / "client_silence_cached.wav")
+    voice_audio_cache.path.write_bytes(b"fake")
+    manager, session, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        voice_audio_cache=voice_audio_cache,
+        client_silence_sec=0.02,
+        is_client_disconnected=lambda: disconnected,
+        client_disconnect_info=lambda: {
+            "disconnect_time": "2026-05-12T10:02:29.224Z",
+            "disconnect_reason": "CLIENT_INITIATED",
+            "participant_identity": "sip_9000828563",
+        },
+        incident_log=incident_log,
+    )
+
+    manager.on_agent_finished_speaking()
+    disconnected = True
+    await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    assert voice_audio_cache.calls == []
+    assert background_audio.played == []
+    assert session.say_calls == []
+    assert [item["incident_type"] for item in incident_log.records] == [
+        "voice_prompt_after_disconnect"
+    ]
+    assert incident_log.records[0]["payload"]["prompt_kind"] == "client_silence"
+    assert incident_log.records[0]["payload"]["disconnect_reason"] == "CLIENT_INITIATED"
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_cancels_pending_voice_prompt_timer(tmp_path) -> None:
+    manager, session, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        client_silence_sec=0.02,
+    )
+
+    manager.on_agent_finished_speaking()
+    manager.on_client_disconnected()
+    await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    assert background_audio.played == []
+    assert session.say_calls == []
 
 
 @pytest.mark.asyncio

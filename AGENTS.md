@@ -55,6 +55,9 @@ Repository-specific rules:
 - Do not break existing working flows without necessity.
 - Reusable integrations should go into `shared/webhooks` or `shared/utils`.
 - For each new webhook, create a separate module.
+- Before changing LLM/TTS/STT/turn profiles, bindings, snapshot behavior, or
+  provider/model selection, read `docs/profile-management.md` and keep Directus,
+  snapshot, docs, and tests in sync.
 - Before adding new plugins, tools, provider integrations, or diagnostic
   behavior, read `docs/robot-diagnostics.md` and use the shared incident log
   contract instead of inventing a separate error table/log format.

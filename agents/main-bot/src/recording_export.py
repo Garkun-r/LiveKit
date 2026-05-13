@@ -341,9 +341,9 @@ async def stop_room_recording(handle: RecordingHandle | None) -> api.EgressInfo 
         await lk.aclose()
 
 
-async def finalize_room_recording(handle: RecordingHandle | None) -> None:
+async def finalize_room_recording(handle: RecordingHandle | None) -> api.EgressInfo | None:
     if not handle:
-        return
+        return None
 
     deadline = asyncio.get_running_loop().time() + max(
         CALL_RECORDING_FINALIZE_TIMEOUT_SEC, 0
@@ -358,13 +358,14 @@ async def finalize_room_recording(handle: RecordingHandle | None) -> None:
         await asyncio.sleep(max(CALL_RECORDING_FINALIZE_POLL_SEC, 0.5))
 
     if info is None:
-        return
+        return None
 
     body = recording_payload_from_egress(handle, info)
     try:
         await upsert_recording(body)
     except Exception as exc:
         print(f"[recording] final Directus upsert failed: {exc}", flush=True)
+    return info
 
 
 async def refresh_recording_metadata(handle: RecordingHandle) -> bool:

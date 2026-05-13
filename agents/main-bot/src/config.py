@@ -59,11 +59,19 @@ TBANK_VOICEKIT_AUTHORITY = os.getenv("TBANK_VOICEKIT_AUTHORITY", "").strip()
 
 # LLM provider switch:
 # - google (default, direct Gemini API)
+# - google_vertex (Google Gemini through Vertex AI)
 # - xai (xAI Grok via livekit.plugins.xai.responses.LLM)
 def _normalize_llm_provider(raw_provider: str) -> str:
     return {
         "google": "google",
         "gemini": "google",
+        "google_vertex": "google_vertex",
+        "google-vertex": "google_vertex",
+        "gemini_vertex": "google_vertex",
+        "gemini-vertex": "google_vertex",
+        "vertex": "google_vertex",
+        "vertexai": "google_vertex",
+        "vertex_ai": "google_vertex",
         "xai": "xai",
         "grok": "xai",
     }.get(raw_provider.strip().lower(), raw_provider.strip().lower())
@@ -297,6 +305,9 @@ VOICE_SHORT_GREETING_PHRASE = (
         "Да, слушаю.",
     ).strip()
     or "Да, слушаю."
+)
+VOICE_SHORT_GREETING_DELAY_SEC = float(
+    os.getenv("VOICE_SHORT_GREETING_DELAY_SEC", "1.0")
 )
 VOICE_AUDIO_CACHE_ENABLED = _env_bool("VOICE_AUDIO_CACHE_ENABLED", default=True)
 VOICE_AUDIO_CACHE_DIR = os.getenv("VOICE_AUDIO_CACHE_DIR", "cache").strip() or "cache"
@@ -650,10 +661,14 @@ DIRECTUS_PROMPT_CACHE_TTL_SEC = float(os.getenv("DIRECTUS_PROMPT_CACHE_TTL_SEC",
 # the final aftercall payload, so abnormal closes still leave recent log lines.
 RAW_CALL_LOG_ENABLED = _env_bool("RAW_CALL_LOG_ENABLED", default=True)
 RAW_CALL_LOG_LEVEL = os.getenv("RAW_CALL_LOG_LEVEL", "INFO").strip().upper() or "INFO"
-RAW_CALL_LOG_FLUSH_INTERVAL_SEC = float(os.getenv("RAW_CALL_LOG_FLUSH_INTERVAL_SEC", "2.0"))
+RAW_CALL_LOG_FLUSH_INTERVAL_SEC = float(
+    os.getenv("RAW_CALL_LOG_FLUSH_INTERVAL_SEC", "2.0")
+)
 RAW_CALL_LOG_BATCH_SIZE = int(os.getenv("RAW_CALL_LOG_BATCH_SIZE", "50"))
 RAW_CALL_LOG_MAX_PENDING = int(os.getenv("RAW_CALL_LOG_MAX_PENDING", "1000"))
-RAW_CALL_LOG_MAX_MESSAGE_CHARS = int(os.getenv("RAW_CALL_LOG_MAX_MESSAGE_CHARS", "8000"))
+RAW_CALL_LOG_MAX_MESSAGE_CHARS = int(
+    os.getenv("RAW_CALL_LOG_MAX_MESSAGE_CHARS", "8000")
+)
 RAW_CALL_LOG_MAX_EXTRA_CHARS = int(os.getenv("RAW_CALL_LOG_MAX_EXTRA_CHARS", "12000"))
 
 DIRECTUS_DEFAULT_TIMEZONE = os.getenv(
@@ -735,7 +750,9 @@ N8N_WEBHOOK_TOKEN = os.getenv("N8N_WEBHOOK_TOKEN", "")
 # LiveKit Egress audio recordings. This is best-effort and must never block the
 # realtime call path when Egress or storage is unavailable.
 CALL_RECORDING_ENABLED = _env_bool("CALL_RECORDING_ENABLED", default=False)
-CALL_RECORDING_S3_ENDPOINT = os.getenv("CALL_RECORDING_S3_ENDPOINT", "").strip().rstrip("/")
+CALL_RECORDING_S3_ENDPOINT = (
+    os.getenv("CALL_RECORDING_S3_ENDPOINT", "").strip().rstrip("/")
+)
 CALL_RECORDING_S3_BUCKET = os.getenv("CALL_RECORDING_S3_BUCKET", "").strip()
 CALL_RECORDING_S3_REGION = os.getenv("CALL_RECORDING_S3_REGION", "us-east-1").strip()
 CALL_RECORDING_S3_ACCESS_KEY = os.getenv("CALL_RECORDING_S3_ACCESS_KEY", "").strip()
@@ -751,7 +768,9 @@ CALL_RECORDING_FINALIZE_TIMEOUT_SEC = float(
 CALL_RECORDING_FINALIZE_POLL_SEC = float(
     os.getenv("CALL_RECORDING_FINALIZE_POLL_SEC", "1.5")
 )
-CALL_RECORDING_STOP_TIMEOUT_SEC = float(os.getenv("CALL_RECORDING_STOP_TIMEOUT_SEC", "3"))
+CALL_RECORDING_STOP_TIMEOUT_SEC = float(
+    os.getenv("CALL_RECORDING_STOP_TIMEOUT_SEC", "3")
+)
 
 SMS_RU_API_URL = os.getenv("SMS_RU_API_URL", "https://sms.ru/sms/send")
 SMS_RU_API_ID = os.getenv("SMS_RU_API_ID", "")

@@ -1,4 +1,5 @@
 import pytest
+from google.auth.credentials import AnonymousCredentials
 from livekit.plugins import google
 
 import agent
@@ -45,3 +46,43 @@ def test_build_google_llm_applies_egress_to_genai_client(monkeypatch) -> None:
         "trust_env": False,
         "proxy": "http://proxy.example:15182",
     }
+
+
+def test_build_google_vertex_llm_uses_profile_location_and_credentials(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        agent,
+        "_load_google_cloud_credentials_for_vertex",
+        lambda: (AnonymousCredentials(), "inferred-project"),
+    )
+
+    llm = agent.build_llm_for_provider(
+        "google_vertex",
+        llm_profile=agent.ComponentSelection(
+            category="llm",
+            slot="primary",
+            profile_key="test_vertex",
+            kind="llm",
+            provider="google_vertex",
+            config={
+                "model": "gemini-3.1-flash-lite",
+                "location": "europe-west1",
+                "temperature": 0.7,
+                "max_output_tokens": 512,
+                "top_p": 1,
+                "thinking_level": "minimal",
+                "egress": "direct",
+            },
+            source_owner_type="runtime",
+            source_owner_key="base",
+        ),
+    )
+
+    assert isinstance(llm, google.LLM)
+    assert llm.provider == "Vertex AI"
+    assert llm.model == "gemini-3.1-flash-lite"
+    assert llm._client.vertexai is True
+    assert llm._client._api_client.project == "inferred-project"
+    assert llm._client._api_client.location == "europe-west1"
+    assert llm._client._api_client._http_options.client_args == {"trust_env": False}

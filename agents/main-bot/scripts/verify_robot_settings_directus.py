@@ -135,7 +135,9 @@ def _parse_active_env_keys(path: Path) -> set[str]:
 def _public_profile(selection: Any) -> str:
     if selection is None:
         return "missing"
-    egress = selection.config.get("egress") if isinstance(selection.config, dict) else None
+    egress = (
+        selection.config.get("egress") if isinstance(selection.config, dict) else None
+    )
     suffix = f", egress={egress}" if egress else ""
     return f"{selection.profile_key} ({selection.provider}{suffix})"
 
@@ -164,7 +166,10 @@ def _find_snapshot_secret_like_keys(payload: dict[str, Any]) -> list[str]:
                 continue
             if normalized in {"max_output_tokens"}:
                 continue
-            if any(part in normalized for part in ("api_key", "secret", "token", "credentials", "auth_key")):
+            if any(
+                part in normalized
+                for part in ("api_key", "secret", "token", "credentials", "auth_key")
+            ):
                 findings.append(f"{profile.get('profile_key')}.{key}")
     return findings
 
@@ -177,11 +182,18 @@ async def _main() -> int:
     parser.add_argument("--runtime", default=None)
     parser.add_argument("--did", default=None)
     parser.add_argument("--allow-legacy-env", action="store_true")
+    parser.add_argument(
+        "--compare-snapshot",
+        action="store_true",
+        help="Also compare Directus settings with the local cold-start snapshot.",
+    )
     args = parser.parse_args()
 
     os.chdir(ROOT_DIR)
     sys.path.insert(0, str(SRC_DIR))
     load_dotenv(args.env_file, override=True)
+
+    import export_robot_settings_snapshot as snapshot_export
 
     import config
     import robot_settings
@@ -221,12 +233,34 @@ async def _main() -> int:
     snapshot_path = Path(config.ROBOT_SETTINGS_SNAPSHOT_FILE)
     if not snapshot_path.is_absolute():
         snapshot_path = ROOT_DIR / snapshot_path
-    snapshot_secret_keys = _find_snapshot_secret_like_keys(_load_snapshot(snapshot_path))
+    snapshot_secret_keys = _find_snapshot_secret_like_keys(
+        _load_snapshot(snapshot_path)
+    )
     if snapshot_secret_keys:
         errors.append(
             "snapshot contains secret-like config keys: "
             + ", ".join(snapshot_secret_keys)
         )
+
+    if args.compare_snapshot:
+        try:
+            directus_snapshot = await snapshot_export.fetch_directus_snapshot_payload()
+            local_snapshot = snapshot_export.load_snapshot_payload(snapshot_path)
+        except Exception as e:
+            detail = f"{type(e).__name__}: {e}".strip()
+            errors.append(f"failed to compare Directus snapshot: {detail}")
+        else:
+            directus_text = snapshot_export.stable_snapshot_text(directus_snapshot)
+            local_text = (
+                snapshot_export.stable_snapshot_text(local_snapshot)
+                if local_snapshot
+                else ""
+            )
+            if directus_text != local_text:
+                errors.append(
+                    "local robot_settings_snapshot.json differs from Directus; "
+                    "run scripts/export_robot_settings_snapshot.py"
+                )
 
     if active_legacy_keys and not args.allow_legacy_env:
         errors.append(
@@ -239,7 +273,9 @@ async def _main() -> int:
     print(f"project={resolved.project_key or 'none'}")
     print(f"llm={_public_profile(resolved.llm_primary)}")
     print(f"llm_fast={_public_profile(resolved.component('llm_routing', 'fast'))}")
-    print(f"llm_complex={_public_profile(resolved.component('llm_routing', 'complex'))}")
+    print(
+        f"llm_complex={_public_profile(resolved.component('llm_routing', 'complex'))}"
+    )
     print(f"tts={_public_profile(resolved.tts_primary)}")
     print(f"stt={_public_profile(resolved.stt_primary)}")
     print(f"turn={_public_profile(resolved.turn)}")
@@ -247,6 +283,7 @@ async def _main() -> int:
     print(f"profile_bindings={len(store.profile_bindings)}")
     print(f"project_profiles={len(store.project_profiles)}")
     print(f"active_legacy_env_keys={len(active_legacy_keys)}")
+    print(f"snapshot_compare={'enabled' if args.compare_snapshot else 'skipped'}")
 
     if errors:
         print("FAILED")

@@ -41,9 +41,7 @@ async def test_sber_stream_sends_ssml_request_and_emits_pcm_audio() -> None:
     assert request.voice == "Ost_24000"
     assert request.language == "ru-RU"
     assert request.text == (
-        '<speak><paint pitch="2" speed="4" loudness="5">'
-        "Здравствуйте!"
-        "</paint></speak>"
+        '<speak><paint pitch="2" speed="4" loudness="5">Здравствуйте!</paint></speak>'
     )
 
     await tts_client.aclose()
@@ -91,7 +89,11 @@ def test_build_tts_uses_sber_provider(monkeypatch) -> None:
     monkeypatch.setattr(agent, "SBER_TTS_REBUILD_CACHE", False)
     monkeypatch.setattr(agent, "SBER_TTS_MIN_SENTENCE_LEN", 4)
     monkeypatch.setattr(agent, "SBER_TTS_STREAM_CONTEXT_LEN", 1)
-    monkeypatch.setattr(agent, "provider_proxy_url", lambda provider: None)
+    monkeypatch.setattr(
+        agent,
+        "provider_proxy_url",
+        lambda provider, mode_override=None: None,
+    )
     monkeypatch.setattr(agent, "SberSaluteTTS", _FakeSberTTS)
 
     result = agent.build_tts()
@@ -103,3 +105,59 @@ def test_build_tts_uses_sber_provider(monkeypatch) -> None:
     assert captured["paint_speed"] == "4"
     assert captured["paint_loudness"] == "5"
     assert captured["sample_rate"] == 24000
+
+
+def test_build_tts_sber_uses_profile_config(monkeypatch) -> None:
+    captured = {}
+
+    class _FakeSberTTS:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(agent, "TTS_PROVIDER", "elevenlabs")
+    monkeypatch.setattr(agent, "SBER_SALUTESPEECH_AUTH_KEY", "test-auth-key")
+    monkeypatch.setattr(agent, "SBER_TTS_OAUTH_SCOPE", "SALUTE_SPEECH_PERS")
+    monkeypatch.setattr(agent, "SBER_TTS_OAUTH_URL", "https://oauth.example/token")
+    monkeypatch.setattr(agent, "SBER_TTS_CA_CERT_FILE", "")
+    monkeypatch.setattr(agent, "SBER_TTS_REQUEST_TIMEOUT_SEC", 15.0)
+    monkeypatch.setattr(agent, "SBER_TTS_REBUILD_CACHE", False)
+    monkeypatch.setattr(
+        agent,
+        "provider_proxy_url",
+        lambda provider, mode_override=None: None,
+    )
+    monkeypatch.setattr(agent, "SberSaluteTTS", _FakeSberTTS)
+
+    profile = agent.ComponentSelection(
+        category="tts",
+        slot="primary",
+        profile_key="tts_sber_profile",
+        kind="tts",
+        provider="sber",
+        config={
+            "endpoint": "profile.sber.example:443",
+            "voice": "ProfileVoice",
+            "language": "ru-RU",
+            "sample_rate": 16000,
+            "paint_pitch": "1",
+            "paint_speed": "2",
+            "paint_loudness": "3",
+            "min_sentence_len": 5,
+            "stream_context_len": 2,
+        },
+        source_owner_type="runtime",
+        source_owner_key="base",
+    )
+
+    result = agent.build_tts(tts_profile=profile)
+
+    assert isinstance(result, _FakeSberTTS)
+    assert captured["auth_key"] == "test-auth-key"
+    assert captured["endpoint"] == "profile.sber.example:443"
+    assert captured["voice"] == "ProfileVoice"
+    assert captured["language"] == "ru-RU"
+    assert captured["sample_rate"] == 16000
+    assert captured["paint_pitch"] == "1"
+    assert captured["paint_speed"] == "2"
+    assert captured["paint_loudness"] == "3"
+    assert agent.resolve_audio_output_sample_rate(profile) == 16000

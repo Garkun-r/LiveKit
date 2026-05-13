@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import pytest
 from livekit import api
 
 import recording_export
@@ -101,3 +102,36 @@ def test_recording_payload_uses_single_file_metadata() -> None:
     assert payload["object_key"] == "livekit/room-3/final.mp3"
     assert payload["file_size"] == 45678
     assert payload["duration_sec"] == 301.712199651
+
+
+@pytest.mark.asyncio
+async def test_finalize_room_recording_returns_latest_egress_info(monkeypatch) -> None:
+    handle = RecordingHandle(
+        egress_id="EG_4",
+        room_name="room-4",
+        object_key="livekit/room-4/recording.mp3",
+        started_at="2026-05-08T12:00:00+00:00",
+    )
+    info = SimpleNamespace(
+        egress_id="EG_4",
+        room_name="room-4",
+        status=api.EgressStatus.EGRESS_COMPLETE,
+        error="",
+        file_results=[],
+    )
+    payloads = []
+
+    async def fake_list_egress(egress_id: str):
+        assert egress_id == "EG_4"
+        return info
+
+    async def fake_upsert_recording(payload: dict):
+        payloads.append(payload)
+
+    monkeypatch.setattr(recording_export, "_list_egress", fake_list_egress)
+    monkeypatch.setattr(recording_export, "upsert_recording", fake_upsert_recording)
+
+    result = await recording_export.finalize_room_recording(handle)
+
+    assert result is info
+    assert payloads[0]["status"] == "complete"

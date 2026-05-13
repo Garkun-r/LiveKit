@@ -47,8 +47,8 @@ values
     'Модель, которая используется как резерв внутри этого LLM-профиля. Например, легкая Gemini-модель для быстрого восстановления ответа.',
     'string',
     'select',
-    '{"choices":[{"value":"gemini-3.1-flash-lite-preview","label":"Gemini 3.1 Flash Lite Preview"},{"value":"gemini-3-flash-preview","label":"Gemini 3 Flash Preview"},{"value":"grok-4-1-fast-non-reasoning-latest","label":"Grok 4.1 Fast"}]}'::jsonb,
-    to_jsonb('gemini-3.1-flash-lite-preview'::text),
+    '{"choices":[{"value":"gemini-3.1-flash-lite","label":"Gemini 3.1 Flash Lite"},{"value":"gemini-3.1-flash-lite-preview","label":"Gemini 3.1 Flash Lite Preview"},{"value":"gemini-3-flash-preview","label":"Gemini 3 Flash Preview"},{"value":"grok-4-1-fast-non-reasoning-latest","label":"Grok 4.1 Fast"}]}'::jsonb,
+    to_jsonb('gemini-3.1-flash-lite'::text),
     '{}'::jsonb,
     '{}'::jsonb,
     87,
@@ -210,7 +210,7 @@ set config_json =
   p.config_json
   || jsonb_build_object(
     'fallback_provider', coalesce(f.config_json->>'complex_backup_provider', 'google'),
-    'fallback_model', coalesce(f.config_json->>'complex_backup_model', 'gemini-3.1-flash-lite-preview'),
+    'fallback_model', coalesce(f.config_json->>'complex_backup_model', 'gemini-3.1-flash-lite'),
     'use_livekit_fallback_adapter', coalesce((f.config_json->>'use_livekit_adapter')::boolean, true),
     'attempt_timeout_sec', 2.5,
     'max_retry_per_llm', 0,

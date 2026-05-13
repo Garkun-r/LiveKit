@@ -30,6 +30,10 @@ agent instructions, handoffs/tasks, tool behavior, model routing, fallback
 activation, retry/timeout settings, latency guards, turn detection, customer
 flow, and any client-visible response behavior.
 
+Before changing LLM/TTS/STT/turn profiles, Directus bindings, snapshot behavior,
+or provider/model selection, read `../../docs/profile-management.md`. Keep
+Directus, `config/robot_settings_snapshot.json`, docs, and tests aligned.
+
 If Gemini, xAI, Deepgram, ElevenLabs, Google, Vertex, LiveKit Inference, or any
 other provider is slow or failing, investigate the root cause first. Switching
 to a backup provider/model/service is a business decision. Present the expected
