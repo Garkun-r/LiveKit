@@ -142,8 +142,10 @@ Voice prompt catalog:
 - `client_silence`: "Алло." Plays if the assistant is listening and the caller
   stays silent past `VOICE_CLIENT_SILENCE_FIRST_SEC`. The prompt repeats up to
   `VOICE_CLIENT_SILENCE_MAX_PROMPTS` with `VOICE_CLIENT_SILENCE_SEC` between
-  prompts; if the caller stays silent after the last prompt and one more silence
-  interval, the agent deletes the room without a final LLM-generated phrase.
+  prompts. The first prompt uses `VOICE_CLIENT_SILENCE_AUDIO_PATH`; the second
+  and later prompts use `VOICE_CLIENT_SILENCE_SECOND_AUDIO_PATH`. If the caller
+  stays silent after the last prompt and one more silence interval, the agent
+  deletes the room without a final LLM-generated phrase.
 - `emergency`: "Извините, перезвоните ещё раз." Plays for unrecoverable runtime
   errors.
 - Future prompts: `tool_wait`, `transfer`, and `farewell` are reserved for

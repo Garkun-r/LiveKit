@@ -1,4 +1,5 @@
 import asyncio
+import wave
 from types import SimpleNamespace
 
 import pytest
@@ -14,15 +15,20 @@ from agent import (
     event_timestamp_seconds,
     extract_sip_diagnostic_context,
     is_abnormal_close,
+    play_prerecorded_audio,
+    prerecorded_playout_timeout_sec,
     should_fire_startup_no_dialog_timeout,
     should_log_slow_response_latency,
     should_log_startup_provider_fallback,
     should_play_initial_greeting,
     should_stop_recording_on_close,
+    speech_playout_was_observed,
     turn_response_latency_ms,
     wait_for_initial_greeting_delay,
+    wait_for_room_audio_output_ready,
     wait_for_short_greeting_delay,
     wait_for_speech_playout,
+    wav_audio_duration_sec,
 )
 
 
@@ -85,6 +91,39 @@ class _Session:
 
     def clear_user_turn(self) -> None:
         self.clear_user_turn_calls += 1
+
+
+class _SaySession:
+    def __init__(self, handles: list[_SpeechHandle]):
+        self.handles = handles
+        self.say_calls: list[dict[str, object]] = []
+
+    def say(
+        self,
+        text: str,
+        *,
+        audio,
+        allow_interruptions: bool,
+        add_to_chat_ctx: bool,
+    ) -> _SpeechHandle:
+        self.say_calls.append(
+            {
+                "text": text,
+                "audio": audio,
+                "allow_interruptions": allow_interruptions,
+                "add_to_chat_ctx": add_to_chat_ctx,
+            }
+        )
+        return self.handles.pop(0)
+
+
+def _write_wav(path, *, sample_rate: int = 8000, duration_sec: float = 0.1) -> None:
+    frame_count = int(sample_rate * duration_sec)
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(b"\0\0" * frame_count)
 
 
 def test_extract_sip_diagnostic_context_reads_trace_and_call_id() -> None:
@@ -191,6 +230,81 @@ async def test_speech_playout_timeout_stops_handle() -> None:
     assert handle.stopped is True
 
 
+@pytest.mark.asyncio
+async def test_prerecorded_audio_retries_after_timeout(tmp_path) -> None:
+    audio_path = tmp_path / "short.wav"
+    _write_wav(audio_path)
+    first_handle = _SpeechHandle(done=False)
+    second_handle = _SpeechHandle(done=True)
+    session = _SaySession([first_handle, second_handle])
+
+    played = await play_prerecorded_audio(
+        session=session,
+        audio_path=audio_path,
+        sample_rate=24000,
+        allow_interruptions=False,
+        add_to_chat_ctx=False,
+        timeout_sec=0.01,
+        retry_count=1,
+    )
+
+    assert played is True
+    assert first_handle.stopped is True
+    assert len(session.say_calls) == 2
+
+
+def test_wav_audio_duration_sec_reads_duration(tmp_path) -> None:
+    audio_path = tmp_path / "short.wav"
+    _write_wav(audio_path, sample_rate=8000, duration_sec=0.25)
+
+    assert wav_audio_duration_sec(audio_path) == 0.25
+
+
+def test_prerecorded_playout_timeout_caps_short_wav(monkeypatch, tmp_path) -> None:
+    audio_path = tmp_path / "short.wav"
+    _write_wav(audio_path, sample_rate=8000, duration_sec=0.25)
+    monkeypatch.setattr(agent, "VOICE_PRERECORDED_PLAYOUT_GRACE_SEC", 0.2)
+    monkeypatch.setattr(agent, "VOICE_PRERECORDED_MIN_PLAYOUT_TIMEOUT_SEC", 0.6)
+
+    assert (
+        prerecorded_playout_timeout_sec(
+            audio_path=audio_path,
+            default_timeout_sec=12.0,
+        )
+        == 0.6
+    )
+
+
+def test_prerecorded_playout_timeout_preserves_disabled_timeout(tmp_path) -> None:
+    audio_path = tmp_path / "short.wav"
+    _write_wav(audio_path)
+
+    assert (
+        prerecorded_playout_timeout_sec(
+            audio_path=audio_path,
+            default_timeout_sec=0,
+        )
+        == 0
+    )
+
+
+def test_speech_playout_was_observed_requires_new_speaking_event() -> None:
+    assert (
+        speech_playout_was_observed(
+            speaking_revision_before=2,
+            speaking_revision_after=3,
+        )
+        is True
+    )
+    assert (
+        speech_playout_was_observed(
+            speaking_revision_before=2,
+            speaking_revision_after=2,
+        )
+        is False
+    )
+
+
 def test_turn_response_latency_measures_user_end_to_agent_start() -> None:
     assert (
         turn_response_latency_ms(
@@ -218,6 +332,33 @@ def test_agent_room_options_delete_room_on_close() -> None:
 
     assert options.delete_room_on_close is True
     assert options.get_audio_output_options().sample_rate == 16000
+
+
+def test_agent_room_options_can_pin_participant_identity() -> None:
+    options = build_agent_room_options(
+        audio_output_sample_rate=16000,
+        participant_identity="sip_123",
+    )
+
+    assert options.participant_identity == "sip_123"
+
+
+@pytest.mark.asyncio
+async def test_room_audio_output_ready_returns_true_for_completed_subscription() -> None:
+    subscribed_fut = asyncio.Future()
+    subscribed_fut.set_result(None)
+    session = SimpleNamespace(room_io=SimpleNamespace(subscribed_fut=subscribed_fut))
+
+    assert await wait_for_room_audio_output_ready(session, timeout_sec=0.01) is True
+
+
+@pytest.mark.asyncio
+async def test_room_audio_output_ready_times_out_without_canceling_subscription() -> None:
+    subscribed_fut = asyncio.Future()
+    session = SimpleNamespace(room_io=SimpleNamespace(subscribed_fut=subscribed_fut))
+
+    assert await wait_for_room_audio_output_ready(session, timeout_sec=0.01) is False
+    assert subscribed_fut.cancelled() is False
 
 
 def test_should_log_slow_response_latency_when_threshold_is_reached() -> None:

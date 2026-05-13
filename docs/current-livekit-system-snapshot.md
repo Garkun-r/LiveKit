@@ -341,7 +341,7 @@ for:
 - initial greeting;
 - short greeting follow-up;
 - response delay filler;
-- client silence prompt;
+- client silence prompt fallback when the prerecorded file is unavailable;
 - emergency fallback phrase.
 
 If cached/generated audio is unavailable, the agent falls back to TTS where it

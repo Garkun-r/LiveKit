@@ -185,6 +185,7 @@ def _voice_prompt_manager(
     client_silence_sec: float = 0.01,
     client_silence_stt_grace_sec: float = 0.0,
     client_silence_max_prompts: int = 2,
+    client_silence_audio_paths=None,
     speech_playout_timeout_sec: float = 12.0,
     is_closed=lambda: False,
     is_end_call_scheduled=lambda: False,
@@ -197,6 +198,8 @@ def _voice_prompt_manager(
     client_silence_audio = tmp_path / "client_silence.wav"
     response_delay_audio.write_bytes(b"fake")
     client_silence_audio.write_bytes(b"fake")
+    if client_silence_audio_paths is None:
+        client_silence_audio_paths = (client_silence_audio,)
     session = session or _FakePromptSession()
     background_audio = background_audio or _FakeBackgroundAudio()
     if on_client_silence_timeout is None:
@@ -215,8 +218,9 @@ def _voice_prompt_manager(
         ),
         client_silence_prompt=agent.VoicePromptSpec(
             kind="client_silence",
-            audio_paths=(client_silence_audio,),
+            audio_paths=tuple(client_silence_audio_paths),
             phrase="Алло.",
+            prefer_prerecorded=True,
         ),
         response_delay_sec=response_delay_sec,
         response_delay_post_gap_sec=response_delay_post_gap_sec,
@@ -651,6 +655,40 @@ async def test_client_silence_prompts_twice_then_requests_close(tmp_path) -> Non
         str(tmp_path / "client_silence.wav"),
     ]
     assert session.say_calls == []
+
+
+@pytest.mark.asyncio
+async def test_client_silence_second_prompt_uses_second_audio(tmp_path) -> None:
+    close_reasons: list[str] = []
+    client_silence_audio = tmp_path / "client_silence.wav"
+    client_silence_second_audio = tmp_path / "client_silence2.wav"
+    client_silence_second_audio.write_bytes(b"fake")
+    cached_path = tmp_path / "cached.wav"
+    cached_path.write_bytes(b"fake")
+    voice_audio_cache = _FakeVoiceAudioCache(cached_path)
+
+    async def on_client_silence_timeout() -> None:
+        close_reasons.append("client_silence_timeout")
+
+    manager, _, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        client_silence_audio_paths=(
+            client_silence_audio,
+            client_silence_second_audio,
+        ),
+        voice_audio_cache=voice_audio_cache,
+        on_client_silence_timeout=on_client_silence_timeout,
+    )
+
+    manager.on_agent_finished_speaking()
+    await _wait_until(lambda: close_reasons == ["client_silence_timeout"])
+    await manager.aclose()
+
+    assert background_audio.played == [
+        str(client_silence_audio),
+        str(client_silence_second_audio),
+    ]
+    assert voice_audio_cache.calls == []
 
 
 @pytest.mark.asyncio
