@@ -165,7 +165,7 @@ Snapshot has no project profiles. Runtime bindings currently are:
 ```text
 runtime=base
   llm.primary        -> llm_gemini
-  llm_routing.fast  -> llm_xai
+  llm_routing.fast  -> llm_gemini_31_flash_lite
   llm_routing.complex -> llm_gemini
   stt.primary        -> stt_deepgram_ru_phone
   tts.primary        -> tts_elevenlabs_v3
@@ -185,15 +185,15 @@ Important profile values from snapshot:
 llm_gemini
   provider: google
   model: gemini-3-flash-preview
-  fallback: google / gemini-3.1-flash-lite
+  fallback: google_vertex / gemini-3.1-flash-lite
   use_livekit_fallback_adapter: true
   attempt_timeout_sec: 2.5
 
-llm_xai
-  provider: xai
-  model: grok-4-1-fast-non-reasoning-latest
-  tools disabled
-  fallback: google / gemini-3.1-flash-lite
+llm_gemini_31_flash_lite
+  provider: google
+  model: gemini-3.1-flash-lite
+  fallback: google_vertex / gemini-3.1-flash-lite
+  fallback_location: eu
   use_livekit_fallback_adapter: true
 
 stt_deepgram_ru_phone
@@ -326,7 +326,7 @@ Supported TTS providers:
 elevenlabs -> official plugin or custom eleven_v3 HTTP streaming adapter
 google     -> livekit.plugins.google.TTS / Google Cloud TTS
 vertex     -> custom Vertex Gemini streaming TTS path
-minimax    -> LiveKit MiniMax plugin path with project patching
+minimax    -> local prepared MiniMax WebSocket path with reusable task_start
 cosyvoice  -> custom Alibaba CosyVoice WebSocket path
 tbank      -> custom T-Bank VoiceKit gRPC streaming TTS
 sber       -> custom Sber SaluteSpeech gRPC streaming TTS
@@ -441,6 +441,7 @@ prompt_lookup_failed
 session_start_failed
 agent_session_error
 provider_fallback
+llm_fallback_same_provider
 slow_response
 reply_watchdog_fired
 no_dialog_startup_timeout

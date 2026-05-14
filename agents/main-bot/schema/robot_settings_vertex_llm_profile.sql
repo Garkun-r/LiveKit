@@ -326,3 +326,52 @@ where kind = 'fallback'
     config_json ->> 'fast_backup_model' = 'gemini-3.1-flash-lite-preview'
     or config_json ->> 'complex_backup_model' = 'gemini-3.1-flash-lite-preview'
   );
+
+update public.robot_component_profiles
+set config_json = config_json || '{
+    "fallback_provider": "google_vertex",
+    "fallback_model": "gemini-3.1-flash-lite",
+    "fallback_location": "eu",
+    "fallback_egress": "direct"
+  }'::jsonb,
+  updated_at = now()
+where profile_key = 'llm_gemini';
+
+update public.robot_component_profiles
+set config_json = config_json || '{
+    "fallback_provider": "google_vertex",
+    "fallback_model": "gemini-3.1-flash-lite",
+    "fallback_location": "eu",
+    "fallback_egress": "proxy"
+  }'::jsonb,
+  updated_at = now()
+where profile_key = 'llm_google_proxy';
+
+update public.robot_component_profiles
+set config_json = config_json || '{
+    "fast_backup_provider": "google_vertex",
+    "fast_backup_model": "gemini-3.1-flash-lite",
+    "complex_backup_provider": "google_vertex",
+    "complex_backup_model": "gemini-3.1-flash-lite",
+    "use_livekit_adapter": true
+  }'::jsonb,
+  updated_at = now()
+where profile_key = 'fallback_google_lite';
+
+update public.robot_profile_bindings
+set profile_key = 'llm_gemini_31_flash_lite',
+  note = 'Base/cloud: быстрая ветка Gemini 3.1 Flash Lite с Vertex fallback',
+  updated_at = now()
+where owner_type = 'runtime'
+  and owner_key = 'base'
+  and category = 'llm_routing'
+  and slot = 'fast';
+
+update public.robot_setting_fields
+set default_value = to_jsonb('google_vertex'::text),
+  updated_at = now()
+where setting_key in (
+  'fallback.fast_backup_provider',
+  'fallback.complex_backup_provider',
+  'llm.fallback_provider'
+);

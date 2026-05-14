@@ -45,6 +45,9 @@ from livekit.agents import (
 from livekit.agents import (
     stt as lk_stt,
 )
+from livekit.agents import (
+    tts as lk_tts,
+)
 from livekit.agents.llm import ChatContext, ChatMessage
 from livekit.agents.llm.tool_context import StopResponse
 from livekit.agents.utils.audio import audio_frames_from_file
@@ -53,11 +56,9 @@ from livekit.plugins import (
     deepgram,
     elevenlabs,
     google,
-    minimax,
     silero,
     xai,
 )
-from livekit.plugins.minimax import tts as minimax_tts_plugin
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from config import (
@@ -152,6 +153,8 @@ from config import (
     MINIMAX_API_KEY,
     MINIMAX_TTS_BASE_URL,
     MINIMAX_TTS_BITRATE,
+    MINIMAX_TTS_CHANNEL,
+    MINIMAX_TTS_CONNECTION_REUSE,
     MINIMAX_TTS_FORMAT,
     MINIMAX_TTS_INTENSITY,
     MINIMAX_TTS_LANGUAGE_BOOST,
@@ -281,6 +284,7 @@ from egress import (
 )
 from eleven_v3_tts import ElevenV3TTS
 from incident_logger import IncidentLogger, classify_error, component_identity
+from minimax_tts import PreparedMiniMaxTTS
 from prompt_repo import PromptResolution, get_active_prompt, resolve_prompt_for_call
 from raw_call_logs import (
     RawCallLogSink,
@@ -314,7 +318,6 @@ logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
 _materialized_google_credentials_file: str | None = None
-_minimax_sound_effects_patched = False
 
 _AUDIO_DIR = Path(__file__).resolve().parent.parent / "audio"
 _INITIAL_GREETING_AUDIO_PATH = _AUDIO_DIR / "1.wav"
@@ -353,6 +356,13 @@ _SHORT_GREETING_RE = re.compile(
     r"^(?:алло|алло алло|ало|ало ало|алё|алё алё|але|але але|доброе утро|алло доброе утро|ало доброе утро|алё доброе утро|добрый день|алло добрый день|ало добрый день|алё добрый день|здравствуйте|да[,\s]+здравствуйте|да[,\s]+да[,\s]+здравствуйте|алло здравствуйте|ало здравствуйте|алё здравствуйте|девушка здравствуйте|алло девушка здравствуйте|здрасьте|здрасте|да[,\s]+(?:здрасьте|здрасте)|да[,\s]+да[,\s]+(?:здрасьте|здрасте)|алло здрасьте|ало здрасьте|алё здрасьте|девушка здрасьте|алло девушка здрасьте)[\.!\?, ]*$",
     re.IGNORECASE,
 )
+_AVITO_INTRO_RE = re.compile(
+    r"(?=.*\bавито\b)"  # noqa: RUF001
+    r"(?=.*\bзвон\w*\b)"  # noqa: RUF001
+    r"(?=.*\bоб[ъь]?явлен\w*\b)"  # noqa: RUF001
+    r"(?=.*\bразговор может быть записан\w*\b)",  # noqa: RUF001
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -372,6 +382,43 @@ class LLMBranchMetadata:
     @property
     def has_backup(self) -> bool:
         return bool(self.backup_provider and self.backup_model)
+
+
+def llm_fallback_same_provider_risk(metadata: LLMBranchMetadata | None) -> bool:
+    if metadata is None or not metadata.uses_fallback_adapter or not metadata.has_backup:
+        return False
+    primary_provider = normalize_provider_name(metadata.primary_provider)
+    backup_provider = normalize_provider_name(metadata.backup_provider)
+    return bool(primary_provider and primary_provider == backup_provider)
+
+
+def record_llm_fallback_configuration_incidents(
+    metadata_by_branch: dict[str, LLMBranchMetadata],
+    incident_log: IncidentLogger,
+) -> None:
+    for branch, metadata in metadata_by_branch.items():
+        if not llm_fallback_same_provider_risk(metadata):
+            continue
+        incident_log.record_nowait(
+            "llm_fallback_same_provider",
+            severity="warning",
+            component="llm",
+            provider=metadata.primary_provider,
+            model=metadata.primary_model,
+            description=(
+                "LLM primary and backup use the same provider; backup only "
+                "protects from model-level failures"
+            ),
+            payload={
+                "branch": branch,
+                "primary_provider": metadata.primary_provider,
+                "primary_model": metadata.primary_model,
+                "backup_provider": metadata.backup_provider,
+                "backup_model": metadata.backup_model,
+                "uses_fallback_adapter": metadata.uses_fallback_adapter,
+                "risk": "provider_account_quota_wide_failure",
+            },
+        )
 
 
 def _component_config(component: ComponentSelection | None) -> dict[str, Any]:
@@ -521,34 +568,6 @@ _EMERGENCY_AUDIO_PATH = resolve_configured_audio_path(VOICE_EMERGENCY_AUDIO_PATH
 _VOICE_AUDIO_CACHE_DIR = resolve_voice_audio_cache_dir(VOICE_AUDIO_CACHE_DIR)
 
 
-def _patch_minimax_sound_effects() -> None:
-    """Inject voice_modify.sound_effects into official MiniMax plugin payload."""
-    global _minimax_sound_effects_patched
-
-    if _minimax_sound_effects_patched:
-        return
-    if not MINIMAX_TTS_SOUND_EFFECTS:
-        return
-
-    original_to_minimax_options = minimax_tts_plugin._to_minimax_options
-
-    def _patched_to_minimax_options(opts: Any) -> dict[str, Any]:
-        config = original_to_minimax_options(opts)
-        voice_modify = config.get("voice_modify")
-        if not isinstance(voice_modify, dict):
-            voice_modify = {}
-            config["voice_modify"] = voice_modify
-        voice_modify["sound_effects"] = MINIMAX_TTS_SOUND_EFFECTS
-        return config
-
-    minimax_tts_plugin._to_minimax_options = _patched_to_minimax_options
-    _minimax_sound_effects_patched = True
-    logger.info(
-        "patched MiniMax plugin payload with voice_modify.sound_effects",
-        extra={"sound_effects": MINIMAX_TTS_SOUND_EFFECTS},
-    )
-
-
 def safe_dump(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -631,6 +650,25 @@ def clear_initial_greeting_user_turn(session: AgentSession) -> bool:
         return False
     logger.info("user turn buffer cleared after initial greeting")
     return True
+
+
+def build_service_phrase_transcript_item(
+    *,
+    text: str | None,
+    kind: str,
+    source: str,
+) -> dict[str, Any] | None:
+    resolved_text = (text or "").strip()
+    if not resolved_text:
+        return None
+    return {
+        "type": "service_phrase",
+        "kind": kind,
+        "role": "assistant",
+        "text": resolved_text,
+        "source": source,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def extract_sip_call_numbers(participant: Any | None) -> dict[str, str | None]:
@@ -725,6 +763,18 @@ def turn_response_latency_ms(
     return round(max(0.0, assistant_started_at - user_phrase_ended_at) * 1000, 1)
 
 
+def vad_speech_duration_ms(
+    *,
+    started_at: float | None,
+    ended_at: float | None,
+) -> float | None:
+    if not isinstance(started_at, (int, float)) or not isinstance(
+        ended_at, (int, float)
+    ):
+        return None
+    return round(max(0.0, float(ended_at) - float(started_at)) * 1000, 1)
+
+
 def normalize_provider_name(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
 
@@ -733,7 +783,7 @@ def fallback_adapter_contains_provider(component: Any, expected_provider: str) -
     expected = normalize_provider_name(expected_provider)
     if not expected:
         return False
-    for attr_name in ("_stt_instances", "_llm_instances"):
+    for attr_name in ("_stt_instances", "_llm_instances", "_tts_instances"):
         instances = getattr(component, attr_name, None)
         if not isinstance(instances, list):
             continue
@@ -829,6 +879,70 @@ def register_stt_fallback_incident_listener(
         stt_client.on("stt_availability_changed", _on_availability_changed)
 
 
+class WarmupClosingTTSFallbackAdapter(lk_tts.FallbackAdapter):
+    def prewarm(self) -> None:
+        for tts_client in self._tts_instances:
+            with suppress(Exception):
+                tts_client.prewarm()
+
+    async def aclose(self) -> None:
+        try:
+            await super().aclose()
+        finally:
+            for tts_client in self._tts_instances:
+                close = getattr(tts_client, "aclose", None)
+                if callable(close):
+                    with suppress(Exception):
+                        await close()
+
+
+def tts_fallback_children(tts_client: Any) -> list[Any]:
+    children = getattr(tts_client, "_tts_instances", None)
+    return children if isinstance(children, list) else []
+
+
+def schedule_tts_prepare(tts_client: Any, *, reason: str) -> None:
+    children = tts_fallback_children(tts_client)
+    if children:
+        for child in children:
+            schedule_tts_prepare(child, reason=reason)
+        return
+
+    schedule_prepare = getattr(tts_client, "schedule_prepare", None)
+    if callable(schedule_prepare):
+        schedule_prepare(reason=reason)
+
+
+def register_tts_fallback_incident_listener(
+    tts_client: Any,
+    incident_log: IncidentLogger,
+) -> None:
+    if not hasattr(tts_client, "on"):
+        return
+
+    def _on_availability_changed(ev: Any) -> None:
+        changed_tts = getattr(ev, "tts", None)
+        available = bool(getattr(ev, "available", False))
+        if available:
+            return
+        provider, model = component_identity(changed_tts)
+        incident_log.record_nowait(
+            "provider_fallback",
+            severity="warning",
+            component="tts",
+            provider=provider,
+            model=model,
+            description="TTS provider became unavailable and fallback path was used",
+            payload={
+                "available": available,
+                "label": getattr(changed_tts, "label", None),
+            },
+        )
+
+    with suppress(Exception):
+        tts_client.on("tts_availability_changed", _on_availability_changed)
+
+
 def register_component_metrics_listener(
     component: Any,
     *,
@@ -864,6 +978,22 @@ def is_short_greeting_response(text: str | None) -> bool:
         return False
 
     return bool(_SHORT_GREETING_RE.fullmatch(normalized))
+
+
+def is_avito_intro_announcement(text: str | None) -> bool:
+    if text is None:
+        return False
+
+    cleaned = re.sub(
+        r"[^\w\s\u0451\u0401\u044a\u042a\u044c\u042C]+",
+        " ",
+        text.strip().lower(),
+    )
+    normalized = _WHITESPACE_RE.sub(" ", cleaned).strip()
+    if not normalized:
+        return False
+
+    return bool(_AVITO_INTRO_RE.search(normalized))
 
 
 def _existing_prerecorded_audio_path(audio_path: Path) -> Path | None:
@@ -1847,6 +1977,34 @@ def create_external_aiohttp_session(
 
 async def warmup_tts_transport(tts_client: Any) -> None:
     """Warm up TTS transport before the first user turn."""
+    children = tts_fallback_children(tts_client)
+    if children:
+        await asyncio.gather(
+            *(warmup_tts_transport(child) for child in children),
+            return_exceptions=True,
+        )
+        return
+
+    if isinstance(tts_client, PreparedMiniMaxTTS):
+        started_at = asyncio.get_running_loop().time()
+        try:
+            await tts_client.prepare(reason="startup")
+            elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000
+            logger.info(
+                "tts transport warmup completed",
+                extra={
+                    "provider": "minimax",
+                    "elapsed_ms": round(elapsed_ms, 1),
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                "tts transport warmup failed: %s",
+                e,
+                extra={"provider": "minimax"},
+            )
+        return
+
     if not isinstance(tts_client, ElevenV3TTS):
         return
 
@@ -1865,7 +2023,7 @@ async def warmup_tts_transport(tts_client: Any) -> None:
         warmup_synthesis = getattr(tts_client, "warmup_synthesis", None)
         if callable(warmup_synthesis):
             await asyncio.wait_for(
-                warmup_synthesis(),
+                warmup_synthesis("Да."),
                 timeout=_WARMUP_REQUEST_TIMEOUT_SEC,
             )
             elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000
@@ -2305,6 +2463,27 @@ def _default_llm_model_for_provider(
     return ""
 
 
+def _is_direct_google_llm_provider(provider: str | None) -> bool:
+    return normalize_provider_name(provider) in {"google", "gemini"}
+
+
+def _is_vertex_llm_provider(provider: str | None) -> bool:
+    return normalize_provider_name(provider) in {
+        "googlevertex",
+        "googlevertexai",
+        "geminivertex",
+        "vertex",
+        "vertexai",
+    }
+
+
+def _default_vertex_location_for_model(model: str) -> str:
+    normalized = model.strip().lower()
+    if normalized.startswith("gemini-3-flash"):
+        return "global"
+    return "eu"
+
+
 def _backup_config_for_branch(
     branch: str,
     *,
@@ -2381,6 +2560,9 @@ def _llm_fallback_profile(
             continue
         fallback_config[target_key] = value
 
+    if _is_vertex_llm_provider(provider) and not fallback_config.get("location"):
+        fallback_config["location"] = _default_vertex_location_for_model(model)
+
     if set(fallback_config) == {"provider", "model"}:
         return None
 
@@ -2440,6 +2622,19 @@ def build_llm_client_for_branch(
     )
     backup_provider = (backup_provider or "").strip()
     backup_model = (backup_model or "").strip()
+    if (
+        _is_direct_google_llm_provider(primary_provider)
+        and _is_direct_google_llm_provider(backup_provider)
+    ):
+        logger.info(
+            "LLM Google backup provider normalized to Vertex for cross-provider fallback",
+            extra={
+                "branch": branch,
+                "configured_backup_provider": backup_provider,
+                "backup_model": backup_model,
+            },
+        )
+        backup_provider = "google_vertex"
     use_fallback_adapter = _config_bool(
         profile_config,
         "use_livekit_fallback_adapter",
@@ -2834,7 +3029,33 @@ def _google_tts_credentials_available() -> bool:
 def build_tts(
     external_http_sessions: list[aiohttp.ClientSession] | None = None,
     tts_profile: ComponentSelection | None = None,
+    backup_tts_profile: ComponentSelection | None = None,
+    fallback_sample_rate: int | None = None,
 ) -> Any:
+    if backup_tts_profile is not None:
+        primary_tts = build_tts(
+            external_http_sessions=external_http_sessions,
+            tts_profile=tts_profile,
+        )
+        backup_tts = build_tts(
+            external_http_sessions=external_http_sessions,
+            tts_profile=backup_tts_profile,
+        )
+        logger.info(
+            "using TTS fallback adapter",
+            extra={
+                "primary_provider": _component_provider(tts_profile, TTS_PROVIDER),
+                "backup_provider": _component_provider(backup_tts_profile, ""),
+                "sample_rate": fallback_sample_rate,
+                "max_retry_per_tts": 0,
+            },
+        )
+        return WarmupClosingTTSFallbackAdapter(
+            [primary_tts, backup_tts],
+            max_retry_per_tts=0,
+            sample_rate=fallback_sample_rate,
+        )
+
     profile_config = _component_config(tts_profile)
     configured_tts_provider = _component_provider(tts_profile, TTS_PROVIDER)
     if configured_tts_provider not in {
@@ -3304,7 +3525,6 @@ def build_tts(
             )
             return build_elevenlabs_tts(tts_profile)
 
-        _patch_minimax_sound_effects()
         minimax_model = _config_str(profile_config, "model", MINIMAX_TTS_MODEL)
         minimax_voice_id = _config_str(profile_config, "voice_id", MINIMAX_TTS_VOICE_ID)
         minimax_base_url = _config_str(profile_config, "base_url", MINIMAX_TTS_BASE_URL)
@@ -3334,6 +3554,11 @@ def build_tts(
             "stream_context_len",
             MINIMAX_TTS_STREAM_CONTEXT_LEN,
         )
+        minimax_connection_reuse = _config_bool(
+            profile_config,
+            "connection_reuse",
+            MINIMAX_TTS_CONNECTION_REUSE,
+        )
         logger.info(
             "using MiniMax TTS provider",
             extra={
@@ -3344,19 +3569,20 @@ def build_tts(
                 "intensity": minimax_intensity,
                 "timbre": minimax_timbre,
                 "sound_effects": minimax_sound_effects or None,
+                "connection_reuse": minimax_connection_reuse,
                 "streaming": True,
                 "egress": provider_egress("minimax"),
             },
         )
-        return minimax.TTS(
+        return PreparedMiniMaxTTS(
             model=minimax_model,
-            voice=minimax_voice_id,
+            voice_id=minimax_voice_id,
             speed=_config_float(profile_config, "speed", MINIMAX_TTS_SPEED),
-            vol=_config_float(profile_config, "volume", MINIMAX_TTS_VOLUME),
+            volume=_config_float(profile_config, "volume", MINIMAX_TTS_VOLUME),
             pitch=minimax_pitch,
             intensity=minimax_intensity,
             timbre=minimax_timbre,
-            text_normalization=False,
+            sound_effects=minimax_sound_effects,
             audio_format=_config_str(profile_config, "format", MINIMAX_TTS_FORMAT),
             sample_rate=_config_int(
                 profile_config,
@@ -3364,22 +3590,20 @@ def build_tts(
                 MINIMAX_TTS_SAMPLE_RATE,
             ),
             bitrate=_config_int(profile_config, "bitrate", MINIMAX_TTS_BITRATE),
+            channel=_config_int(profile_config, "channel", MINIMAX_TTS_CHANNEL),
             language_boost=_config_str(
                 profile_config,
                 "language_boost",
                 MINIMAX_TTS_LANGUAGE_BOOST,
             ),
-            tokenizer=tokenize.blingfire.SentenceTokenizer(
+            connection_reuse=minimax_connection_reuse,
+            http_proxy=provider_proxy_url("minimax"),
+            tokenizer_obj=tokenize.blingfire.SentenceTokenizer(
                 min_sentence_len=max(2, minimax_min_sentence_len),
                 stream_context_len=max(1, minimax_stream_context_len),
             ),
-            text_pacing=False,
             api_key=MINIMAX_API_KEY,
             base_url=minimax_base_url,
-            http_session=create_external_aiohttp_session(
-                "minimax",
-                external_http_sessions,
-            ),
         )
 
     return build_elevenlabs_tts(tts_profile)
@@ -3859,6 +4083,11 @@ class Assistant(Agent):
         self._incident_logger = incident_logger
         self._awaiting_first_user_turn = True
         self._initial_greeting_in_progress = False
+        self._pending_avito_intro_replay = False
+        self._initial_greeting_replay_text = VOICE_INITIAL_GREETING_PHRASE
+        self._initial_greeting_replay_audio_path = _existing_prerecorded_audio_path(
+            _INITIAL_GREETING_AUDIO_PATH
+        )
         self._llm_branch_started_at: dict[str, float] = {}
         self._tts_first_frame_ready_at: float | None = None
         self._tts_first_frame_yielded_at: float | None = None
@@ -3874,6 +4103,15 @@ class Assistant(Agent):
 
     def finish_initial_greeting(self) -> None:
         self._initial_greeting_in_progress = False
+
+    def configure_initial_greeting_replay(
+        self,
+        *,
+        text: str,
+        audio_path: Path | None,
+    ) -> None:
+        self._initial_greeting_replay_text = text.strip()
+        self._initial_greeting_replay_audio_path = audio_path
 
     def note_user_started_speaking(self) -> None:
         self._user_speech_revision += 1
@@ -3947,6 +4185,85 @@ class Assistant(Agent):
                 self.session.interrupt(force=True)
         return True
 
+    async def play_pending_avito_initial_greeting_replay(self) -> bool:
+        if not self._pending_avito_intro_replay:
+            return False
+
+        self._pending_avito_intro_replay = False
+        return await self._play_avito_initial_greeting_replay()
+
+    async def _play_avito_initial_greeting_replay(self) -> bool:
+        replay_text = self._initial_greeting_replay_text
+        replay_audio_path = self._initial_greeting_replay_audio_path
+        if not replay_text and replay_audio_path is None:
+            logger.warning("avito intro matched but initial greeting replay is not configured")
+            return False
+
+        replay_revision = self._user_speech_revision
+        if self._user_spoke_since(replay_revision):
+            logger.info(
+                "avito initial greeting replay canceled because user is speaking",
+                extra={
+                    "speech_start_user_revision": replay_revision,
+                    "current_user_revision": self._user_speech_revision,
+                    "user_is_speaking": self._user_is_speaking,
+                },
+            )
+            return False
+
+        logger.info(
+            "avito intro matched; replaying initial greeting",
+            extra={
+                "text_len": len(replay_text or ""),
+                "audio_path": str(replay_audio_path)
+                if replay_audio_path is not None
+                else None,
+            },
+        )
+        with suppress(Exception):
+            await self.session.interrupt(force=True)
+
+        if self._user_spoke_since(replay_revision):
+            logger.info(
+                "avito initial greeting replay canceled before playback because user started speaking",
+                extra={
+                    "speech_start_user_revision": replay_revision,
+                    "current_user_revision": self._user_speech_revision,
+                    "user_is_speaking": self._user_is_speaking,
+                },
+            )
+            return False
+
+        if replay_audio_path is not None:
+            return await play_prerecorded_audio(
+                session=self.session,
+                audio_path=replay_audio_path,
+                sample_rate=self._prerecorded_audio_sample_rate,
+                allow_interruptions=True,
+                add_to_chat_ctx=False,
+                text=replay_text,
+                playback_kind="avito_initial_greeting_replay",
+                timeout_sec=VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
+                incident_log=self._incident_logger,
+            )
+
+        if not replay_text:
+            return False
+
+        handle = self.session.say(
+            replay_text,
+            allow_interruptions=True,
+            add_to_chat_ctx=False,
+        )
+        return await wait_for_speech_playout(
+            handle,
+            kind="avito_initial_greeting_replay",
+            log_label="avito initial greeting replay",
+            timeout_sec=VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
+            incident_log=self._incident_logger,
+            payload={"source": "session.say", "text_len": len(replay_text)},
+        )
+
     async def on_user_turn_completed(self, _: Any, new_message: ChatMessage) -> None:
         if not self._awaiting_first_user_turn:
             return
@@ -3954,6 +4271,15 @@ class Assistant(Agent):
         user_text = (getattr(new_message, "text_content", None) or "").strip()
         if not user_text:
             return
+
+        if is_avito_intro_announcement(user_text):
+            if self._initial_greeting_in_progress:
+                self._pending_avito_intro_replay = True
+                logger.info("avito intro matched during initial greeting; replay queued")
+                raise StopResponse()
+
+            await self._play_avito_initial_greeting_replay()
+            raise StopResponse()
 
         if self._initial_greeting_in_progress:
             logger.info("user turn ignored while initial greeting is playing")
@@ -4749,6 +5075,12 @@ async def my_agent(ctx: JobContext):
     response_delay_has_final_transcript = False
     response_delay_user_stopped_speaking = False
     response_delay_started_for_turn = False
+    vad_speech_id = 0
+    vad_speech_started_at: float | None = None
+    vad_speech_ended_at: float | None = None
+    vad_speech_transcript = ""
+    vad_speech_interim_count = 0
+    vad_speech_final_count = 0
     end_call_task: asyncio.Task | None = None
     reply_watchdog_task: asyncio.Task | None = None
     startup_no_dialog_task: asyncio.Task | None = None
@@ -5014,6 +5346,8 @@ async def my_agent(ctx: JobContext):
             )
             raise
 
+    record_llm_fallback_configuration_incidents(routed_llm_metadata, incident_log)
+
     turn_profile = robot_settings.turn if robot_settings else None
     turn_config = _component_config(turn_profile)
     min_endpointing_delay = max(
@@ -5086,6 +5420,10 @@ async def my_agent(ctx: JobContext):
         tts_client = build_tts(
             external_http_sessions=external_http_sessions,
             tts_profile=robot_settings.tts_primary if robot_settings else None,
+            backup_tts_profile=robot_settings.component("tts", "backup")
+            if robot_settings
+            else None,
+            fallback_sample_rate=audio_output_sample_rate,
         )
     except Exception as e:
         await incident_log.record_exception(
@@ -5168,6 +5506,7 @@ async def my_agent(ctx: JobContext):
         )
 
     register_stt_fallback_incident_listener(stt_client, incident_log)
+    register_tts_fallback_incident_listener(tts_client, incident_log)
     register_component_metrics_listener(
         stt_client,
         component_name="stt",
@@ -5620,6 +5959,8 @@ async def my_agent(ctx: JobContext):
         nonlocal last_final_user_turn_started_at, last_final_user_turn_text_len
         nonlocal slow_response_logged_for_current_turn
         nonlocal response_delay_has_final_transcript
+        nonlocal vad_speech_transcript, vad_speech_interim_count
+        nonlocal vad_speech_final_count
         try:
             transcript_items.append(
                 {
@@ -5634,12 +5975,34 @@ async def my_agent(ctx: JobContext):
             transcript = (raw_transcript or "").strip()
             is_final = bool(getattr(ev, "is_final", False))
             if transcript:
+                transcript_at = event_timestamp_seconds(ev, default=time.time())
+                if is_final:
+                    vad_speech_final_count += 1
+                    vad_speech_transcript = transcript
+                else:
+                    vad_speech_interim_count += 1
+                    if not vad_speech_transcript or len(transcript) >= len(
+                        vad_speech_transcript
+                    ):
+                        vad_speech_transcript = transcript
                 logger.info(
                     "user input transcribed",
                     extra={
                         "transcript": transcript,
+                        "transcript_len": len(transcript),
                         "is_final": is_final,
                         "language": getattr(ev, "language", None),
+                        "vad_speech_id": vad_speech_id or None,
+                        "vad_speech_started_at": vad_speech_started_at,
+                        "vad_speech_ended_at": vad_speech_ended_at,
+                        "vad_speech_duration_ms": vad_speech_duration_ms(
+                            started_at=vad_speech_started_at,
+                            ended_at=vad_speech_ended_at
+                            if vad_speech_ended_at is not None
+                            else transcript_at,
+                        ),
+                        "vad_transcript_interim_count": vad_speech_interim_count,
+                        "vad_transcript_final_count": vad_speech_final_count,
                     },
                 )
                 mark_startup_dialog_activity(
@@ -5684,6 +6047,9 @@ async def my_agent(ctx: JobContext):
         nonlocal response_delay_has_final_transcript
         nonlocal response_delay_user_stopped_speaking
         nonlocal response_delay_started_for_turn
+        nonlocal vad_speech_id, vad_speech_started_at, vad_speech_ended_at
+        nonlocal vad_speech_transcript, vad_speech_interim_count
+        nonlocal vad_speech_final_count
         try:
             old_state = getattr(ev, "old_state", None)
             new_state = getattr(ev, "new_state", None)
@@ -5699,6 +6065,24 @@ async def my_agent(ctx: JobContext):
                     old_state=old_state_value,
                     new_state=new_state_value,
                 )
+                vad_speech_id += 1
+                vad_speech_started_at = event_timestamp_seconds(
+                    ev,
+                    default=time.time(),
+                )
+                vad_speech_ended_at = None
+                vad_speech_transcript = ""
+                vad_speech_interim_count = 0
+                vad_speech_final_count = 0
+                logger.info(
+                    "local VAD start of speech",
+                    extra={
+                        "vad_speech_id": vad_speech_id,
+                        "started_at": vad_speech_started_at,
+                        "old_state": old_state_value,
+                        "new_state": new_state_value,
+                    },
+                )
                 pending_user_phrase_end_at = None
                 pending_user_phrase_end_source = None
                 response_delay_has_final_transcript = False
@@ -5711,17 +6095,29 @@ async def my_agent(ctx: JobContext):
                 )
                 if callable(notify_local_start_of_speech):
                     notify_local_start_of_speech(started_at=started_at)
+                schedule_tts_prepare(tts_client, reason="user_speaking")
                 voice_prompts.on_user_started_speaking()
                 return
             if old_state_value == "speaking" and new_state_value == "listening":
                 ended_at = event_timestamp_seconds(ev, default=time.time())
+                vad_speech_ended_at = ended_at
                 pending_user_phrase_end_at = ended_at
                 pending_user_phrase_end_source = "user_state_changed"
                 if isinstance(ended_at, (int, float)):
                     logger.info(
                         "local VAD end of speech",
                         extra={
+                            "vad_speech_id": vad_speech_id or None,
+                            "started_at": vad_speech_started_at,
                             "ended_at": ended_at,
+                            "duration_ms": vad_speech_duration_ms(
+                                started_at=vad_speech_started_at,
+                                ended_at=ended_at,
+                            ),
+                            "transcript": vad_speech_transcript or None,
+                            "transcript_len": len(vad_speech_transcript or ""),
+                            "interim_transcript_count": vad_speech_interim_count,
+                            "final_transcript_count": vad_speech_final_count,
                             "handler_lag_ms": round(
                                 max(0.0, time.time() - float(ended_at)) * 1000,
                                 1,
@@ -6384,6 +6780,18 @@ async def my_agent(ctx: JobContext):
             prompt=prompt_resolution.prompt,
             incident_logger=incident_log,
         )
+        preliminary_initial_greeting = (
+            prompt_resolution.initial_greeting or ""
+        ).strip() or VOICE_INITIAL_GREETING_PHRASE
+        preliminary_initial_greeting_audio_path = (
+            None
+            if (prompt_resolution.initial_greeting or "").strip()
+            else _existing_prerecorded_audio_path(_INITIAL_GREETING_AUDIO_PATH)
+        )
+        assistant.configure_initial_greeting_replay(
+            text=preliminary_initial_greeting,
+            audio_path=preliminary_initial_greeting_audio_path,
+        )
 
         try:
             await session.start(
@@ -6423,7 +6831,7 @@ async def my_agent(ctx: JobContext):
             timeout_sec=VOICE_AUDIO_OUTPUT_READY_TIMEOUT_SEC,
         ):
             logger.warning(
-                "room audio output was not ready before initial greeting",
+                "room audio output was not ready before initial greeting; continuing to playback",
                 extra={
                     "timeout_sec": VOICE_AUDIO_OUTPUT_READY_TIMEOUT_SEC,
                     "participant_identity": participant_identity,
@@ -6436,20 +6844,17 @@ async def my_agent(ctx: JobContext):
                 component="livekit_room",
                 latency_ms=int(VOICE_AUDIO_OUTPUT_READY_TIMEOUT_SEC * 1000),
                 error_type="TimeoutError",
-                description="Room audio output was not ready before initial greeting",
+                description=(
+                    "Room audio output was not ready before initial greeting; "
+                    "continuing to playback"
+                ),
                 payload={
                     "timeout_sec": VOICE_AUDIO_OUTPUT_READY_TIMEOUT_SEC,
                     "participant_identity": participant_identity,
                     "sip_call_id": sip_diagnostic_context.get("sip_call_id"),
+                    "action": "continued_to_initial_greeting",
                 },
             )
-            await delete_room_safely(
-                "room_audio_output_not_ready",
-                close_reason="room_audio_output_not_ready",
-            )
-            close_event.set()
-            await export_best_effort(timeout_sec=export_wait_sec)
-            return
         if VOICE_STARTUP_NO_DIALOG_TIMEOUT_SEC > 0:
             startup_no_dialog_task = asyncio.create_task(
                 startup_no_dialog_watchdog(),
@@ -6485,6 +6890,10 @@ async def my_agent(ctx: JobContext):
                 default_greeting=VOICE_INITIAL_GREETING_PHRASE,
                 prerecorded_path=_INITIAL_GREETING_AUDIO_PATH,
             )
+            assistant.configure_initial_greeting_replay(
+                text=initial_greeting,
+                audio_path=initial_greeting_audio_path,
+            )
             logger.info(
                 "initial greeting resolved",
                 extra={
@@ -6506,7 +6915,12 @@ async def my_agent(ctx: JobContext):
                 "initial greeting skipped",
                 extra={"reason": "close_event_set", "text_len": len(initial_greeting)},
             )
+            assistant.configure_initial_greeting_replay(
+                text=initial_greeting,
+                audio_path=None,
+            )
         played_initial_greeting = False
+        played_avito_initial_greeting_replay = False
         if should_greet:
             assistant.begin_initial_greeting()
             try:
@@ -6547,6 +6961,14 @@ async def my_agent(ctx: JobContext):
                                 },
                             )
                             played_initial_greeting = False
+                        if played_initial_greeting:
+                            transcript_item = build_service_phrase_transcript_item(
+                                text=initial_greeting,
+                                kind="initial_greeting",
+                                source="prerecorded_audio",
+                            )
+                            if transcript_item is not None:
+                                transcript_items.append(transcript_item)
                 # Do not block call flow if warmup is still in progress.
                 if runtime_warmup_task and not runtime_warmup_task.done():
                     with suppress(Exception):
@@ -6598,7 +7020,11 @@ async def my_agent(ctx: JobContext):
             finally:
                 clear_initial_greeting_user_turn(session)
                 assistant.finish_initial_greeting()
-        if played_initial_greeting:
+            if not close_event.is_set():
+                played_avito_initial_greeting_replay = (
+                    await assistant.play_pending_avito_initial_greeting_replay()
+                )
+        if played_initial_greeting or played_avito_initial_greeting_replay:
             voice_prompts.on_agent_finished_speaking()
         elif should_greet and not close_event.is_set():
             incident_log.record_nowait(

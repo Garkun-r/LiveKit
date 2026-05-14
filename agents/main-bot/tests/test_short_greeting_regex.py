@@ -3,6 +3,7 @@ from livekit import rtc
 
 from agent import (
     extract_sip_call_numbers,
+    is_avito_intro_announcement,
     is_response_delay_candidate_transcript,
     is_short_greeting_response,
     resolve_initial_greeting_audio,
@@ -72,6 +73,44 @@ def test_is_short_greeting_response_rejects_questions_and_other_phrases(
     text: str | None,
 ) -> None:
     assert is_short_greeting_response(text) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Авито звонок по объявлению, разговор может быть записан.",
+        "авито звонок по обьявлению разговор может быть записан",
+        "АВИТО: звонок по обьЯвлению! Разговор может быть записан.",
+    ],
+)
+def test_is_avito_intro_announcement_matches_service_phrase(text: str) -> None:
+    assert is_avito_intro_announcement(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        None,
+        "",
+        "алло здравствуйте",
+        "я звоню с авито по объявлению",  # noqa: RUF001
+        "звонок по объявлению, разговор может быть записан",
+        "авито доставка по объявлению, разговор может быть записан",
+    ],
+)
+def test_is_avito_intro_announcement_rejects_other_phrases(
+    text: str | None,
+) -> None:
+    assert is_avito_intro_announcement(text) is False
+
+
+def test_avito_intro_announcement_is_not_short_greeting() -> None:
+    assert (
+        is_short_greeting_response(
+            "Авито звонок по объявлению, разговор может быть записан."
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio

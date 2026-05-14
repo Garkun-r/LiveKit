@@ -4,9 +4,9 @@
       "active": true,
       "config_json": {
         "complex_backup_model": "gemini-3.1-flash-lite",
-        "complex_backup_provider": "google",
+        "complex_backup_provider": "google_vertex",
         "fast_backup_model": "gemini-3.1-flash-lite",
-        "fast_backup_provider": "google",
+        "fast_backup_provider": "google_vertex",
         "use_livekit_adapter": true
       },
       "description": "LLM fallback settings synchronized from current .env.local.",
@@ -22,8 +22,10 @@
       "config_json": {
         "api_key_ref": "GOOGLE_API_KEY",
         "attempt_timeout_sec": 2.5,
+        "fallback_egress": "direct",
+        "fallback_location": "eu",
         "fallback_model": "gemini-3.1-flash-lite",
-        "fallback_provider": "google",
+        "fallback_provider": "google_vertex",
         "max_output_tokens": 512,
         "max_retry_per_llm": 0,
         "model": "gemini-3-flash-preview",
@@ -166,8 +168,10 @@
         "api_key_ref": "GOOGLE_API_KEY",
         "attempt_timeout_sec": 2.5,
         "egress": "proxy",
+        "fallback_egress": "proxy",
+        "fallback_location": "eu",
         "fallback_model": "gemini-3.1-flash-lite",
-        "fallback_provider": "google",
+        "fallback_provider": "google_vertex",
         "max_output_tokens": 512,
         "max_retry_per_llm": 0,
         "model": "gemini-3-flash-preview",
@@ -398,8 +402,8 @@
         "stream_context_len": 2,
         "use_stream_input": true,
         "voice_id": "wF58OrxELqJ5nFJxXiva",
-        "voice_similarity_boost": 0.9,
-        "voice_stability": 0.85
+        "voice_similarity_boost": 0.95,
+        "voice_stability": 0.75
       },
       "description": "Основной TTS-профиль для базовой/cloud-среды: ElevenLabs eleven_v3.",
       "display_name": "ElevenLabs v3",
@@ -675,10 +679,10 @@
     {
       "active": true,
       "category": "llm_routing",
-      "note": "Base/cloud: быстрая ветка xAI",
+      "note": "Base/cloud: быстрая ветка Gemini 3.1 Flash Lite с Vertex fallback",
       "owner_key": "base",
       "owner_type": "runtime",
-      "profile_key": "llm_xai",
+      "profile_key": "llm_gemini_31_flash_lite",
       "slot": "fast",
       "sort": 20
     },
@@ -783,7 +787,7 @@
     },
     {
       "active": true,
-      "default_value": "google",
+      "default_value": "google_vertex",
       "description": "Провайдер резервной быстрой LLM-ветки, которая используется для коротких и срочных ответов при отказе основной быстрой модели.",
       "label": "Fast backup provider",
       "module": "fallback",
@@ -825,7 +829,7 @@
     },
     {
       "active": true,
-      "default_value": "google",
+      "default_value": "google_vertex",
       "description": "Провайдер резервной сложной LLM-ветки, которая используется для более тяжелых рассуждений при отказе основной сложной модели.",
       "label": "Complex backup provider",
       "module": "fallback",
@@ -1127,7 +1131,7 @@
     },
     {
       "active": true,
-      "default_value": "google",
+      "default_value": "google_vertex",
       "description": "Провайдер, который используется как резерв для этого LLM-профиля. Обычно google, если основная модель xAI или Gemini.",
       "label": "Провайдер запасной модели",
       "module": "llm",

@@ -202,7 +202,7 @@ TTS profiles currently support:
 1. `provider=elevenlabs` - ElevenLabs TTS.
 2. `provider=google` - `livekit.plugins.google.TTS` (Google Cloud streaming path).
 3. `provider=vertex` - Vertex Gemini API streaming path (`google.genai`, `vertexai=True`).
-4. `provider=minimax` - official `livekit.plugins.minimax.TTS` path (`speech-2.8-turbo`).
+4. `provider=minimax` - local prepared MiniMax WebSocket path (`speech-2.8-hd`, reusable `task_start` per call).
 5. `provider=cosyvoice` - custom Alibaba CosyVoice WebSocket path.
 6. `provider=tbank` - custom T-Bank VoiceKit gRPC streaming synthesis.
 7. `provider=sber` - custom Sber SaluteSpeech gRPC streaming path.
@@ -288,9 +288,10 @@ MiniMax example:
 ```console
 TTS_PROVIDER=minimax
 MINIMAX_API_KEY=<your_minimax_api_key>
-MINIMAX_TTS_MODEL=speech-2.8-turbo
+MINIMAX_TTS_MODEL=speech-2.8-hd
 MINIMAX_TTS_VOICE_ID=moss_audio_43d3c43e-3a2d-11f1-b47e-928b88df9451
 MINIMAX_TTS_FORMAT=mp3
+MINIMAX_TTS_CONNECTION_REUSE=true
 ```
 
 Sber SaluteSpeech example:

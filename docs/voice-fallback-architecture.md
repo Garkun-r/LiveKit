@@ -99,9 +99,9 @@ LLM_MAX_RETRY_PER_LLM=0
 LLM_RETRY_INTERVAL_SEC=0.3
 LLM_RETRY_ON_CHUNK_SENT=false
 GEMINI_HTTP_TIMEOUT_SEC=10.0
-FAST_LLM_BACKUP_PROVIDER=google
+FAST_LLM_BACKUP_PROVIDER=google_vertex
 FAST_LLM_BACKUP_MODEL=<from config/env>
-COMPLEX_LLM_BACKUP_PROVIDER=google
+COMPLEX_LLM_BACKUP_PROVIDER=google_vertex
 COMPLEX_LLM_BACKUP_MODEL=<from config/env>
 ```
 
@@ -114,6 +114,8 @@ Directus field mapping:
 - `use_livekit_fallback_adapter` replaces `USE_LIVEKIT_FALLBACK_ADAPTER`.
 - `attempt_timeout_sec`, `max_retry_per_llm`, `retry_interval_sec`, and
   `retry_on_chunk_sent` replace the matching env tuning knobs.
+- For Google/Gemini primary profiles, backup should use `google_vertex` so the
+  reserve path is a different provider surface, not only a different model ID.
 
 The separate `fallback` profile is legacy/future operational fallback. LLM
 backup model selection belongs to the LLM profile itself.

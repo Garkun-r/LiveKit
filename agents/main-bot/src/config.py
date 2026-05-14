@@ -447,9 +447,9 @@ GOOGLE_TTS_PROMPT = os.getenv(
 )
 
 # MiniMax TTS runtime settings.
-# Docs: https://platform.minimax.io/docs/api-reference/speech-t2a-http
+# Docs: https://platform.minimax.io/docs/api-reference/speech-t2a-websocket
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
-MINIMAX_TTS_MODEL = os.getenv("MINIMAX_TTS_MODEL", "speech-2.8-turbo")
+MINIMAX_TTS_MODEL = os.getenv("MINIMAX_TTS_MODEL", "speech-2.8-hd")
 MINIMAX_TTS_VOICE_ID = os.getenv(
     "MINIMAX_TTS_VOICE_ID",
     "moss_audio_43d3c43e-3a2d-11f1-b47e-928b88df9451",
@@ -470,6 +470,9 @@ MINIMAX_TTS_FORMAT = os.getenv("MINIMAX_TTS_FORMAT", "mp3")
 MINIMAX_TTS_SAMPLE_RATE = int(os.getenv("MINIMAX_TTS_SAMPLE_RATE", "24000"))
 MINIMAX_TTS_BITRATE = int(os.getenv("MINIMAX_TTS_BITRATE", "128000"))
 MINIMAX_TTS_CHANNEL = int(os.getenv("MINIMAX_TTS_CHANNEL", "1"))
+MINIMAX_TTS_CONNECTION_REUSE = os.getenv(
+    "MINIMAX_TTS_CONNECTION_REUSE", "true"
+).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
 MINIMAX_TTS_MIN_SENTENCE_LEN = int(os.getenv("MINIMAX_TTS_MIN_SENTENCE_LEN", "4"))
 MINIMAX_TTS_STREAM_CONTEXT_LEN = int(os.getenv("MINIMAX_TTS_STREAM_CONTEXT_LEN", "1"))
 

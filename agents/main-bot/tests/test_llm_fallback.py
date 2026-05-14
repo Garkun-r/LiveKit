@@ -411,8 +411,19 @@ def test_build_fast_branch_fallback_uses_xai_primary_and_google_backup(
     assert metadata.uses_fallback_adapter is True
 
 
-def test_build_complex_branch_fallback_uses_google_backup(monkeypatch) -> None:
-    def fake_build(provider: str, model_name: str | None = None) -> _FakeLLM:
+def test_build_complex_branch_fallback_uses_vertex_backup_for_google_primary(
+    monkeypatch,
+) -> None:
+    build_calls: list[
+        tuple[str, str | None, agent.ComponentSelection | None]
+    ] = []
+
+    def fake_build(
+        provider: str,
+        model_name: str | None = None,
+        llm_profile: agent.ComponentSelection | None = None,
+    ) -> _FakeLLM:
+        build_calls.append((provider, model_name, llm_profile))
         return _FakeLLM(
             provider=provider,
             model=model_name or f"{provider}-default",
@@ -434,9 +445,18 @@ def test_build_complex_branch_fallback_uses_google_backup(monkeypatch) -> None:
     assert metadata.branch == "complex"
     assert metadata.primary_provider == "google"
     assert metadata.primary_model == "gemini-flash"
-    assert metadata.backup_provider == "google"
+    assert metadata.backup_provider == "google_vertex"
     assert metadata.backup_model == "gemini-lite"
     assert metadata.uses_fallback_adapter is True
+    backup_provider, backup_model, backup_profile = build_calls[1]
+    assert backup_provider == "google_vertex"
+    assert backup_model == "gemini-lite"
+    assert backup_profile is not None
+    assert backup_profile.config == {
+        "provider": "google_vertex",
+        "model": "gemini-lite",
+        "location": "eu",
+    }
 
 
 def test_build_branch_fallback_uses_profile_backup_route(monkeypatch) -> None:
@@ -498,6 +518,48 @@ def test_build_branch_fallback_uses_profile_backup_route(monkeypatch) -> None:
         "location": "eu",
         "egress": "proxy",
     }
+
+
+def test_llm_fallback_same_provider_risk_ignores_vertex_backup() -> None:
+    assert (
+        agent.llm_fallback_same_provider_risk(
+            agent.LLMBranchMetadata(
+                branch="fast",
+                primary_provider="Gemini",
+                primary_model="gemini-3.1-flash-lite",
+                backup_provider="Vertex AI",
+                backup_model="gemini-3.1-flash-lite",
+                uses_fallback_adapter=True,
+            )
+        )
+        is False
+    )
+
+
+def test_llm_fallback_same_provider_risk_records_incident() -> None:
+    incident_log = _FakeIncidentLog()
+    metadata = agent.LLMBranchMetadata(
+        branch="complex",
+        primary_provider="Gemini",
+        primary_model="gemini-3-flash-preview",
+        backup_provider="Gemini",
+        backup_model="gemini-3.1-flash-lite",
+        uses_fallback_adapter=True,
+    )
+
+    agent.record_llm_fallback_configuration_incidents(
+        {"complex": metadata},
+        incident_log,
+    )
+
+    assert [item["incident_type"] for item in incident_log.records] == [
+        "llm_fallback_same_provider"
+    ]
+    assert incident_log.records[0]["payload"]["branch"] == "complex"
+    assert (
+        incident_log.records[0]["payload"]["risk"]
+        == "provider_account_quota_wide_failure"
+    )
 
 
 @pytest.mark.asyncio

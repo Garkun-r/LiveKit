@@ -426,7 +426,7 @@ insert into public.robot_provider_profiles (
         'MiniMax Russian default',
         'Draft non-secret MiniMax profile based on the current robot env.',
         'draft',
-        '{"model":"speech-2.8-turbo","voice_id":"moss_audio_43d3c43e-3a2d-11f1-b47e-928b88df9451","base_url":"https://api-uw.minimax.io","language_boost":"Russian","speed":1.2,"volume":1.0,"pitch":0,"format":"mp3","sample_rate":24000,"bitrate":128000,"channel":1,"min_sentence_len":4,"stream_context_len":1}'::jsonb
+        '{"model":"speech-2.8-hd","voice_id":"moss_audio_43d3c43e-3a2d-11f1-b47e-928b88df9451","base_url":"https://api-uw.minimax.io","language_boost":"Russian","speed":1.2,"volume":1.0,"pitch":0,"format":"mp3","sample_rate":24000,"bitrate":128000,"channel":1,"connection_reuse":true,"min_sentence_len":4,"stream_context_len":1}'::jsonb
     ),
     (
         'tts_cosyvoice_plus_default',

@@ -1,5 +1,6 @@
 import asyncio
 import wave
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ import agent
 from agent import (
     Assistant,
     build_agent_room_options,
+    build_service_phrase_transcript_item,
     clear_initial_greeting_user_turn,
     disconnect_reason_name,
     event_timestamp_seconds,
@@ -24,6 +26,7 @@ from agent import (
     should_stop_recording_on_close,
     speech_playout_was_observed,
     turn_response_latency_ms,
+    vad_speech_duration_ms,
     wait_for_initial_greeting_delay,
     wait_for_room_audio_output_ready,
     wait_for_short_greeting_delay,
@@ -55,6 +58,14 @@ class _FallbackComponent:
 
     def __init__(self, instances):
         self._stt_instances = instances
+
+
+class _TTSFallbackComponent:
+    provider = "livekit"
+    model = "FallbackAdapter"
+
+    def __init__(self, instances):
+        self._tts_instances = instances
 
 
 class _Event:
@@ -166,6 +177,21 @@ def test_should_not_log_startup_provider_fallback_when_chain_contains_provider()
             configured_provider="google",
             actual_component=_FallbackComponent(
                 [_Component(provider="Google Cloud", model="latest_long")]
+            ),
+        )
+        is False
+    )
+
+
+def test_should_not_log_startup_provider_fallback_when_tts_chain_contains_provider() -> (
+    None
+):
+    assert (
+        should_log_startup_provider_fallback(
+            component_name="tts",
+            configured_provider="minimax",
+            actual_component=_TTSFallbackComponent(
+                [_Component(provider="MiniMax", model="speech-2.8-hd")]
             ),
         )
         is False
@@ -366,6 +392,12 @@ def test_should_log_slow_response_latency_when_threshold_is_reached() -> None:
     assert should_log_slow_response_latency(7200.5, 7000) is True
 
 
+def test_vad_speech_duration_ms_uses_non_negative_elapsed_time() -> None:
+    assert vad_speech_duration_ms(started_at=10.0, ended_at=11.2345) == 1234.5
+    assert vad_speech_duration_ms(started_at=11.0, ended_at=10.0) == 0.0
+    assert vad_speech_duration_ms(started_at=None, ended_at=10.0) is None
+
+
 def test_should_not_log_slow_response_latency_below_threshold_or_disabled() -> None:
     assert should_log_slow_response_latency(None, 7000) is False
     assert should_log_slow_response_latency(6999.9, 7000) is False
@@ -391,11 +423,165 @@ async def test_initial_greeting_in_progress_ignores_first_user_turn() -> None:
     assert assistant._awaiting_first_user_turn is True
 
 
+@pytest.mark.asyncio
+async def test_avito_intro_during_initial_greeting_queues_replay() -> None:
+    assistant = Assistant(prompt="test prompt")
+    assistant.begin_initial_greeting()
+
+    with pytest.raises(StopResponse):
+        await assistant.on_user_turn_completed(
+            None,
+            _ChatMessage("Авито звонок по объявлению, разговор может быть записан."),
+        )
+
+    assert assistant._awaiting_first_user_turn is True
+    assert assistant._pending_avito_intro_replay is True
+
+
+@pytest.mark.asyncio
+async def test_pending_avito_intro_replays_initial_greeting(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    audio_path = tmp_path / "initial.wav"
+    audio_path.write_bytes(b"fake")
+    assistant = Assistant(prompt="test prompt")
+    session = _Session()
+    assistant._activity = SimpleNamespace(session=session)
+    assistant.configure_initial_greeting_replay(
+        text="Алло, здравствуйте.",
+        audio_path=audio_path,
+    )
+    assistant._pending_avito_intro_replay = True
+    played_calls = []
+
+    async def fake_play_prerecorded_audio(**kwargs):
+        played_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr("agent.play_prerecorded_audio", fake_play_prerecorded_audio)
+
+    played = await assistant.play_pending_avito_initial_greeting_replay()
+
+    assert played is True
+    assert assistant._pending_avito_intro_replay is False
+    assert session.interrupt_calls == [True]
+    assert played_calls[0]["audio_path"] == audio_path
+    assert played_calls[0]["text"] == "Алло, здравствуйте."
+    assert played_calls[0]["allow_interruptions"] is True
+    assert played_calls[0]["playback_kind"] == "avito_initial_greeting_replay"
+
+
+@pytest.mark.asyncio
+async def test_avito_intro_after_initial_greeting_replays_immediately(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    audio_path = tmp_path / "initial.wav"
+    audio_path.write_bytes(b"fake")
+    assistant = Assistant(prompt="test prompt")
+    session = _Session()
+    assistant._activity = SimpleNamespace(session=session)
+    assistant.configure_initial_greeting_replay(
+        text="Алло, здравствуйте.",
+        audio_path=audio_path,
+    )
+    played_calls = []
+
+    async def fake_play_prerecorded_audio(**kwargs):
+        played_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr("agent.play_prerecorded_audio", fake_play_prerecorded_audio)
+
+    with pytest.raises(StopResponse):
+        await assistant.on_user_turn_completed(
+            None,
+            _ChatMessage("Авито звонок по обьявлению, разговор может быть записан."),
+        )
+
+    assert assistant._awaiting_first_user_turn is True
+    assert session.interrupt_calls == [True]
+    assert played_calls[0]["audio_path"] == audio_path
+    assert played_calls[0]["allow_interruptions"] is True
+
+
+@pytest.mark.asyncio
+async def test_short_greeting_still_plays_after_avito_intro_replay(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    initial_audio_path = tmp_path / "initial.wav"
+    short_audio_path = tmp_path / "short.wav"
+    initial_audio_path.write_bytes(b"fake")
+    short_audio_path.write_bytes(b"fake")
+    assistant = Assistant(
+        prompt="test prompt",
+        first_turn_short_greeting_audio_path=short_audio_path,
+        first_turn_short_greeting_delay_sec=0,
+    )
+    session = _Session()
+    assistant._activity = SimpleNamespace(session=session)
+    assistant.configure_initial_greeting_replay(
+        text="Алло, здравствуйте.",
+        audio_path=initial_audio_path,
+    )
+    played_calls = []
+
+    async def fake_play_prerecorded_audio(**kwargs):
+        played_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr("agent.play_prerecorded_audio", fake_play_prerecorded_audio)
+
+    with pytest.raises(StopResponse):
+        await assistant.on_user_turn_completed(
+            None,
+            _ChatMessage("Авито звонок по объявлению, разговор может быть записан."),
+        )
+    with pytest.raises(StopResponse):
+        await assistant.on_user_turn_completed(None, _ChatMessage("алло"))
+
+    assert assistant._awaiting_first_user_turn is False
+    assert session.interrupt_calls == [True, True]
+    assert played_calls[0]["audio_path"] == initial_audio_path
+    assert played_calls[0]["playback_kind"] == "avito_initial_greeting_replay"
+    assert played_calls[1]["audio_path"] == short_audio_path
+    assert played_calls[1]["text"] == "Да, слушаю."
+
+
 def test_clear_initial_greeting_user_turn_discards_buffered_turn() -> None:
     session = _Session()
 
     assert clear_initial_greeting_user_turn(session) is True
     assert session.clear_user_turn_calls == 1
+
+
+def test_build_service_phrase_transcript_item_marks_assistant_history() -> None:
+    item = build_service_phrase_transcript_item(
+        text=" Здравствуйте. ",
+        kind="initial_greeting",
+        source="prerecorded_audio",
+    )
+
+    assert item is not None
+    assert item["type"] == "service_phrase"
+    assert item["kind"] == "initial_greeting"
+    assert item["role"] == "assistant"
+    assert item["text"] == "Здравствуйте."
+    assert item["source"] == "prerecorded_audio"
+    assert datetime.fromisoformat(item["created_at"]).tzinfo is not None
+
+
+def test_build_service_phrase_transcript_item_skips_empty_text() -> None:
+    assert (
+        build_service_phrase_transcript_item(
+            text=" ",
+            kind="initial_greeting",
+            source="prerecorded_audio",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

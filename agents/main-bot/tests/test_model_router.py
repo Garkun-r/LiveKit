@@ -23,7 +23,7 @@ def _router() -> ModelRouter:
                     "да да",
                     "соединить",
                 ],
-                "whole_word": ["оператор"],
+                "whole_word": ["нет, спасибо", "нет спасибо", "оператор"],
                 "partial": ["операт", "да соед", "менедж", "специалистом"],
             }
         )
@@ -68,6 +68,8 @@ def test_full_equals(text: str, matched_value: str) -> None:
         ("мне нужен оператор", "fast", "whole_word"),
         ("оператор", "fast", "whole_word"),
         ("операторов", "fast", "partial"),
+        ("Нет спасибо.", "fast", "whole_word"),
+        ("Нет, спасибо.", "fast", "whole_word"),
     ],
 )
 def test_whole_word(text: str, selected_model: str, reason: str) -> None:

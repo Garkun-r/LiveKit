@@ -182,7 +182,13 @@ LLM, TTS и session runtime.
 
 `provider_fallback`
 : LLM/STT fallback adapter переключился, manual LLM fallback сработал, или
-configured STT/TTS provider не был использован на старте.
+  configured STT/TTS provider не был использован на старте.
+
+`llm_fallback_same_provider`
+: при старте LLM primary и backup построились на одном провайдере. Это
+  означает, что резерв защищает только от сбоя конкретной модели, но не от
+  сбоя аккаунта, квоты или провайдера. Для backup через другой провайдер
+  предупреждение не пишется.
 
 `slow_response`
 : фактическое время от конца фразы клиента до начала фразы робота превысило
