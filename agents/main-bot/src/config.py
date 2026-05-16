@@ -293,6 +293,23 @@ VOICE_INITIAL_GREETING_PHRASE = (
 VOICE_INITIAL_GREETING_DELAY_SEC = float(
     os.getenv("VOICE_INITIAL_GREETING_DELAY_SEC", "1.0")
 )
+VOICE_FIRST_LLM_INTRO_PHRASE = (
+    os.getenv(
+        "VOICE_FIRST_LLM_INTRO_PHRASE",
+        "Я хочу обратить внимание, что я виртуальный ассистент.",
+    ).strip()
+    or "Я хочу обратить внимание, что я виртуальный ассистент."
+)
+VOICE_FIRST_LLM_INTRO_DELAY_SEC = float(
+    os.getenv("VOICE_FIRST_LLM_INTRO_DELAY_SEC", "0.7")
+)
+VOICE_FIRST_LLM_INTRO_AUDIO_PATH = (
+    os.getenv(
+        "VOICE_FIRST_LLM_INTRO_AUDIO_PATH",
+        "first_llm_intro.mp3",
+    ).strip()
+    or "first_llm_intro.mp3"
+)
 VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC = float(
     os.getenv("VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC", "12.0")
 )
@@ -323,7 +340,7 @@ VOICE_SHORT_GREETING_PHRASE = (
     or "Да, слушаю."
 )
 VOICE_SHORT_GREETING_DELAY_SEC = float(
-    os.getenv("VOICE_SHORT_GREETING_DELAY_SEC", "1.0")
+    os.getenv("VOICE_SHORT_GREETING_DELAY_SEC", "0.5")
 )
 VOICE_AUDIO_CACHE_ENABLED = _env_bool("VOICE_AUDIO_CACHE_ENABLED", default=True)
 VOICE_AUDIO_CACHE_DIR = os.getenv("VOICE_AUDIO_CACHE_DIR", "cache").strip() or "cache"
@@ -387,6 +404,10 @@ TURN_MAX_ENDPOINTING_DELAY = float(os.getenv("TURN_MAX_ENDPOINTING_DELAY", "1.0"
 TURN_DETECTION_MODE = os.getenv("TURN_DETECTION_MODE", "vad").strip().lower()
 # Endpointing mode: "fixed" or "dynamic"
 TURN_ENDPOINTING_MODE = os.getenv("TURN_ENDPOINTING_MODE", "dynamic").strip().lower()
+TURN_PENDING_REPLY_MIN_INTERRUPTION_WORDS = max(
+    0,
+    int(os.getenv("TURN_PENDING_REPLY_MIN_INTERRUPTION_WORDS", "2")),
+)
 # Preemptive generation can reduce latency, but may cause occasional stalled turns
 # depending on provider/turn-detector combination.
 PREEMPTIVE_GENERATION = _env_bool("PREEMPTIVE_GENERATION", default=True)
@@ -828,3 +849,4 @@ INCIDENT_ENVIRONMENT = os.getenv(
 ).strip() or ("local" if LIVEKIT_SELF_HOSTED else "cloud")
 INCIDENT_DB_TIMEOUT_SEC = float(os.getenv("INCIDENT_DB_TIMEOUT_SEC", "1.5"))
 INCIDENT_SLOW_RESPONSE_MS = int(os.getenv("INCIDENT_SLOW_RESPONSE_MS", "4000"))
+INCIDENT_TTS_TTFB_SLOW_MS = int(os.getenv("INCIDENT_TTS_TTFB_SLOW_MS", "3000"))

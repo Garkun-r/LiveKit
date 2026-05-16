@@ -156,7 +156,9 @@ Voice prompt catalog:
 Requirements:
 
 - Voice prompts must use pre-synthesized/prerecorded audio files from
-  `agents/main-bot/audio`, with paths configurable through env.
+  `agents/main-bot/audio`, with paths configurable through env, or generated
+  once into `VoiceAudioCache` for client-specific text such as
+  `bot_configurations.llm_intro`.
 - Technical prompts must not be added to LLM chat context.
 - Only one technical prompt may play at a time. VAD user-speech events pause
   prompt playback so audio does not overlap with the caller; final non-empty
@@ -200,7 +202,7 @@ Requirements:
   `user_state_changed: speaking -> listening`.
 - If the assistant starts speaking before the timer fires, the prompt is skipped.
 - If the timer fires while the assistant is still silent/thinking, play
-  `response_delay` through LiveKit `BackgroundAudioPlayer` on-demand playback.
+  prerecorded `response_delay` audio through LiveKit `BackgroundAudioPlayer`.
 - The assistant TTS pipeline must wait for an active technical prompt to finish
   before releasing the normal answer, so prompt audio and assistant audio do not
   overlap.

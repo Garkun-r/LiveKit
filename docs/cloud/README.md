@@ -1,6 +1,6 @@
 # LiveKit Cloud documentation
 
-Last reviewed: 2026-05-11.
+Last reviewed: 2026-05-15.
 
 This folder is the project runbook for LiveKit Cloud work. Read it before touching cloud deployment, secrets, telephony, rooms, ingress, egress, or agent observability.
 
@@ -9,6 +9,7 @@ This folder is the project runbook for LiveKit Cloud work. Read it before touchi
 - [assistant-cloud-playbook.md](assistant-cloud-playbook.md): what Codex can manage in LiveKit Cloud, required access, safety rules, and standard commands.
 - [current-cloud-state.md](current-cloud-state.md): read-only snapshot of the current LiveKit Cloud project and agent configuration.
 - [cold-starts.md](cold-starts.md): why the cloud agent can show `Sleeping`, what causes test delays, and what can reduce them.
+- [main-bot-test.md](main-bot-test.md): setup notes for the isolated `main-bot-test` Cloud agent.
 
 ## Project entrypoints
 
@@ -16,11 +17,14 @@ This folder is the project runbook for LiveKit Cloud work. Read it before touchi
 - Main agent directory: `/Users/romangarkun/Documents/Проекты/LiveKit/agents/main-bot`
 - Agent code entrypoint: `agents/main-bot/src/agent.py`
 - Cloud deployment config: `agents/main-bot/livekit.toml`
+- Test Cloud deployment config after creation: `agents/main-bot/livekit.test.toml`
 - Local env template: `agents/main-bot/.env.example`
 - Cloud sync file built from templates: `agents/main-bot/.env.cloud.local`
+- Cloud test sync file built from templates: `agents/main-bot/.env.cloud-test.local`
 - Cloud secret sync helper: `agents/main-bot/scripts/sync_cloud_secrets.py`
-- Env profile templates: `agents/main-bot/env/common.env.example` and
-  `agents/main-bot/env/cloud.env.example`
+- Env profile templates: `agents/main-bot/env/common.env.example`,
+  `agents/main-bot/env/cloud.env.example`, and
+  `agents/main-bot/env/cloud-test.env.example`
 
 ## Required first checks
 

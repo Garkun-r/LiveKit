@@ -1,9 +1,10 @@
 # Agent environment profiles
 
-This directory separates one shared agent codebase into three runtime profiles:
+This directory separates one shared agent codebase into runtime profiles:
 
 - `mac.env.example` - local development on the Mac.
 - `cloud.env.example` - LiveKit Cloud deployment.
+- `cloud-test.env.example` - isolated LiveKit Cloud test agent.
 - `asterisk.env.example` - self-hosted LiveKit on the Asterisk server.
 
 Runtime env is flat. Do not keep three prefixed configs in one real `.env`
@@ -13,20 +14,31 @@ and `LLM_PROVIDER`, so each running process must receive exactly one resolved
 env file.
 
 Use `common.env.example` for settings that should normally stay the same across
-all three profiles. Use the profile files only for deployment identity,
+all profiles. Use the profile files only for deployment identity,
 networking, dispatch, local/cloud behavior, and measured provider routing.
 Each profile file must also set `ROBOT_RUNTIME_PROFILE` so Directus settings
-resolve through the intended runtime: `mac`, `base`, or `asterisk`.
+resolve through the intended runtime: `mac`, `base`, `main_bot_test`, or
+`asterisk`.
 
 Cloud SIP dispatch currently targets agent name `main-bot`. Do not change the
 Cloud `AGENT_NAME` template without updating the matching LiveKit SIP dispatch
 rule at the same time.
+
+The `cloud-test` profile is intentionally separate from production:
+
+- `AGENT_NAME=main-bot-test` controls LiveKit agent dispatch.
+- `ROBOT_RUNTIME_PROFILE=main_bot_test` controls Directus profile selection.
+- Do not point the current production SIP dispatch rule at `main-bot-test`.
+- For test experiments, create separate component profiles and assign them to
+  `runtime.main_bot_test.*` in `robot_profile_bindings`; do not edit shared
+  production component profiles in place.
 
 Secrets are not stored here. Put real values in ignored local files such as:
 
 ```console
 env/mac.secrets.env
 env/cloud.secrets.env
+env/cloud-test.secrets.env
 env/asterisk.secrets.env
 ```
 
@@ -43,6 +55,13 @@ Build a Cloud sync file:
 ```console
 uv run python scripts/build_env.py --profile cloud --secrets env/cloud.secrets.env --output .env.cloud.local
 uv run python scripts/sync_cloud_secrets.py --env-file .env.cloud.local
+```
+
+Build a Cloud test sync file:
+
+```console
+uv run python scripts/build_env.py --profile cloud-test --secrets env/cloud-test.secrets.env --output .env.cloud-test.local
+uv run python scripts/sync_cloud_secrets.py --env-file .env.cloud-test.local --config livekit.test.toml
 ```
 
 `sync_cloud_secrets.py` updates provided keys without deleting other cloud

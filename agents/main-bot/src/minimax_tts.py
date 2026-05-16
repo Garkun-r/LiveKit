@@ -36,6 +36,7 @@ DEFAULT_SAMPLE_RATE = 24000
 DEFAULT_BITRATE = 128000
 DEFAULT_CHANNELS = 1
 _DEFAULT_PREPARE_TIMEOUT_SEC = 10.0
+_DEFAULT_CANCEL_DRAIN_TIMEOUT_SEC = 1.0
 
 logger = logging.getLogger("agent")
 
@@ -62,6 +63,7 @@ class _MiniMaxTTSOptions:
     channel: int
     connection_reuse: bool
     http_proxy: str | None
+    cancel_drain_timeout: float
     tokenizer: tokenize.SentenceTokenizer
 
 
@@ -129,6 +131,7 @@ class PreparedMiniMaxTTS(tts.TTS):
         channel: int = DEFAULT_CHANNELS,
         connection_reuse: bool = True,
         http_proxy: str | None = None,
+        cancel_drain_timeout: float = _DEFAULT_CANCEL_DRAIN_TIMEOUT_SEC,
         tokenizer_obj: NotGivenOr[tokenize.SentenceTokenizer] = NOT_GIVEN,
         connect_factory: ConnectFactory = connect,
     ) -> None:
@@ -171,6 +174,7 @@ class PreparedMiniMaxTTS(tts.TTS):
             channel=int(channel),
             connection_reuse=bool(connection_reuse),
             http_proxy=http_proxy,
+            cancel_drain_timeout=max(0.0, float(cancel_drain_timeout)),
             tokenizer=tokenizer_obj,
         )
         self._connect_factory = connect_factory
@@ -447,12 +451,16 @@ class PreparedMiniMaxTTS(tts.TTS):
             audio_chunks = 0
             audio_bytes = 0
             usage_characters: int | None = None
+            task_continue_started = False
+            task_continue_sent = False
             try:
                 await self._ensure_prepared_locked(
                     timeout=conn_options.timeout,
                     reason="stream",
                 )
+                task_continue_started = True
                 await self._send_json_locked({"event": "task_continue", "text": text})
+                task_continue_sent = True
 
                 while True:
                     message = await self._recv_json_locked(timeout=conn_options.timeout)
@@ -511,8 +519,11 @@ class PreparedMiniMaxTTS(tts.TTS):
                     await self._finish_and_close_locked(wait_for_finish=True)
                 return stats
             except asyncio.CancelledError:
-                await self._reset_connection_locked(reason="cancelled")
-                self.schedule_prepare("cancelled")
+                await self._recover_cancelled_stream_locked(
+                    task_continue_started=task_continue_started,
+                    task_continue_sent=task_continue_sent,
+                    found_audio=found_audio,
+                )
                 raise
             except (APIConnectionError, APIStatusError, APITimeoutError):
                 await self._reset_connection_locked(reason="connection_error")
@@ -525,6 +536,84 @@ class PreparedMiniMaxTTS(tts.TTS):
                     status_code=502,
                     retryable=True,
                 ) from e
+
+    async def _recover_cancelled_stream_locked(
+        self,
+        *,
+        task_continue_started: bool,
+        task_continue_sent: bool,
+        found_audio: bool,
+    ) -> None:
+        if not task_continue_started:
+            if _is_ws_open(self._ws) and self._prepared.prepared_at is not None:
+                logger.info(
+                    "minimax prepared tts cancel before task_continue; keeping websocket"
+                )
+                return
+            await self._reset_connection_locked(reason="cancelled_before_continue")
+            self.schedule_prepare("cancelled_before_continue")
+            return
+
+        if not task_continue_sent:
+            await self._reset_connection_locked(reason="cancelled_during_continue_send")
+            self.schedule_prepare("cancelled_during_continue_send")
+            return
+
+        if await self._drain_cancelled_segment_locked(found_audio=found_audio):
+            return
+
+        await self._reset_connection_locked(reason="cancel_drain_failed")
+        self.schedule_prepare("cancel_drain_failed")
+
+    async def _drain_cancelled_segment_locked(self, *, found_audio: bool) -> bool:
+        timeout = self._opts.cancel_drain_timeout
+        if timeout <= 0 or not _is_ws_open(self._ws):
+            return False
+
+        started_at = time.perf_counter()
+        discarded_chunks = 0
+        discarded_bytes = 0
+        try:
+            while True:
+                remaining = timeout - (time.perf_counter() - started_at)
+                if remaining <= 0:
+                    logger.info(
+                        "minimax prepared tts cancel drain timed out",
+                        extra={
+                            "cancel_drain_timeout_ms": round(timeout * 1000, 1),
+                            "cancel_drain_ms": _safe_ms(started_at),
+                            "cancel_drain_discarded_chunks": discarded_chunks,
+                            "cancel_drain_discarded_bytes": discarded_bytes,
+                            "cancel_after_audio": found_audio,
+                        },
+                    )
+                    return False
+
+                message = await self._recv_json_locked(timeout=remaining)
+                data = message.get("data") or {}
+                raw_audio = data.get("audio")
+                if isinstance(raw_audio, str) and raw_audio:
+                    discarded_chunks += 1
+                    discarded_bytes += max(0, len(raw_audio) // 2)
+
+                if message.get("is_final"):
+                    logger.info(
+                        "minimax prepared tts cancel drained segment; keeping websocket",
+                        extra={
+                            "cancel_drain_ms": _safe_ms(started_at),
+                            "cancel_drain_discarded_chunks": discarded_chunks,
+                            "cancel_drain_discarded_bytes": discarded_bytes,
+                            "cancel_after_audio": found_audio,
+                        },
+                    )
+                    return True
+        except (APIConnectionError, APIStatusError, APITimeoutError) as e:
+            logger.warning(
+                "minimax prepared tts cancel drain failed: %s",
+                e,
+                extra={"cancel_after_audio": found_audio},
+            )
+            return False
 
     async def _reset_connection_locked(self, reason: str) -> None:
         if self._ws is None:

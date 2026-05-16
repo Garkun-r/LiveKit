@@ -5,23 +5,29 @@ from types import SimpleNamespace
 
 import pytest
 from livekit import rtc
+from livekit.agents import llm
 from livekit.agents.llm.tool_context import StopResponse
 
 import agent
 from agent import (
     Assistant,
+    PrerecordedIntroPlaybackState,
     build_agent_room_options,
     build_service_phrase_transcript_item,
     clear_initial_greeting_user_turn,
+    delayed_prerecorded_audio_frames,
     disconnect_reason_name,
     event_timestamp_seconds,
     extract_sip_diagnostic_context,
     is_abnormal_close,
+    is_low_information_user_turn,
     play_prerecorded_audio,
     prerecorded_playout_timeout_sec,
+    record_speech_canceled_before_first_audio_incident,
     should_fire_startup_no_dialog_timeout,
     should_log_slow_response_latency,
     should_log_startup_provider_fallback,
+    should_log_tts_ttfb_slow,
     should_play_initial_greeting,
     should_stop_recording_on_close,
     speech_playout_was_observed,
@@ -92,6 +98,14 @@ class _SpeechHandle:
         self._done = True
 
 
+class _IncidentLog:
+    def __init__(self) -> None:
+        self.records: list[dict[str, object]] = []
+
+    def record_nowait(self, incident_type: str, **kwargs) -> None:
+        self.records.append({"incident_type": incident_type, **kwargs})
+
+
 class _Session:
     def __init__(self) -> None:
         self.interrupt_calls: list[bool] = []
@@ -126,6 +140,21 @@ class _SaySession:
             }
         )
         return self.handles.pop(0)
+
+
+class _VoiceAudioCache:
+    def __init__(self, audio_path) -> None:
+        self.audio_path = audio_path
+        self.get_or_create_calls: list[dict[str, object]] = []
+
+    async def get_or_create(self, *, kind: str, text: str, legacy_path=None):
+        self.get_or_create_calls.append(
+            {"kind": kind, "text": text, "legacy_path": legacy_path}
+        )
+        return self.audio_path
+
+    def get_existing(self, **kwargs):
+        return None
 
 
 def _write_wav(path, *, sample_rate: int = 8000, duration_sec: float = 0.1) -> None:
@@ -392,6 +421,11 @@ def test_should_log_slow_response_latency_when_threshold_is_reached() -> None:
     assert should_log_slow_response_latency(7200.5, 7000) is True
 
 
+def test_should_log_tts_ttfb_slow_when_threshold_is_reached() -> None:
+    assert should_log_tts_ttfb_slow(3000, 3000) is True
+    assert should_log_tts_ttfb_slow(4416.7, 3000) is True
+
+
 def test_vad_speech_duration_ms_uses_non_negative_elapsed_time() -> None:
     assert vad_speech_duration_ms(started_at=10.0, ended_at=11.2345) == 1234.5
     assert vad_speech_duration_ms(started_at=11.0, ended_at=10.0) == 0.0
@@ -402,6 +436,48 @@ def test_should_not_log_slow_response_latency_below_threshold_or_disabled() -> N
     assert should_log_slow_response_latency(None, 7000) is False
     assert should_log_slow_response_latency(6999.9, 7000) is False
     assert should_log_slow_response_latency(10000, 0) is False
+
+
+def test_should_not_log_tts_ttfb_slow_below_threshold_or_disabled() -> None:
+    assert should_log_tts_ttfb_slow(None, 3000) is False
+    assert should_log_tts_ttfb_slow(2999.9, 3000) is False
+    assert should_log_tts_ttfb_slow(5000, 0) is False
+
+
+def test_record_speech_canceled_before_first_audio_incident() -> None:
+    incident_log = _IncidentLog()
+
+    record_speech_canceled_before_first_audio_incident(
+        incident_log,
+        speech_id="speech-1",
+        phase="first_frame_ready",
+        speech_start_user_revision=2,
+        current_user_revision=3,
+        user_is_speaking=True,
+        transcript="алло",
+        min_words=2,
+    )
+
+    assert incident_log.records == [
+        {
+            "incident_type": "speech_canceled_before_first_audio",
+            "severity": "warning",
+            "component": "voice_pipeline",
+            "description": (
+                "Assistant speech was canceled before first audio reached playback"
+            ),
+            "payload": {
+                "speech_id": "speech-1",
+                "phase": "first_frame_ready",
+                "speech_start_user_revision": 2,
+                "current_user_revision": 3,
+                "user_is_speaking": True,
+                "transcript": "алло",
+                "transcript_word_count": 1,
+                "pending_reply_guard_min_words": 2,
+            },
+        }
+    ]
 
 
 def test_initial_greeting_plays_regardless_of_user_speech() -> None:
@@ -548,6 +624,190 @@ async def test_short_greeting_still_plays_after_avito_intro_replay(
     assert played_calls[0]["playback_kind"] == "avito_initial_greeting_replay"
     assert played_calls[1]["audio_path"] == short_audio_path
     assert played_calls[1]["text"] == "Да, слушаю."
+
+
+@pytest.mark.asyncio
+async def test_first_llm_intro_schedules_foreground_before_generated_reply(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    audio_path = tmp_path / "first_intro.wav"
+    audio_path.write_bytes(b"fake")
+    handle = _SpeechHandle(done=False)
+    session = _SaySession([handle])
+    assistant = Assistant(
+        prompt="test prompt",
+        first_llm_intro_audio_path=audio_path,
+        first_llm_intro_delay_sec=1.5,
+    )
+    assistant._activity = SimpleNamespace(session=session)
+    wait_release = asyncio.Event()
+
+    async def fake_wait_for_speech_playout(*args, **kwargs):
+        await wait_release.wait()
+        return False
+
+    monkeypatch.setattr(agent, "wait_for_speech_playout", fake_wait_for_speech_playout)
+
+    await assistant.on_user_turn_completed(None, _ChatMessage("Сколько стоит услуга?"))
+
+    assert assistant._awaiting_first_user_turn is False
+    assert assistant._first_llm_intro_pending is False
+    assert assistant._first_llm_intro_in_flight is True
+    assert (
+        session.say_calls[0]["text"]
+        == "Я хочу обратить внимание, что я виртуальный ассистент."
+    )
+    assert session.say_calls[0]["allow_interruptions"] is True
+    assert session.say_calls[0]["add_to_chat_ctx"] is False
+
+    wait_release.set()
+    await assistant._first_llm_intro_watch_task
+
+
+@pytest.mark.asyncio
+async def test_first_llm_intro_synthesizes_dynamic_text_before_generated_reply(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    audio_path = tmp_path / "cached-first-intro.wav"
+    handle = _SpeechHandle(done=False)
+    session = _SaySession([handle])
+    cache = _VoiceAudioCache(audio_path)
+    assistant = Assistant(
+        prompt="test prompt",
+        first_llm_intro_audio_path=None,
+        first_llm_intro_phrase="Индивидуальная фраза ассистента.",
+        voice_audio_cache=cache,
+    )
+    assistant._activity = SimpleNamespace(session=session)
+    wait_release = asyncio.Event()
+
+    async def fake_wait_for_speech_playout(*args, **kwargs):
+        await wait_release.wait()
+        return False
+
+    monkeypatch.setattr(agent, "wait_for_speech_playout", fake_wait_for_speech_playout)
+
+    await assistant.on_user_turn_completed(None, _ChatMessage("service question"))
+
+    assert cache.get_or_create_calls == [
+        {
+            "kind": "first_llm_intro",
+            "text": "Индивидуальная фраза ассистента.",
+            "legacy_path": None,
+        }
+    ]
+    assert session.say_calls[0]["text"] == "Индивидуальная фраза ассистента."
+    assert assistant._first_llm_intro_pending is False
+    assert assistant._first_llm_intro_in_flight is True
+
+    wait_release.set()
+    await assistant._first_llm_intro_watch_task
+
+
+def test_first_llm_intro_context_keeps_user_turn_last_semantically(tmp_path) -> None:
+    audio_path = tmp_path / "first_intro.wav"
+    audio_path.write_bytes(b"fake")
+    assistant = Assistant(
+        prompt="test prompt",
+        first_llm_intro_audio_path=audio_path,
+    )
+    chat_ctx = llm.ChatContext.empty()
+    chat_ctx.add_message(role="user", content="Сколько стоит услуга?")
+
+    assistant._inject_first_llm_intro_context(chat_ctx)
+
+    assert [item.role for item in chat_ctx.items] == ["user", "system"]
+    assert (
+        chat_ctx.items[-1].text_content
+        != "Я хочу обратить внимание, что я виртуальный ассистент."
+    )
+    assert "уже произносит перед твоим ответом" in chat_ctx.items[-1].text_content
+    assert "Сгенерируй только естественное продолжение" in chat_ctx.items[-1].text_content
+
+
+@pytest.mark.asyncio
+async def test_first_llm_intro_interruption_keeps_intro_pending(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    audio_path = tmp_path / "first_intro.wav"
+    audio_path.write_bytes(b"fake")
+    transcript_items = []
+    handle = _SpeechHandle(done=True)
+    handle.interrupted = True
+    assistant = Assistant(
+        prompt="test prompt",
+        first_llm_intro_audio_path=audio_path,
+        record_service_phrase=transcript_items.append,
+    )
+    assistant._first_llm_intro_pending = False
+    assistant._first_llm_intro_in_flight = True
+    playback_state = PrerecordedIntroPlaybackState(first_frame_yielded=True)
+
+    async def fake_wait_for_speech_playout(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(agent, "wait_for_speech_playout", fake_wait_for_speech_playout)
+
+    await assistant._watch_first_llm_intro_playout(
+        handle,
+        playback_state=playback_state,
+        speech_start_revision=1,
+        audio_path=audio_path,
+    )
+
+    assert assistant._first_llm_intro_pending is True
+    assert assistant._first_llm_intro_in_flight is False
+    assert assistant._first_llm_intro_played is False
+    assert transcript_items == []
+
+
+@pytest.mark.asyncio
+async def test_low_information_turn_does_not_consume_first_llm_intro(tmp_path) -> None:
+    audio_path = tmp_path / "first_intro.wav"
+    audio_path.write_bytes(b"fake")
+    session = _SaySession([_SpeechHandle(done=True)])
+    assistant = Assistant(
+        prompt="test prompt",
+        first_llm_intro_audio_path=audio_path,
+    )
+    assistant._activity = SimpleNamespace(session=session)
+
+    with pytest.raises(StopResponse):
+        await assistant.on_user_turn_completed(None, _ChatMessage("в"))
+
+    assert assistant._awaiting_first_user_turn is True
+    assert assistant._first_llm_intro_pending is True
+    assert session.say_calls == []
+
+
+def test_low_information_user_turn_detects_single_character_noise() -> None:
+    assert is_low_information_user_turn("в") is True
+    assert is_low_information_user_turn("?") is True
+    assert is_low_information_user_turn("адрес") is False
+
+
+@pytest.mark.asyncio
+async def test_delayed_prerecorded_audio_cancels_before_first_frame(tmp_path) -> None:
+    audio_path = tmp_path / "first_intro.wav"
+    _write_wav(audio_path)
+    state = PrerecordedIntroPlaybackState()
+    frames = [
+        frame
+        async for frame in delayed_prerecorded_audio_frames(
+            audio_path,
+            sample_rate=8000,
+            delay_sec=0,
+            cancel_check=lambda: True,
+            state=state,
+        )
+    ]
+
+    assert frames == []
+    assert state.canceled_before_first_frame is True
+    assert state.first_frame_yielded is False
 
 
 def test_clear_initial_greeting_user_turn_discards_buffered_turn() -> None:

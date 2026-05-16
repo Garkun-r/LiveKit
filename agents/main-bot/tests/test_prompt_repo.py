@@ -208,6 +208,45 @@ async def test_resolve_prompt_uses_directus_cached_template(
 
 
 @pytest.mark.asyncio
+async def test_resolve_prompt_sanitizes_directus_cached_intro_instruction(
+    prompt_file,
+    monkeypatch,
+):
+    _enable_directus(monkeypatch)
+    http_client = _DirectusHttpClient(
+        {
+            "client_prompt_cache": [
+                {
+                    "caller_id": "+15550100",
+                    "client_id": 7,
+                    "prompt_template": (
+                        "Если это твоя ПЕРВАЯ реплика в диалоге, начни её с "
+                        "короткого представления: \"Я виртуальный ассистент.\" "
+                        "и сразу после этого дай ответ из <knowledge_base>.\n"
+                        "Model: Я виртуальный ассистент, сейчас подскажу. "
+                        "Выезд стоит пятьсот рублей.\n"
+                        "Model: Я виртуальный ассистент. Конечно, оформим заявку."
+                    ),
+                    "timezone": "Europe/Kaliningrad",
+                    "active": True,
+                }
+            ],
+        }
+    )
+
+    result = await prompt_repo.resolve_prompt_for_call(
+        sip_trunk_number="+15550100",
+        directus_client_factory=_directus_factory(http_client),
+    )
+
+    assert "начни её с короткого представления" not in result.prompt
+    assert "Я виртуальный ассистент" not in result.prompt
+    assert "Model: Сейчас подскажу." in result.prompt
+    assert "Model: Конечно, оформим заявку." in result.prompt
+    assert "<runtime_voice_intro>" in result.prompt
+
+
+@pytest.mark.asyncio
 async def test_resolve_prompt_uses_memory_cache_without_second_http_call(
     prompt_file, monkeypatch
 ):
@@ -240,6 +279,7 @@ async def test_resolve_prompt_uses_memory_cache_without_second_http_call(
     assert [request[0] for request in http_client.requests] == [
         "client_prompt_cache",
         "clients",
+        "bot_configurations",
     ]
 
 
@@ -294,6 +334,7 @@ async def test_resolve_prompt_rebuilds_stale_directus_cache(prompt_file, monkeyp
                     "system_prompt": "specific strategy",
                     "examples": "dialogue example",
                     "skills_name": "skill_info+questions",
+                    "llm_intro": "Я хочу обратить внимание, что я виртуальный ассистент.",
                 }
             ],
             "clients": [
@@ -344,6 +385,7 @@ async def test_resolve_prompt_builds_live_prompt_on_cache_miss(
                     "system_prompt": "specific strategy",
                     "examples": "dialogue example",
                     "skills_name": "skill_info+questions",
+                    "llm_intro": "Я хочу обратить внимание, что я виртуальный ассистент.",
                 }
             ],
             "clients": [
@@ -372,6 +414,7 @@ async def test_resolve_prompt_builds_live_prompt_on_cache_miss(
     )
 
     assert result.source == "directus:live"
+    assert result.llm_intro == "Я хочу обратить внимание, что я виртуальный ассистент."
     assert "global rules text" in result.prompt
     assert "skills text" in result.prompt
     assert "client knowledge" in result.prompt
@@ -391,6 +434,107 @@ async def test_resolve_prompt_builds_live_prompt_on_cache_miss(
     assert len(payload["source_hash"]) == 64
     assert "global rules text" in payload["prompt_template"]
     assert prompt_repo._CURRENT_DATETIME_PLACEHOLDER in payload["prompt_template"]
+
+
+@pytest.mark.asyncio
+async def test_cached_prompt_reads_llm_intro_from_bot_configuration(
+    prompt_file, monkeypatch
+):
+    _enable_directus(monkeypatch)
+    http_client = _DirectusHttpClient(
+        {
+            "client_prompt_cache": [
+                {
+                    "caller_id": "+15550100",
+                    "client_id": 7,
+                    "prompt_template": "cached prompt",
+                    "timezone": "Europe/Kaliningrad",
+                    "active": True,
+                }
+            ],
+            "bot_configurations": [
+                {
+                    "client_id": 7,
+                    "llm_intro": "Индивидуальное предупреждение ассистента.",
+                }
+            ],
+        }
+    )
+
+    result = await prompt_repo.resolve_prompt_for_call(
+        sip_trunk_number="+15550100",
+        directus_client_factory=_directus_factory(http_client),
+    )
+
+    assert result.source == "directus:cache"
+    assert result.llm_intro == "Индивидуальное предупреждение ассистента."
+
+
+@pytest.mark.asyncio
+async def test_resolve_prompt_sanitizes_live_directus_intro_sources(
+    prompt_file,
+    monkeypatch,
+):
+    _enable_directus(monkeypatch)
+    http_client = _DirectusHttpClient(
+        {
+            "client_prompt_cache": [],
+            "CallerID": [{"CallerID": "+15550100", "client_id": 7}],
+            "bot_configurations": [
+                {
+                    "client_id": 7,
+                    "system_prompt": "specific strategy",
+                    "examples": (
+                        "User: Сколько стоит выезд? "
+                        "Model: Я виртуальный ассистент, сейчас подскажу. "
+                        "Выезд стоит пятьсот рублей.\n"
+                        "User: Хочу вызвать мастера. "
+                        "Model: Я виртуальный ассистент. Конечно, оформим заявку.\n"
+                        "User: Перезвоните мне. "
+                        "Model: Я виртуальный ассистент, с удовольствием помогу. "
+                        "Как к вам можно обращаться?"
+                    ),
+                    "skills_name": "skill_info+questions",
+                }
+            ],
+            "clients": [
+                {
+                    "id": 7,
+                    "add_info": "client knowledge",
+                    "company_website": "",
+                    "company_extra": "",
+                }
+            ],
+            "clients_prompt": [
+                {"name": "global_rules", "text": "global rules text"},
+                {
+                    "name": "skill_info+questions",
+                    "text": (
+                        "Если это твоя ПЕРВАЯ реплика в диалоге, начни её с "
+                        "короткого представления: \"Я виртуальный ассистент.\" "
+                        "и сразу после этого дай ответ из <knowledge_base>."
+                    ),
+                },
+            ],
+            "transfer_number": [],
+        }
+    )
+
+    result = await prompt_repo.resolve_prompt_for_call(
+        sip_trunk_number="+15550100",
+        directus_client_factory=_directus_factory(http_client),
+    )
+
+    assert "начни её с короткого представления" not in result.prompt
+    assert "Я виртуальный ассистент" not in result.prompt
+    assert "Model: Сейчас подскажу." in result.prompt
+    assert "Model: Конечно, оформим заявку." in result.prompt
+    assert "Model: С удовольствием помогу." in result.prompt
+    assert "<runtime_voice_intro>" in result.prompt
+    assert len(http_client.writes) == 1
+    payload = http_client.writes[0][-1]
+    assert "Я виртуальный ассистент" not in payload["prompt_template"]
+    assert "<runtime_voice_intro>" in payload["prompt_template"]
 
 
 @pytest.mark.asyncio

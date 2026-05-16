@@ -196,9 +196,18 @@ LLM, TTS и session runtime.
   `user_state_changed: speaking -> listening`; если VAD-события не было,
   используется время final transcript как fallback.
 
+`speech_canceled_before_first_audio`
+: речь робота была создана, но отменена до первого аудиокадра, потому что
+  клиент начал говорить снова. Это отдельный UX-инцидент: обычный
+  `slow_response` может не сработать, если playback так и не начался.
+
+`tts_ttfb_slow`
+: TTS сообщил `tts_metrics.ttfb` выше `INCIDENT_TTS_TTFB_SLOW_MS`. Этот сигнал
+  отделяет задержку первого аудио TTS от быстрых LLM/STT этапов.
+
 `reply_watchdog_fired`
 : после финального user transcript не появилась реплика агента до watchdog
-таймаута, и существующий safety path был запущен.
+  таймаута, и существующий safety path был запущен.
 
 `no_dialog_startup_timeout`
 : после старта `AgentSession` не появилось ни речи робота, ни речи клиента,
@@ -328,6 +337,7 @@ INCIDENT_POSTGRES_DSN=
 INCIDENT_ENVIRONMENT=cloud
 INCIDENT_DB_TIMEOUT_SEC=1.5
 INCIDENT_SLOW_RESPONSE_MS=4000
+INCIDENT_TTS_TTFB_SLOW_MS=3000
 ```
 
 `INCIDENT_DB_TIMEOUT_SEC` должен быть коротким. Если VPS/Directus/Postgres

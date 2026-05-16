@@ -215,6 +215,7 @@ def _voice_prompt_manager(
             kind="response_delay",
             audio_paths=(response_delay_audio,),
             phrase="Секундочку.",
+            prefer_prerecorded=True,
         ),
         client_silence_prompt=agent.VoicePromptSpec(
             kind="client_silence",
@@ -589,7 +590,7 @@ async def test_response_delay_prompt_fires_after_timer(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_response_delay_prompt_uses_voice_audio_cache(tmp_path) -> None:
+async def test_response_delay_prompt_prefers_prerecorded_audio(tmp_path) -> None:
     cached_path = tmp_path / "cached.wav"
     cached_path.write_bytes(b"fake")
     voice_audio_cache = _FakeVoiceAudioCache(cached_path)
@@ -597,6 +598,27 @@ async def test_response_delay_prompt_uses_voice_audio_cache(tmp_path) -> None:
         tmp_path=tmp_path,
         voice_audio_cache=voice_audio_cache,
     )
+
+    manager.start_response_delay_timer()
+    await asyncio.sleep(0.05)
+    await manager.aclose()
+
+    assert background_audio.played == [str(tmp_path / "response_delay.wav")]
+    assert voice_audio_cache.calls == []
+
+
+@pytest.mark.asyncio
+async def test_response_delay_prompt_uses_voice_audio_cache_when_file_missing(
+    tmp_path,
+) -> None:
+    cached_path = tmp_path / "cached.wav"
+    cached_path.write_bytes(b"fake")
+    voice_audio_cache = _FakeVoiceAudioCache(cached_path)
+    manager, _, background_audio = _voice_prompt_manager(
+        tmp_path=tmp_path,
+        voice_audio_cache=voice_audio_cache,
+    )
+    (tmp_path / "response_delay.wav").unlink()
 
     manager.start_response_delay_timer()
     await asyncio.sleep(0.05)

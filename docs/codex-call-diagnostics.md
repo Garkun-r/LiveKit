@@ -24,18 +24,26 @@ The realtime LiveKit agent remains unchanged. Diagnostics run after the call:
    `short_call_no_dialog`, `no_transcript_items`, `no_tag_events`,
    `user_speech_state_seen`, `initial_greeting_playback_log_seen`,
    `room_seen_in_livekit_snapshot`, and `egress_active_in_livekit_snapshot`.
-9. The worker reads the matching Directus `client_prompt_cache` row by
+9. The worker also builds investigation input for Codex:
+   `problem_signals`, `evidence_timeline`, and `latency_chains`.
+   `problem_signals` names the likely problem classes to investigate.
+   `evidence_timeline` is a compact proof chain from raw logs, transcript,
+   metrics, tag events, incidents, and LiveKit snapshot. `latency_chains`
+   precomputes turn lifecycle steps such as user final transcript, response
+   creation, LLM metrics, TTS first audio, playback start, interruption, and
+   replacement playback.
+10. The worker reads the matching Directus `client_prompt_cache` row by
    DID/trunk and attaches the rendered prompt context to the audit input when
    available. This lets Codex verify facts from client `add_info` and the
    actual cached production prompt, not only `agents/main-bot/src/prompt.txt`.
-10. The worker runs:
+11. The worker runs:
 
    ```console
    codex exec --sandbox read-only --ephemeral --json --output-schema shared/webhooks/codex_diagnostics_report.schema.json
    ```
 
-11. The worker writes the full report back to Directus.
-12. If the matched rule's `telegram_policy` allows it, the worker calls the n8n
+12. The worker writes the full report back to Directus.
+13. If the matched rule's `telegram_policy` allows it, the worker calls the n8n
    audit-notification webhook. n8n sends a Russian Telegram brief to the same
    chat and through the same bot/token path as low-score aftercall alerts. The
    brief includes a link to the specific `robot_call_audits` item in Directus
@@ -44,12 +52,12 @@ The realtime LiveKit agent remains unchanged. Diagnostics run after the call:
    `AFTER CALL` execution that launched diagnostics. Each top finding must
    name the dialog stage, approximate turn/time, exact tag/value/event when
    relevant, concrete evidence, and an implementation idea.
-13. When that button is pressed, n8n receives the Telegram callback, asks the
+14. When that button is pressed, n8n receives the Telegram callback, asks the
     worker for the full report by `audit_id`, and sends the full Russian report
     back to the same chat. The full report is chunked for Telegram limits and
     includes the sections for timeline, pauses/delays, errors/incidents,
-    anomalies, suspected cause, recommendations, implementation ideas, missing
-    evidence, and the no-auto-fix guarantee.
+    anomalies, root-cause analysis, recommendations, implementation ideas,
+    missing evidence, and the no-auto-fix guarantee.
 
 ## Report Quality Contract
 
@@ -84,6 +92,67 @@ The full report must still preserve:
 - evidence versus inference;
 - what evidence is still missing if the cause is uncertain;
 - the concrete implementation idea: what to inspect or change next.
+
+Every important finding must include a `root_cause_analysis` object in the
+Codex JSON. This is mandatory even when the cause is uncertain. The block must
+answer:
+
+- `symptom`: what the owner or client noticed;
+- `expected`: what the robot should have done;
+- `actual`: what transcript/raw logs/metrics/tag events show happened;
+- `chain_break`: the nearest broken point, such as STT, VAD, LLM, TTS,
+  interruption, prompt, tag parser, Directus, LiveKit room, n8n export, or
+  aftercall;
+- `checked_hypotheses`: versions checked with `confirmed`, `rejected`, or
+  `uncertain`;
+- `root_cause`: the most likely technical cause with evidence;
+- `code_or_logic_reference`: the function, file, log message, or "not visible
+  in supplied data";
+- `what_this_was_not`: likely but rejected causes;
+- `evidence_timeline`: short timestamped proof chain;
+- `changes_to_make`: concrete action in code, prompt, logging, or settings;
+- `missing_evidence`: what must be logged next time if the cause is not fully
+  proven.
+
+Symptom-only findings are invalid. If Codex writes "delay", "robot was silent",
+"late answer", "client said Алло", "wrong answer", "wrong company name",
+"missing tag", "no Codex report", "no raw logs", or "strange close", it must
+also explain the nearest technical cause. If the cause cannot be proven, it
+must list the checked versions and the missing evidence.
+
+For latency, silence, "Алло", and interruption findings, Codex must inspect
+`latency_chains` first. A correct finding should distinguish these cases:
+
+- slow LLM or slow TTS;
+- playback started late after audio was ready;
+- a reply was generated but canceled before first audio;
+- the client spoke over the robot after playback had already started;
+- `slow_response` did not fire because the metric was measured from the last
+  short "Алло" rather than from the first useful question.
+
+Example mechanism:
+
+```text
+Проблема:
+Клиент ждал первый полезный ответ.
+
+Почему так произошло:
+Робот начал готовить ответ, но клиент сказал "Алло" до первого аудио.
+Interruption logic отменил еще не прозвучавший ответ. Потом робот создал новый
+ответ и начал говорить через 1.25 сек.
+
+Что это НЕ было:
+Это не долгий LLM: LLM ответил за 568 ms.
+Это не n8n/export: задержка была внутри live conversation.
+
+Доказательная цепочка:
+08:59:28 вопрос клиента
+08:59:29 speech created
+08:59:29 llm metrics
+08:59:30 клиент сказал "Алло"
+08:59:31 assistant_interrupted
+08:59:32 new_playback_started
+```
 
 For example, a tag finding should name the exact tag and explain whether the
 current repository logic hides it, ignores it, or still routes it to an action.

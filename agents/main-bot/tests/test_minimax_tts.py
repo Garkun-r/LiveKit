@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections import deque
 from typing import Any
@@ -19,19 +20,37 @@ from minimax_tts import PreparedMiniMaxTTS
 
 
 class _FakeWebSocket:
-    def __init__(self, events: list[dict[str, Any] | str] | None = None) -> None:
+    def __init__(
+        self,
+        events: list[dict[str, Any] | str] | None = None,
+        *,
+        block_when_empty: bool = False,
+    ) -> None:
         self.state = State.OPEN
         self.sent: list[dict[str, Any]] = []
         self.closed = False
+        self._block_when_empty = block_when_empty
         self._events: deque[str] = deque()
+        self._recv_waiters: deque[asyncio.Future[str]] = deque()
         for event in events or []:
             self.queue(event)
 
     def queue(self, event: dict[str, Any] | str) -> None:
-        self._events.append(json.dumps(event) if isinstance(event, dict) else event)
+        payload = json.dumps(event) if isinstance(event, dict) else event
+        if self._recv_waiters:
+            while self._recv_waiters:
+                waiter = self._recv_waiters.popleft()
+                if not waiter.done():
+                    waiter.set_result(payload)
+                    return
+        self._events.append(payload)
 
     async def recv(self) -> str:
         if not self._events:
+            if self._block_when_empty:
+                waiter = asyncio.get_running_loop().create_future()
+                self._recv_waiters.append(waiter)
+                return await waiter
             raise AssertionError("fake websocket recv called with no queued events")
         return self._events.popleft()
 
@@ -95,6 +114,30 @@ async def test_minimax_prepare_reuses_started_task() -> None:
 
     await tts_client.prepare(reason="test")
     await tts_client.prepare(reason="test-again")
+
+    assert connections == [ws]
+    assert [payload["event"] for payload in ws.sent] == ["task_start"]
+
+    await tts_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_minimax_schedule_prepare_starts_background_task() -> None:
+    ws = _FakeWebSocket(_connected_events())
+    connections: list[_FakeWebSocket] = []
+
+    async def connect_factory(*args: Any, **kwargs: Any) -> _FakeWebSocket:
+        connections.append(ws)
+        return ws
+
+    tts_client = PreparedMiniMaxTTS(
+        api_key="test-key",
+        connect_factory=connect_factory,
+    )
+
+    tts_client.schedule_prepare(reason="dialog_start")
+    assert tts_client._prepare_task is not None
+    await tts_client._prepare_task
 
     assert connections == [ws]
     assert [payload["event"] for payload in ws.sent] == ["task_start"]
@@ -199,6 +242,133 @@ async def test_minimax_reset_closes_stale_websocket_and_next_stream_reconnects()
 
     assert connections == [first_ws, second_ws]
     assert emitter.chunks == [b"\x0a\x0b"]
+
+    await tts_client.aclose()
+
+
+async def _wait_for_sent_event(ws: _FakeWebSocket, event: str) -> None:
+    for _ in range(50):
+        if any(payload.get("event") == event for payload in ws.sent):
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"fake websocket did not send {event}")
+
+
+@pytest.mark.asyncio
+async def test_minimax_cancel_after_continue_drains_and_reuses_websocket() -> None:
+    ws = _FakeWebSocket(_connected_events(), block_when_empty=True)
+    connections: list[_FakeWebSocket] = []
+
+    async def connect_factory(*args: Any, **kwargs: Any) -> _FakeWebSocket:
+        connections.append(ws)
+        return ws
+
+    tts_client = PreparedMiniMaxTTS(
+        api_key="test-key",
+        connect_factory=connect_factory,
+        cancel_drain_timeout=0.5,
+    )
+    emitter = _Emitter()
+    task = asyncio.create_task(
+        tts_client._stream_text_to_emitter(
+            text="старая фраза",
+            output_emitter=emitter,
+            conn_options=DEFAULT_API_CONNECT_OPTIONS,
+        )
+    )
+
+    await _wait_for_sent_event(ws, "task_continue")
+    task.cancel()
+    await asyncio.sleep(0)
+    ws.queue(_audio_event("0102"))
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert ws.closed is False
+    assert emitter.chunks == []
+
+    ws.queue(_audio_event("0304"))
+    await tts_client._stream_text_to_emitter(
+        text="новая фраза",
+        output_emitter=emitter,
+        conn_options=DEFAULT_API_CONNECT_OPTIONS,
+    )
+
+    assert connections == [ws]
+    assert [payload["event"] for payload in ws.sent] == [
+        "task_start",
+        "task_continue",
+        "task_continue",
+    ]
+    assert emitter.chunks == [b"\x03\x04"]
+
+    await tts_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_minimax_cancel_drain_timeout_resets_and_prepares_new_websocket() -> None:
+    first_ws = _FakeWebSocket(_connected_events(), block_when_empty=True)
+    second_ws = _FakeWebSocket(_connected_events())
+    sockets = deque([first_ws, second_ws])
+    connections: list[_FakeWebSocket] = []
+
+    async def connect_factory(*args: Any, **kwargs: Any) -> _FakeWebSocket:
+        ws = sockets.popleft()
+        connections.append(ws)
+        return ws
+
+    tts_client = PreparedMiniMaxTTS(
+        api_key="test-key",
+        connect_factory=connect_factory,
+        cancel_drain_timeout=0.01,
+    )
+    task = asyncio.create_task(
+        tts_client._stream_text_to_emitter(
+            text="старая фраза",
+            output_emitter=_Emitter(),
+            conn_options=DEFAULT_API_CONNECT_OPTIONS,
+        )
+    )
+
+    await _wait_for_sent_event(first_ws, "task_continue")
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    if tts_client._prepare_task is not None:
+        await tts_client._prepare_task
+
+    assert first_ws.closed is True
+    assert second_ws.closed is False
+    assert connections == [first_ws, second_ws]
+    assert [payload["event"] for payload in second_ws.sent] == ["task_start"]
+
+    await tts_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_minimax_cancel_before_continue_keeps_prepared_websocket() -> None:
+    ws = _FakeWebSocket(_connected_events())
+
+    async def connect_factory(*args: Any, **kwargs: Any) -> _FakeWebSocket:
+        return ws
+
+    tts_client = PreparedMiniMaxTTS(
+        api_key="test-key",
+        connect_factory=connect_factory,
+    )
+
+    await tts_client.prepare(reason="test")
+    async with tts_client._task_lock:
+        await tts_client._recover_cancelled_stream_locked(
+            task_continue_started=False,
+            task_continue_sent=False,
+            found_audio=False,
+        )
+
+    assert ws.closed is False
+    assert [payload["event"] for payload in ws.sent] == ["task_start"]
 
     await tts_client.aclose()
 
@@ -339,6 +509,29 @@ def test_build_tts_minimax_uses_profile_config(monkeypatch) -> None:
     assert captured["channel"] == 1
     assert captured["connection_reuse"] is False
     assert captured["http_proxy"] == "http://proxy"
+
+
+def test_schedule_tts_prepare_prepares_all_fallback_children() -> None:
+    class _PreparedFakeTTS(_FakeTTS):
+        def __init__(self, *, model: str) -> None:
+            super().__init__(model=model)
+            self.prepare_reasons: list[str] = []
+
+        def schedule_prepare(self, reason: str = "background") -> None:
+            self.prepare_reasons.append(reason)
+
+    primary = _PreparedFakeTTS(model="primary")
+    backup = _PreparedFakeTTS(model="backup")
+    adapter = agent.WarmupClosingTTSFallbackAdapter(
+        [primary, backup],
+        max_retry_per_tts=0,
+        sample_rate=24000,
+    )
+
+    agent.schedule_tts_prepare(adapter, reason="dialog_start")
+
+    assert primary.prepare_reasons == ["dialog_start"]
+    assert backup.prepare_reasons == ["dialog_start"]
 
 
 def test_build_tts_wraps_backup_profile_in_fallback_adapter(monkeypatch) -> None:

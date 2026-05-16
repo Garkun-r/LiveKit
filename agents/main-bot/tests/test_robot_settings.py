@@ -25,6 +25,12 @@ def _store() -> RobotSettingsStore:
                 config={"provider": "xai", "model": "asterisk-model"},
             ),
             ComponentProfile(
+                profile_key="llm_test",
+                kind="llm",
+                provider="google",
+                config={"provider": "google", "model": "test-model"},
+            ),
+            ComponentProfile(
                 profile_key="llm_project",
                 kind="llm",
                 provider="google",
@@ -48,6 +54,7 @@ def _store() -> RobotSettingsStore:
             ProfileBinding("runtime", "base", "tts", "primary", "tts_base"),
             ProfileBinding("runtime", "base", "turn", "selected", "turn_base"),
             ProfileBinding("runtime", "asterisk", "llm", "primary", "llm_asterisk"),
+            ProfileBinding("runtime", "main_bot_test", "llm", "primary", "llm_test"),
             ProfileBinding("project", "coffee", "llm", "primary", "llm_project"),
         ],
         project_profiles=[
@@ -68,6 +75,18 @@ def test_runtime_inherits_base_when_runtime_binding_missing() -> None:
 
     assert resolved.llm_primary is not None
     assert resolved.llm_primary.profile_key == "llm_asterisk"
+    assert resolved.tts_primary is not None
+    assert resolved.tts_primary.profile_key == "tts_base"
+    assert resolved.turn is not None
+    assert resolved.turn.profile_key == "turn_base"
+
+
+def test_main_bot_test_runtime_stays_separate_and_inherits_base() -> None:
+    resolved = _store().resolve(did=None, runtime_key="main_bot_test")
+
+    assert resolved.effective_runtime_key == "main_bot_test"
+    assert resolved.llm_primary is not None
+    assert resolved.llm_primary.profile_key == "llm_test"
     assert resolved.tts_primary is not None
     assert resolved.tts_primary.profile_key == "tts_base"
     assert resolved.turn is not None

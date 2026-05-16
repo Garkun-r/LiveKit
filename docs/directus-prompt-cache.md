@@ -30,7 +30,8 @@ in LiveKit Cloud just to avoid permission updates.
 Recommended readable fields:
 
 - `CallerID`: `CallerID`, `client_id`
-- `bot_configurations`: `client_id`, `system_prompt`, `examples`, `skills_name`
+- `bot_configurations`: `client_id`, `system_prompt`, `examples`, `skills_name`,
+  `llm_intro`
 - `clients`: `id`, `add_info`, `company_website`, `company_extra`, `first_step`
 - `clients_prompt`: `name`, `text`
 - `webparsing`: `url`, `text`
@@ -63,13 +64,13 @@ schema migration because adding columns changes the source data model.
 
 After applying permission changes, verify with the `Livekit` token, not an admin
 token. The visible fields should include `clients.first_step` and legacy
-`bot_configurations.first_step_text`:
+`bot_configurations.first_step_text` and `bot_configurations.llm_intro`:
 
 ```bash
 curl -sS "$DIRECTUS_URL/items/clients?limit=1&fields=id,first_step" \
   -H "Authorization: Bearer $DIRECTUS_TOKEN"
 
-curl -sS "$DIRECTUS_URL/items/bot_configurations?limit=1&fields=client_id,first_step_text" \
+curl -sS "$DIRECTUS_URL/items/bot_configurations?limit=1&fields=client_id,first_step_text,llm_intro" \
   -H "Authorization: Bearer $DIRECTUS_TOKEN"
 ```
 
@@ -124,6 +125,13 @@ Client-specific fixed greetings are read from `clients.first_step` by default.
 If the cell is empty, the robot uses its default greeting. If the Directus API
 key differs from the UI label, set `DIRECTUS_INITIAL_GREETING_FIELD` to the real
 field key.
+
+Client-specific first LLM intro phrases are read from
+`bot_configurations.llm_intro`. If this cell is empty, the robot uses the
+general `VOICE_FIRST_LLM_INTRO_PHRASE` and the bundled `first_llm_intro.mp3`.
+If it is filled, the robot synthesizes/caches that exact text per active TTS
+voice profile and reuses the cached audio until the text or voice profile
+changes.
 
 `DIRECTUS_PROMPT_CACHE_TTL_SEC` controls both the short in-process cache and
 the maximum age of a stored `client_prompt_cache` row. With the default `300`,

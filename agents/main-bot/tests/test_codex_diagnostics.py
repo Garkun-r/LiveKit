@@ -18,6 +18,9 @@ from shared.webhooks.codex_diagnostics import (  # noqa: E402
     build_codex_prompt,
     build_livekit_snapshot_commands,
     collect_diagnostic_signals,
+    collect_evidence_timeline,
+    collect_latency_chains,
+    collect_problem_signals,
     directus_audit_report_url,
     extract_final_codex_message,
     format_call_time,
@@ -387,6 +390,146 @@ def test_collect_diagnostic_signals_marks_no_dialog_root_cause_focus() -> None:
     assert "verify_initial_greeting_or_first_reply" in signals["analysis_focus"]
 
 
+def test_collect_investigation_input_explains_cancelled_first_reply() -> None:
+    call = CallContext.from_payload(
+        {
+            **_call().payload,
+            "transcript_items": [
+                {
+                    "type": "user_input_transcribed",
+                    "transcript": "Это мастерская по кофемашинам?",
+                    "is_final": True,
+                    "timestamp": "2026-05-07T12:00:10+00:00",
+                },
+                {
+                    "type": "user_input_transcribed",
+                    "transcript": "Алло",
+                    "is_final": True,
+                    "timestamp": "2026-05-07T12:00:10.700000+00:00",
+                },
+            ],
+        },
+        target="cloud",
+    )
+    raw_logs = {
+        "status": "found",
+        "rows": [
+            {
+                "id": 1,
+                "event_time": "2026-05-07T12:00:08+00:00",
+                "level": "INFO",
+                "message": "initial greeting tts fallback finished",
+            },
+            {
+                "id": 2,
+                "event_time": "2026-05-07T12:00:10+00:00",
+                "level": "INFO",
+                "message": "user input transcribed",
+                "extras": {
+                    "transcript": "Это мастерская по кофемашинам?",
+                    "is_final": True,
+                },
+            },
+            {
+                "id": 3,
+                "event_time": "2026-05-07T12:00:10.200000+00:00",
+                "level": "INFO",
+                "message": "speech created",
+                "extras": {"source": "generate_reply", "speech_id": "s1"},
+            },
+            {
+                "id": 4,
+                "event_time": "2026-05-07T12:00:10.568000+00:00",
+                "level": "INFO",
+                "message": "llm metrics",
+                "extras": {"duration_ms": 568, "ttft_ms": 210},
+            },
+            {
+                "id": 5,
+                "event_time": "2026-05-07T12:00:10.700000+00:00",
+                "level": "INFO",
+                "message": "user input transcribed",
+                "extras": {"transcript": "Алло", "is_final": True},
+            },
+            {
+                "id": 6,
+                "event_time": "2026-05-07T12:00:10.710000+00:00",
+                "level": "INFO",
+                "message": (
+                    "assistant speech canceled before first audio because user "
+                    "started speaking"
+                ),
+                "extras": {"phase": "first_frame_ready", "speech_id": "s1"},
+            },
+            {
+                "id": 7,
+                "event_time": "2026-05-07T12:00:11+00:00",
+                "level": "INFO",
+                "message": "speech created",
+                "extras": {"source": "generate_reply", "speech_id": "s2"},
+            },
+            {
+                "id": 8,
+                "event_time": "2026-05-07T12:00:11.400000+00:00",
+                "level": "INFO",
+                "message": "eleven_v3 first audio chunk",
+                "extras": {"ttfb_ms": 250, "model": "eleven_turbo_v2_5"},
+            },
+            {
+                "id": 9,
+                "event_time": "2026-05-07T12:00:11.950000+00:00",
+                "level": "INFO",
+                "message": "agent state changed",
+                "extras": {"old_state": "thinking", "new_state": "speaking"},
+            },
+        ],
+    }
+    diagnostic_signals = collect_diagnostic_signals(
+        call=call,
+        incidents=[],
+        call_session={},
+        raw_logs=raw_logs,
+        livekit_snapshot={},
+    )
+
+    problem_signals = collect_problem_signals(
+        call=call,
+        incidents=[],
+        call_session={},
+        raw_logs=raw_logs,
+        livekit_snapshot={},
+        diagnostic_signals=diagnostic_signals,
+    )
+    timeline = collect_evidence_timeline(
+        call=call,
+        incidents=[],
+        call_session={},
+        raw_logs=raw_logs,
+        livekit_snapshot={},
+    )
+    chains = collect_latency_chains(
+        call=call,
+        incidents=[],
+        call_session={},
+        raw_logs=raw_logs,
+    )
+
+    assert any(item["type"] == "client_connection_check" for item in problem_signals)
+    assert any(item["event"] == "user_said_allo" for item in chains[0]["events"])
+    assert any(item["event"] == "assistant_interrupted" for item in chains[0]["events"])
+    assert any(item["event"] == "new_playback_started" for item in chains[0]["events"])
+    assert chains[0]["metrics"]["llm_ms"] == 568
+    assert chains[0]["metrics"]["tts_ms"] == 250
+    assert chains[0]["metrics"]["time_to_first_audio_ms"] == 1950
+    assert chains[0]["metrics"]["time_from_allo_to_new_playback_ms"] == 1250
+    assert chains[0]["metrics"]["canceled_before_first_audio"] is True
+    assert chains[0]["metrics"]["cancel_reason"] == "client_spoke_before_playback"
+    assert chains[0]["metrics"]["slow_response_incident_missing_reason"] == (
+        "measured from last «Алло», not from first useful question"
+    )
+    assert any(item["event"] == "user input transcribed" for item in timeline)
+
+
 def test_telegram_policy_can_skip_n8n_handoff() -> None:
     silent = DiagnosticRule(
         id=1,
@@ -404,9 +547,10 @@ def test_telegram_policy_can_skip_n8n_handoff() -> None:
     )
 
     assert telegram_skip_status(silent, {"verdict": "critical"}) == "skipped:silent"
-    assert telegram_skip_status(
-        critical_only, {"verdict": "needs_attention"}
-    ) == "skipped:critical_only"
+    assert (
+        telegram_skip_status(critical_only, {"verdict": "needs_attention"})
+        == "skipped:critical_only"
+    )
     assert telegram_skip_status(critical_only, {"verdict": "critical"}) is None
 
 
@@ -455,6 +599,13 @@ def test_prompt_forbids_auto_fix_and_mutating_livekit_commands() -> None:
     assert "prompt_context.rendered_prompt" in prompt
     assert "raw_logs" in prompt
     assert "root-cause audit" in lowered
+    assert "two-stage investigation" in lowered
+    assert "symptom-only findings" in lowered
+    assert "root_cause_analysis" in prompt
+    assert "latency_chains" in prompt
+    assert "problem_signals" in prompt
+    assert "evidence_timeline" in prompt
+    assert "canceled_before_first_audio=true" in prompt
     assert "do not confuse tts warmup" in lowered
     assert "no-dialog call longer than five seconds" in lowered
 
@@ -467,6 +618,20 @@ def test_parse_codex_report_accepts_json_fence() -> None:
     )
 
     assert report["verdict"] == "watch"
+
+
+def test_report_schema_requires_root_cause_analysis_for_findings() -> None:
+    schema_path = PROJECT_ROOT / "shared/webhooks/codex_diagnostics_report.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    finding = schema["properties"]["findings"]["items"]
+    root = finding["properties"]["root_cause_analysis"]
+
+    assert "root_cause_analysis" in finding["required"]
+    assert "checked_hypotheses" in root["required"]
+    assert "evidence_timeline" in root["required"]
+    assert root["properties"]["checked_hypotheses"]["minItems"] == 1
+    assert root["properties"]["what_this_was_not"]["minItems"] == 1
+    assert root["properties"]["changes_to_make"]["minItems"] == 1
 
 
 def test_report_markdown_fallback_is_readable_russian() -> None:
@@ -549,9 +714,7 @@ def test_local_livekit_snapshot_uses_existing_livekit_env(monkeypatch) -> None:
 
 
 def test_local_livekit_snapshot_can_run_through_asterisk_ssh(monkeypatch) -> None:
-    monkeypatch.setenv(
-        "CODEX_DIAGNOSTICS_LK_LOCAL_SSH_TARGET", "root@87.226.145.66"
-    )
+    monkeypatch.setenv("CODEX_DIAGNOSTICS_LK_LOCAL_SSH_TARGET", "root@87.226.145.66")
     monkeypatch.setenv("CODEX_DIAGNOSTICS_LK_LOCAL_SSH_PORT", "39001")
     monkeypatch.setenv("CODEX_DIAGNOSTICS_LK_LOCAL_SSH_KEY", "/root/.ssh/id_rsa_n8n")
 
@@ -595,16 +758,20 @@ def test_cloud_livekit_snapshot_prefers_explicit_cloud_credentials(monkeypatch) 
 
 
 def test_directus_audit_report_url_points_to_item_page(monkeypatch) -> None:
-    assert directus_audit_report_url(
-        directus_url="https://jcall.io/directus", audit_id=7
-    ) == "https://jcall.io/directus/admin/content/robot_call_audits/7"
+    assert (
+        directus_audit_report_url(directus_url="https://jcall.io/directus", audit_id=7)
+        == "https://jcall.io/directus/admin/content/robot_call_audits/7"
+    )
 
     monkeypatch.setenv(
         "CODEX_DIAGNOSTICS_DIRECTUS_APP_URL", "https://jcall.io/directus/admin"
     )
-    assert directus_audit_report_url(
-        directus_url="https://api.example/directus", audit_id=8
-    ) == "https://jcall.io/directus/admin/content/robot_call_audits/8"
+    assert (
+        directus_audit_report_url(
+            directus_url="https://api.example/directus", audit_id=8
+        )
+        == "https://jcall.io/directus/admin/content/robot_call_audits/8"
+    )
 
 
 def test_call_time_and_aftercall_execution_url_are_readable(monkeypatch) -> None:
@@ -619,16 +786,22 @@ def test_call_time_and_aftercall_execution_url_are_readable(monkeypatch) -> None
         "конец 2026-05-07 07:08:28 (Europe/Kaliningrad), "
         "длительность 25.3 сек"
     )
-    assert aftercall_execution_url_from_payload(
-        {"codex_diagnostics_aftercall_execution_id": "37107"}
-    ) == "https://n8n.jcall.io/workflow/yj1KNjeuDOcJZNSS/executions/37107"
-    assert aftercall_execution_url_from_payload(
-        {
-            "codex_diagnostics": {
-                "aftercall_execution_url": "https://n8n.example/execution/1"
+    assert (
+        aftercall_execution_url_from_payload(
+            {"codex_diagnostics_aftercall_execution_id": "37107"}
+        )
+        == "https://n8n.jcall.io/workflow/yj1KNjeuDOcJZNSS/executions/37107"
+    )
+    assert (
+        aftercall_execution_url_from_payload(
+            {
+                "codex_diagnostics": {
+                    "aftercall_execution_url": "https://n8n.example/execution/1"
+                }
             }
-        }
-    ) == "https://n8n.example/execution/1"
+        )
+        == "https://n8n.example/execution/1"
+    )
 
 
 def test_render_diagnostic_prompt_template_uses_call_time() -> None:
@@ -733,8 +906,14 @@ def test_telegram_payload_uses_russian_brief_and_report_link() -> None:
         "Клиент: +7 (999) 000-11-22 | DID/xDID: 312388 | локальный"
         in payload["telegram_brief"]
     )
-    assert "Прогон aftercall: https://n8n.jcall.io/workflow/yj1KNjeuDOcJZNSS/executions/123" in payload["telegram_brief"]
-    assert "Полный отчет: https://jcall.io/directus/admin/content/robot_call_audits/7" in payload["telegram_brief"]
+    assert (
+        "Прогон aftercall: https://n8n.jcall.io/workflow/yj1KNjeuDOcJZNSS/executions/123"
+        in payload["telegram_brief"]
+    )
+    assert (
+        "Полный отчет: https://jcall.io/directus/admin/content/robot_call_audits/7"
+        in payload["telegram_brief"]
+    )
     assert "Итог:" in payload["telegram_brief"]
     assert "Главное:" in payload["telegram_brief"]
     assert "1. Медленный ответ" in payload["telegram_brief"]
@@ -744,7 +923,9 @@ def test_telegram_payload_uses_russian_brief_and_report_link() -> None:
         in payload["telegram_brief"]
     )
     assert "   Почему верю: e2e 9000ms e2e latency 9000ms." in payload["telegram_brief"]
-    assert "   Что сделать: Проверить slow_response threshold" in payload["telegram_brief"]
+    assert (
+        "   Что сделать: Проверить slow_response threshold" in payload["telegram_brief"]
+    )
     assert "   Источник:" not in payload["telegram_brief"]
     assert "e2e 9000ms" in payload["text"]
 
@@ -773,7 +954,10 @@ def test_full_report_text_includes_metadata_report_and_directus_link() -> None:
     assert "Полный диагностический отчет" in text
     assert "Вердикт: требует внимания" in text
     assert "Время звонка: начало 2026-05-07 14:00:00" in text
-    assert "Прогон aftercall: https://n8n.jcall.io/workflow/yj1KNjeuDOcJZNSS/executions/321" in text
+    assert (
+        "Прогон aftercall: https://n8n.jcall.io/workflow/yj1KNjeuDOcJZNSS/executions/321"
+        in text
+    )
     assert "Инциденты: 1, 2" in text
     assert "https://jcall.io/directus/admin/content/robot_call_audits/7" in text
     assert "Длинных пауз нет." in text

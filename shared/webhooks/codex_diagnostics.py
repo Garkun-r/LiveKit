@@ -6,6 +6,8 @@ call payloads and existing robot_incidents rows, runs Codex in read-only mode,
 stores the audit in Directus, and asks n8n to send the Telegram brief.
 """
 
+# ruff: noqa: RUF001
+
 from __future__ import annotations
 
 import argparse
@@ -92,12 +94,19 @@ WEEKDAY_NAMES_RU = (
 )
 RAW_LOG_KEY_PATTERNS = (
     "agent session error",
+    "agent state changed",
     "closing agent session",
+    "cancel",
+    "cancelled",
     "disconnect",
     "exception",
     "error",
     "failed",
+    "first audio",
+    "first audio chunk",
+    "interrupted",
     "initial greeting",
+    "llm metrics",
     "local vad",
     "play",
     "playback",
@@ -109,6 +118,22 @@ RAW_LOG_KEY_PATTERNS = (
     "tts",
     "user state changed",
     "voice prompt",
+)
+INVESTIGATION_STEPS = (
+    "sip_room_join",
+    "prompt_context",
+    "robot_settings",
+    "initial_greeting",
+    "stt_vad",
+    "llm",
+    "tts",
+    "playout",
+    "interruption",
+    "tag_parser",
+    "close_reason",
+    "aftercall_export",
+    "directus",
+    "livekit_snapshot",
 )
 
 
@@ -197,8 +222,7 @@ def truncate_prompt_context(text: Any, *, max_chars: int | None = None) -> str:
         return value
     omitted = len(value) - limit
     return (
-        value[:limit]
-        + f"\n\n[Обрезано для диагностики: еще {omitted} символов. "
+        value[:limit] + f"\n\n[Обрезано для диагностики: еще {omitted} символов. "
         "Увеличьте CODEX_DIAGNOSTICS_PROMPT_CONTEXT_MAX_CHARS, если нужен полный prompt.]"
     )
 
@@ -226,7 +250,7 @@ def build_diagnostic_datetime_block(
     return (
         "<current_datetime>\n"
         "Сейчас локальная дата и время компании:\n"
-        f"- Дата: {now.day} {MONTH_NAMES_RU[now.month - 1]} {now.year} г.\n"  # noqa: RUF001
+        f"- Дата: {now.day} {MONTH_NAMES_RU[now.month - 1]} {now.year} г.\n"
         f"- День недели: {WEEKDAY_NAMES_RU[now.weekday()]}\n"
         f"- Время: {now.hour:02d}:00\n"
         f"- Часовой пояс: {timezone_label}\n\n"
@@ -504,10 +528,7 @@ def raw_log_time_filters(call: CallContext) -> dict[str, str]:
 def telegram_skip_status(rule: DiagnosticRule, report: dict[str, Any]) -> str | None:
     if rule.telegram_policy == "silent":
         return "skipped:silent"
-    if (
-        rule.telegram_policy == "critical_only"
-        and report.get("verdict") != "critical"
-    ):
+    if rule.telegram_policy == "critical_only" and report.get("verdict") != "critical":
         return "skipped:critical_only"
     return None
 
@@ -610,7 +631,9 @@ def _duration_sec(call: CallContext, call_session: dict[str, Any]) -> float | No
 
 
 def _close_reason(call: CallContext, call_session: dict[str, Any]) -> str | None:
-    close = call.payload.get("close") if isinstance(call.payload.get("close"), dict) else {}
+    close = (
+        call.payload.get("close") if isinstance(call.payload.get("close"), dict) else {}
+    )
     for value in (
         close.get("reason"),
         _call_session_row(call_session).get("close_reason"),
@@ -624,7 +647,9 @@ def _close_reason(call: CallContext, call_session: dict[str, Any]) -> str | None
 
 def _raw_log_rows(raw_logs: dict[str, Any]) -> list[dict[str, Any]]:
     rows = raw_logs.get("rows")
-    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    return (
+        [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+    )
 
 
 def _log_text(row: dict[str, Any]) -> str:
@@ -636,7 +661,9 @@ def _log_text(row: dict[str, Any]) -> str:
     return " ".join(str(part) for part in parts if part).lower()
 
 
-def _raw_log_key_events(rows: list[dict[str, Any]], *, limit: int = 80) -> list[dict[str, Any]]:
+def _raw_log_key_events(
+    rows: list[dict[str, Any]], *, limit: int = 80
+) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for row in rows:
         text = _log_text(row)
@@ -662,6 +689,847 @@ def _raw_log_key_events(rows: list[dict[str, Any]], *, limit: int = 80) -> list[
         if len(events) >= limit:
             break
     return events
+
+
+def _event_detail_from_extras(row: dict[str, Any]) -> str:
+    extras = row.get("extras") if isinstance(row.get("extras"), dict) else {}
+    keys = (
+        "transcript",
+        "text",
+        "new_state",
+        "old_state",
+        "reason",
+        "kind",
+        "source",
+        "provider",
+        "model",
+        "speech_id",
+        "tag",
+        "status",
+        "latency_ms",
+        "ttfb_ms",
+        "ttft_ms",
+        "duration_ms",
+        "elapsed_ms",
+    )
+    parts = []
+    for key in keys:
+        value = extras.get(key)
+        if value is not None and value != "":
+            parts.append(f"{key}={truncate_runtime_text(value, max_chars=180)}")
+    return "; ".join(parts)
+
+
+def classify_evidence_step(text: str) -> str:
+    lower = text.lower()
+    if "n8n" in lower or "export" in lower or "aftercall" in lower:
+        return "aftercall_export"
+    if "directus" in lower or "prompt_context" in lower:
+        return "directus"
+    if "prompt" in lower:
+        return "prompt_context"
+    if "robot settings" in lower:
+        return "robot_settings"
+    if "initial greeting" in lower or "prerecorded" in lower:
+        return "initial_greeting"
+    if "user input transcribed" in lower or "stt" in lower:
+        return "stt_vad"
+    if "vad" in lower or "user state changed" in lower:
+        return "stt_vad"
+    if "llm" in lower or "model router" in lower:
+        return "llm"
+    if "tts" in lower or "first audio chunk" in lower:
+        return "tts"
+    if "playback" in lower or "playout" in lower or "speaking" in lower:
+        return "playout"
+    if "interrupt" in lower or "cancel" in lower:
+        return "interruption"
+    if "tag" in lower or "status_" in lower:
+        return "tag_parser"
+    if "disconnect" in lower or "close" in lower or "delete_room" in lower:
+        return "close_reason"
+    if "room" in lower or "sip" in lower:
+        return "sip_room_join"
+    return "runtime"
+
+
+def _timeline_event(
+    *,
+    source: str,
+    timestamp: Any,
+    event: str,
+    detail: Any = "",
+    step: str | None = None,
+    evidence_id: Any = None,
+    severity: Any = None,
+) -> dict[str, Any]:
+    detail_text = truncate_runtime_text(detail, max_chars=500)
+    text_for_step = " ".join(str(item) for item in (event, detail_text) if item)
+    item = {
+        "time": timestamp,
+        "source": source,
+        "step": step or classify_evidence_step(text_for_step),
+        "event": truncate_runtime_text(event, max_chars=180),
+        "detail": detail_text,
+        "evidence_id": evidence_id,
+        "severity": severity,
+    }
+    return {
+        key: value for key, value in item.items() if value is not None and value != ""
+    }
+
+
+def collect_evidence_timeline(
+    *,
+    call: CallContext,
+    incidents: list[dict[str, Any]],
+    call_session: dict[str, Any],
+    raw_logs: dict[str, Any],
+    livekit_snapshot: dict[str, Any],
+    limit: int = 140,
+) -> list[dict[str, Any]]:
+    timeline: list[dict[str, Any]] = []
+    for row in _raw_log_key_events(_raw_log_rows(raw_logs), limit=limit):
+        detail = _event_detail_from_extras(row)
+        if not detail:
+            detail = row.get("raw_text")
+        timeline.append(
+            _timeline_event(
+                source="raw_logs",
+                timestamp=row.get("event_time"),
+                event=str(row.get("message") or row.get("logger_name") or "log event"),
+                detail=detail,
+                evidence_id=row.get("id"),
+                severity=row.get("level"),
+            )
+        )
+
+    for item in _list_from_sources("transcript_items", call, call_session):
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text") or item.get("transcript") or item.get("content")
+        if not text:
+            continue
+        role = item.get("role") or item.get("speaker") or item.get("type") or "unknown"
+        timeline.append(
+            _timeline_event(
+                source="transcript_items",
+                timestamp=item.get("created_at") or item.get("timestamp"),
+                event=f"{role}: {truncate_runtime_text(text, max_chars=220)}",
+                detail={
+                    key: item.get(key)
+                    for key in ("type", "is_final", "interrupted")
+                    if item.get(key) is not None
+                },
+                step="stt_vad" if "user" in str(role).lower() else "playout",
+            )
+        )
+
+    for item in _list_from_sources("tag_events", call, call_session):
+        if not isinstance(item, dict):
+            continue
+        timeline.append(
+            _timeline_event(
+                source="tag_events",
+                timestamp=item.get("created_at") or item.get("timestamp"),
+                event=str(
+                    item.get("tag")
+                    or item.get("status")
+                    or item.get("action")
+                    or "tag event"
+                ),
+                detail=json.dumps(redact(item), ensure_ascii=False),
+                step="tag_parser",
+                evidence_id=item.get("id"),
+            )
+        )
+
+    for incident in incidents:
+        timeline.append(
+            _timeline_event(
+                source="robot_incidents",
+                timestamp=incident.get("created_at"),
+                event=str(incident.get("incident_type") or "incident"),
+                detail=incident.get("description") or incident.get("payload"),
+                step=classify_evidence_step(
+                    " ".join(
+                        str(incident.get(key) or "")
+                        for key in ("incident_type", "component", "description")
+                    )
+                ),
+                evidence_id=incident.get("id"),
+                severity=incident.get("severity"),
+            )
+        )
+
+    if call.room_name and call.room_name in _snapshot_text(livekit_snapshot):
+        timeline.append(
+            _timeline_event(
+                source="livekit_snapshot",
+                timestamp=livekit_snapshot.get("collected_at"),
+                event="room visible in post-call LiveKit snapshot",
+                detail=call.room_name,
+                step="livekit_snapshot",
+            )
+        )
+
+    def sort_key(item: dict[str, Any]) -> str:
+        return str(item.get("time") or "")
+
+    return redact(sorted(timeline, key=sort_key)[:limit])
+
+
+def _has_text(rows: list[dict[str, Any]], *needles: str) -> bool:
+    return any(any(needle in _log_text(row) for needle in needles) for row in rows)
+
+
+def _transcript_texts(call: CallContext, call_session: dict[str, Any]) -> list[str]:
+    texts = []
+    for item in _list_from_sources("transcript_items", call, call_session):
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text") or item.get("transcript") or item.get("content")
+        if text:
+            texts.append(str(text))
+    return texts
+
+
+def _problem_signal(
+    *,
+    signal_type: str,
+    severity: str,
+    symptom: str,
+    expected: str,
+    evidence: str,
+    chain_steps: list[str],
+    hypotheses: list[str],
+) -> dict[str, Any]:
+    return {
+        "type": signal_type,
+        "severity": severity,
+        "symptom": symptom,
+        "expected": expected,
+        "primary_evidence": evidence,
+        "chain_steps_to_check": chain_steps,
+        "hypotheses_to_test": hypotheses,
+    }
+
+
+def collect_problem_signals(
+    *,
+    call: CallContext,
+    incidents: list[dict[str, Any]],
+    call_session: dict[str, Any],
+    raw_logs: dict[str, Any],
+    livekit_snapshot: dict[str, Any],
+    diagnostic_signals: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rows = _raw_log_rows(raw_logs)
+    raw_text = "\n".join(_log_text(row) for row in rows)
+    transcript_text = "\n".join(_transcript_texts(call, call_session)).lower()
+    signals: list[dict[str, Any]] = []
+
+    if diagnostic_signals.get("short_call_no_dialog"):
+        signals.append(
+            _problem_signal(
+                signal_type="no_dialog_or_silence",
+                severity="error",
+                symptom="Звонок заметной длины завершился без расшифровки и без тега.",
+                expected="Робот должен поприветствовать, услышать клиента или штатно закрыть тишину.",
+                evidence="Нет transcript_items и tag_events; звонок длился больше 5 секунд.",
+                chain_steps=[
+                    "sip_room_join",
+                    "initial_greeting",
+                    "stt_vad",
+                    "tts",
+                    "playout",
+                    "close_reason",
+                ],
+                hypotheses=[
+                    "приветствие не проигралось",
+                    "клиент молчал или аудио не дошло до STT",
+                    "сессия закрылась до таймера тишины",
+                ],
+            )
+        )
+
+    if "алло" in transcript_text or "алло" in raw_text:
+        signals.append(
+            _problem_signal(
+                signal_type="client_connection_check",
+                severity="warning",
+                symptom="Клиент проверял связь словом «Алло».",
+                expected="После приветствия робот должен быстро дать понятный первый ответ.",
+                evidence="В transcript/raw_logs есть «Алло».",
+                chain_steps=[
+                    "initial_greeting",
+                    "stt_vad",
+                    "llm",
+                    "tts",
+                    "playout",
+                    "interruption",
+                ],
+                hypotheses=[
+                    "первый ответ был отменен до первого аудио",
+                    "LLM или TTS задержали первый ответ",
+                    "клиент говорил поверх робота и сработала защита от перебивания",
+                ],
+            )
+        )
+
+    if _has_text(rows, "interrupted", "cancelled", "cancel"):
+        signals.append(
+            _problem_signal(
+                signal_type="reply_cancel_or_interrupt",
+                severity="warning",
+                symptom="В runtime были отмены или interruption вокруг ответа робота.",
+                expected="Отмены должны быть объяснены: клиент перебил, close_event, timeout или ошибка.",
+                evidence="raw_logs содержат cancel/interrupted/cancelled события.",
+                chain_steps=["llm", "tts", "playout", "interruption", "stt_vad"],
+                hypotheses=[
+                    "ответ отменен до первого аудио из-за новой речи клиента",
+                    "TTS-соединение закрыто после отмены, а не из-за сбоя провайдера",
+                    "измерение slow_response сбросилось на последнюю короткую реплику",
+                ],
+            )
+        )
+
+    if (
+        diagnostic_signals.get("no_tag_events")
+        and diagnostic_signals.get("transcript_count", 0) > 0
+    ):
+        signals.append(
+            _problem_signal(
+                signal_type="missing_or_unfinished_final_status",
+                severity="warning",
+                symptom="В звонке была речь, но не было tag_events.",
+                expected="Если смысл звонка ясен, робот должен поставить корректный статус или объяснимо закрыть разговор.",
+                evidence="transcript_count > 0, tag_event_count = 0.",
+                chain_steps=[
+                    "prompt_context",
+                    "tag_parser",
+                    "close_reason",
+                    "aftercall_export",
+                ],
+                hypotheses=[
+                    "финальная реплика была вопросом и тег был запрещен",
+                    "клиент отключился до статуса",
+                    "parser не распознал тег или prompt не довел разговор до статуса",
+                ],
+            )
+        )
+
+    if any(str(item.get("incident_type")) == "n8n_export_failed" for item in incidents):
+        signals.append(
+            _problem_signal(
+                signal_type="aftercall_export_failed",
+                severity="error",
+                symptom="Aftercall export в n8n упал или превысил timeout.",
+                expected="После звонка n8n должен получить payload и запустить все aftercall шаги, включая Codex diagnostics.",
+                evidence="robot_incidents содержит n8n_export_failed.",
+                chain_steps=["aftercall_export", "directus"],
+                hypotheses=[
+                    "n8n webhook не ответил до timeout",
+                    "n8n execution не стартовал или завис на первом шаге",
+                    "payload дошел до Directus, но не дошел до diagnostics webhook",
+                ],
+            )
+        )
+
+    if _has_text(
+        rows, "failed to resolve prompt", "using file prompt", "prompt lookup"
+    ):
+        signals.append(
+            _problem_signal(
+                signal_type="prompt_context_fallback",
+                severity="warning",
+                symptom="Во время звонка prompt мог быть взят из fallback, а не из актуального Directus cache.",
+                expected="Production prompt_context должен быть доступен и совпадать с клиентской базой знаний.",
+                evidence="raw_logs содержат failed to resolve prompt / using file prompt.",
+                chain_steps=["directus", "prompt_context", "robot_settings"],
+                hypotheses=[
+                    "Directus/cache lookup был недоступен",
+                    "робот работал на file prompt или snapshot",
+                    "вывод о знаниях надо сверять с фактическим prompt source",
+                ],
+            )
+        )
+
+    if _has_text(rows, "failed to load robot settings", "snapshot:"):
+        signals.append(
+            _problem_signal(
+                signal_type="robot_settings_fallback",
+                severity="warning",
+                symptom="Настройки робота могли быть взяты из snapshot.",
+                expected="Настройки клиента должны загружаться из Directus или явно понятного актуального источника.",
+                evidence="raw_logs содержат failed to load robot settings / snapshot.",
+                chain_steps=["directus", "robot_settings", "prompt_context"],
+                hypotheses=[
+                    "Directus settings lookup был недоступен",
+                    "профили STT/TTS/LLM могли быть не самыми актуальными",
+                ],
+            )
+        )
+
+    if diagnostic_signals.get("room_seen_in_livekit_snapshot"):
+        signals.append(
+            _problem_signal(
+                signal_type="post_close_room_state",
+                severity="info",
+                symptom="Комната была видна в LiveKit snapshot после завершения payload.",
+                expected="После закрытия звонка комната и egress должны исчезнуть после короткой задержки.",
+                evidence="room_name найден в post-call LiveKit snapshot.",
+                chain_steps=["close_reason", "livekit_snapshot", "aftercall_export"],
+                hypotheses=[
+                    "это нормальная задержка очистки LiveKit",
+                    "комната или запись остались активны дольше ожидаемого",
+                ],
+            )
+        )
+
+    if not diagnostic_signals.get("raw_logs_available"):
+        signals.append(
+            _problem_signal(
+                signal_type="missing_raw_logs",
+                severity="warning",
+                symptom="Для звонка нет raw_logs.",
+                expected="Диагностика должна иметь runtime logs по настоящему LiveKit room_name.",
+                evidence="raw_log_count = 0.",
+                chain_steps=["sip_room_join", "directus", "aftercall_export"],
+                hypotheses=[
+                    "передан не LiveKit room_name, а lead/admin id",
+                    "raw log capture не стартовал",
+                    "raw logs не связались с call_session",
+                ],
+            )
+        )
+
+    if diagnostic_signals.get("raw_log_warning_error_count", 0) > 0:
+        signals.append(
+            _problem_signal(
+                signal_type="runtime_warnings",
+                severity="info",
+                symptom="В runtime были warning/error записи.",
+                expected="Каждый warning надо классифицировать: повлиял на разговор или был служебным.",
+                evidence=f"raw_log_warning_error_count={diagnostic_signals.get('raw_log_warning_error_count')}",
+                chain_steps=[
+                    "directus",
+                    "prompt_context",
+                    "llm",
+                    "tts",
+                    "aftercall_export",
+                ],
+                hypotheses=[
+                    "warning является причиной проблемы",
+                    "warning является следствием отмены или штатного закрытия",
+                    "warning служебный и не повлиял на звонок",
+                ],
+            )
+        )
+
+    unique: dict[str, dict[str, Any]] = {}
+    for signal in signals:
+        unique.setdefault(str(signal["type"]), signal)
+    return redact(list(unique.values())[:12])
+
+
+def _row_extras(row: dict[str, Any]) -> dict[str, Any]:
+    return row.get("extras") if isinstance(row.get("extras"), dict) else {}
+
+
+def _row_time(row: dict[str, Any]) -> datetime | None:
+    parsed = parse_datetime(row.get("event_time"))
+    if parsed is not None:
+        return parsed
+    extras = _row_extras(row)
+    for key in ("created_at", "started_at", "ended_at"):
+        value = extras.get(key)
+        parsed = parse_datetime(value)
+        if parsed is not None:
+            return parsed
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.fromtimestamp(float(value), timezone.utc)
+            except (OSError, ValueError):
+                pass
+    return None
+
+
+def _elapsed_ms(
+    start: dict[str, Any] | None, end: dict[str, Any] | None
+) -> float | None:
+    if start is None or end is None:
+        return None
+    start_time = _row_time(start)
+    end_time = _row_time(end)
+    if start_time is None or end_time is None:
+        return None
+    return round((end_time - start_time).total_seconds() * 1000, 1)
+
+
+def _bool_extra(row: dict[str, Any], key: str) -> bool:
+    value = _row_extras(row).get(key)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def _number_extra_ms(row: dict[str, Any] | None, *keys: str) -> float | None:
+    if row is None:
+        return None
+    extras = _row_extras(row)
+    for key in keys:
+        value = extras.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if key.endswith("_ms"):
+            return round(number, 1)
+        return round(number * 1000, 1)
+    return None
+
+
+def _row_detail(row: dict[str, Any] | None) -> str | None:
+    if row is None:
+        return None
+    detail = _event_detail_from_extras(row)
+    if detail:
+        return detail
+    return truncate_runtime_text(
+        row.get("message") or row.get("raw_text"), max_chars=260
+    )
+
+
+def _latency_chain_event(
+    name: str, row: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    item = {
+        "event": name,
+        "time": row.get("event_time"),
+        "message": truncate_runtime_text(row.get("message"), max_chars=180),
+        "detail": _row_detail(row),
+        "evidence_id": row.get("id"),
+        "step": classify_evidence_step(
+            " ".join(
+                str(item) for item in (row.get("message"), _row_detail(row)) if item
+            )
+        ),
+    }
+    return {
+        key: value for key, value in item.items() if value is not None and value != ""
+    }
+
+
+def _first_matching_row(
+    rows: list[dict[str, Any]],
+    predicate: Any,
+    *,
+    start: int,
+    end: int | None = None,
+) -> tuple[int, dict[str, Any]] | tuple[None, None]:
+    stop = len(rows) if end is None else min(end, len(rows))
+    for index in range(max(0, start), stop):
+        row = rows[index]
+        if predicate(row):
+            return index, row
+    return None, None
+
+
+def _last_matching_row(
+    rows: list[dict[str, Any]],
+    predicate: Any,
+    *,
+    end: int,
+) -> tuple[int, dict[str, Any]] | tuple[None, None]:
+    for index in range(min(end, len(rows)) - 1, -1, -1):
+        row = rows[index]
+        if predicate(row):
+            return index, row
+    return None, None
+
+
+def _is_user_final_transcript_row(row: dict[str, Any]) -> bool:
+    text = _log_text(row)
+    if "user input transcribed" in text:
+        return _bool_extra(row, "is_final")
+    return "local vad end of speech" in text and bool(
+        _row_extras(row).get("transcript")
+    )
+
+
+def _transcript_from_row(row: dict[str, Any]) -> str:
+    extras = _row_extras(row)
+    return str(extras.get("transcript") or extras.get("text") or "").strip()
+
+
+def _is_allo_text(value: Any) -> bool:
+    return "алло" in str(value or "").strip().lower()
+
+
+def _is_assistant_response_created_row(row: dict[str, Any]) -> bool:
+    text = _log_text(row)
+    if "speech created" not in text:
+        return False
+    source = str(_row_extras(row).get("source") or "").lower()
+    return not source or source == "generate_reply"
+
+
+def _is_agent_thinking_row(row: dict[str, Any]) -> bool:
+    return (
+        "agent state changed" in _log_text(row)
+        and str(_row_extras(row).get("new_state") or "").lower() == "thinking"
+    )
+
+
+def _is_llm_metrics_row(row: dict[str, Any]) -> bool:
+    return "llm metrics" in _log_text(row)
+
+
+def _is_tts_first_audio_row(row: dict[str, Any]) -> bool:
+    text = _log_text(row)
+    if "cancel" in text or "interrupt" in text:
+        return False
+    return "first audio chunk" in text or "tts metrics" in text
+
+
+def _is_playback_started_row(row: dict[str, Any]) -> bool:
+    text = _log_text(row)
+    if "agent playback started latency" in text:
+        return True
+    return (
+        "agent state changed" in text
+        and str(_row_extras(row).get("new_state") or "").lower() == "speaking"
+    )
+
+
+def _is_cancel_or_interrupt_row(row: dict[str, Any]) -> bool:
+    text = _log_text(row)
+    if "speech completed" in text and _bool_extra(row, "interrupted"):
+        return True
+    return any(
+        marker in text
+        for marker in (
+            "canceled before first audio",
+            "cancelled before first audio",
+            "canceled before playback",
+            "cancelled before playback",
+            "interrupted",
+        )
+    )
+
+
+def _is_initial_greeting_finished_row(row: dict[str, Any]) -> bool:
+    text = _log_text(row)
+    return "initial greeting" in text and (
+        "finished" in text or "completed" in text or "playback completed" in text
+    )
+
+
+def _slow_response_incident_count(incidents: list[dict[str, Any]]) -> int:
+    return sum(1 for item in incidents if item.get("incident_type") == "slow_response")
+
+
+def collect_latency_chains(
+    *,
+    call: CallContext,
+    incidents: list[dict[str, Any]],
+    call_session: dict[str, Any],
+    raw_logs: dict[str, Any],
+    limit: int = 6,
+) -> list[dict[str, Any]]:
+    """Build compact response lifecycle chains for root-cause diagnostics."""
+
+    del call, call_session  # reserved for future session-level metric extraction
+    rows = _raw_log_rows(raw_logs)
+    if not rows:
+        return []
+
+    final_indices = [
+        index for index, row in enumerate(rows) if _is_user_final_transcript_row(row)
+    ]
+    chains: list[dict[str, Any]] = []
+    slow_response_count = _slow_response_incident_count(incidents)
+
+    for chain_index, user_index in enumerate(final_indices[:limit], start=1):
+        user_row = rows[user_index]
+        next_user_index = next(
+            (index for index in final_indices if index > user_index),
+            len(rows),
+        )
+        lookahead_end = next(
+            (index for index in final_indices if index > next_user_index),
+            min(len(rows), user_index + 160),
+        )
+        if lookahead_end <= user_index:
+            lookahead_end = min(len(rows), user_index + 160)
+
+        greeting_index, greeting_row = _last_matching_row(
+            rows,
+            _is_initial_greeting_finished_row,
+            end=user_index,
+        )
+        response_index, response_row = _first_matching_row(
+            rows,
+            lambda row: (
+                _is_assistant_response_created_row(row) or _is_agent_thinking_row(row)
+            ),
+            start=user_index + 1,
+            end=lookahead_end,
+        )
+        llm_index, llm_row = _first_matching_row(
+            rows,
+            _is_llm_metrics_row,
+            start=(
+                response_index + 1 if response_index is not None else user_index + 1
+            ),
+            end=lookahead_end,
+        )
+        _tts_index, tts_row = _first_matching_row(
+            rows,
+            _is_tts_first_audio_row,
+            start=(llm_index + 1 if llm_index is not None else user_index + 1),
+            end=lookahead_end,
+        )
+        playback_index, playback_row = _first_matching_row(
+            rows,
+            _is_playback_started_row,
+            start=user_index + 1,
+            end=lookahead_end,
+        )
+        cancel_index, cancel_row = _first_matching_row(
+            rows,
+            _is_cancel_or_interrupt_row,
+            start=user_index + 1,
+            end=playback_index if playback_index is not None else lookahead_end,
+        )
+
+        user_text = _transcript_from_row(user_row)
+        allo_index: int | None = None
+        allo_row: dict[str, Any] | None = None
+        if _is_allo_text(user_text):
+            allo_index, allo_row = user_index, user_row
+        else:
+            allo_index, allo_row = _first_matching_row(
+                rows,
+                lambda row: (
+                    _is_user_final_transcript_row(row)
+                    and _is_allo_text(_transcript_from_row(row))
+                ),
+                start=user_index + 1,
+                end=playback_index if playback_index is not None else lookahead_end,
+            )
+
+        canceled_before_first_audio = bool(
+            cancel_row is not None
+            and (playback_index is None or (cancel_index or 0) < playback_index)
+        )
+        if allo_row is not None and (
+            playback_index is None or (allo_index or 0) < playback_index
+        ):
+            canceled_before_first_audio = (
+                canceled_before_first_audio or cancel_row is not None
+            )
+
+        replacement_start = max(
+            item for item in (cancel_index, allo_index, user_index) if item is not None
+        )
+        replacement_response_index: int | None = None
+        replacement_response_row: dict[str, Any] | None = None
+        replacement_playback_row: dict[str, Any] | None = None
+        if canceled_before_first_audio:
+            replacement_response_index, replacement_response_row = _first_matching_row(
+                rows,
+                lambda row: (
+                    _is_assistant_response_created_row(row)
+                    or _is_agent_thinking_row(row)
+                ),
+                start=replacement_start + 1,
+                end=lookahead_end,
+            )
+            _, replacement_playback_row = _first_matching_row(
+                rows,
+                _is_playback_started_row,
+                start=(
+                    replacement_response_index + 1
+                    if replacement_response_index is not None
+                    else replacement_start + 1
+                ),
+                end=lookahead_end,
+            )
+
+        first_audio_row = (
+            replacement_playback_row if canceled_before_first_audio else playback_row
+        )
+        events = [
+            _latency_chain_event("initial_greeting_finished", greeting_row)
+            if greeting_index is not None
+            else None,
+            _latency_chain_event("user_final_transcript", user_row),
+            _latency_chain_event("assistant_response_created", response_row),
+            _latency_chain_event("llm_metrics", llm_row),
+            _latency_chain_event("tts_first_chunk", tts_row),
+            _latency_chain_event("user_said_allo", allo_row)
+            if allo_row is not None
+            else None,
+            _latency_chain_event("assistant_interrupted", cancel_row)
+            if cancel_row is not None
+            else None,
+            _latency_chain_event("playback_started", playback_row)
+            if not canceled_before_first_audio
+            else None,
+            _latency_chain_event("new_response_created", replacement_response_row)
+            if replacement_response_row is not None
+            else None,
+            _latency_chain_event("new_playback_started", replacement_playback_row)
+            if replacement_playback_row is not None
+            else None,
+        ]
+
+        cancel_reason = None
+        if canceled_before_first_audio:
+            cancel_reason = "client_spoke_before_playback"
+            if allo_row is None and cancel_row is not None:
+                cancel_reason = "interruption_or_cancel_before_playback"
+
+        slow_response_missing_reason = None
+        if canceled_before_first_audio and slow_response_count == 0:
+            slow_response_missing_reason = (
+                "measured from last «Алло», not from first useful question"
+                if allo_row is not None
+                else "original reply was canceled before playback, so slow_response may never attach to that first useful turn"
+            )
+
+        chain = {
+            "chain_id": f"turn_{chain_index}",
+            "user_final_transcript": user_text or None,
+            "events": [event for event in events if event],
+            "metrics": {
+                "llm_ms": _number_extra_ms(llm_row, "duration_ms", "duration"),
+                "llm_ttft_ms": _number_extra_ms(llm_row, "ttft_ms", "ttft"),
+                "tts_ms": _number_extra_ms(
+                    tts_row,
+                    "ttfb_ms",
+                    "time_to_first_audio",
+                    "total_tts_duration",
+                ),
+                "time_to_first_audio_ms": _elapsed_ms(user_row, first_audio_row),
+                "time_from_allo_to_new_playback_ms": _elapsed_ms(
+                    allo_row, replacement_playback_row
+                ),
+                "canceled_before_first_audio": canceled_before_first_audio,
+                "cancel_reason": cancel_reason,
+                "slow_response_incident_count": slow_response_count,
+                "slow_response_incident_missing_reason": slow_response_missing_reason,
+            },
+        }
+        chains.append(redact(chain))
+
+    return chains
 
 
 def _snapshot_text(livekit_snapshot: dict[str, Any]) -> str:
@@ -753,7 +1621,9 @@ def collect_diagnostic_signals(
         "raw_logs_available": bool(raw_rows),
         "raw_log_count": len(raw_rows),
         "raw_log_warning_error_count": len(warning_error_logs),
-        "prompt_resolved_log_seen": any("prompt resolved" in text for text in raw_texts),
+        "prompt_resolved_log_seen": any(
+            "prompt resolved" in text for text in raw_texts
+        ),
         "stt_provider_log_seen": any("stt provider" in text for text in raw_texts),
         "tts_provider_log_seen": any("tts provider" in text for text in raw_texts),
         "tts_warmup_seen": any(
@@ -763,7 +1633,9 @@ def collect_diagnostic_signals(
             "user state changed" in text and "speaking" in text for text in raw_texts
         ),
         "vad_end_seen": any("vad end of speech" in text for text in raw_texts),
-        "agent_session_error_seen": any("agent session error" in text for text in raw_texts),
+        "agent_session_error_seen": any(
+            "agent session error" in text for text in raw_texts
+        ),
         "reply_watchdog_seen": any("reply watchdog" in text for text in raw_texts),
         "initial_greeting_playback_log_seen": any(
             "initial greeting" in text and ("play" in text or "prerecorded" in text)
@@ -772,7 +1644,9 @@ def collect_diagnostic_signals(
         "voice_prompt_log_seen": any("voice prompt" in text for text in raw_texts),
         "room_seen_in_livekit_snapshot": bool(room_name and room_name in snapshot_text),
         "egress_active_in_livekit_snapshot": bool(
-            room_name and room_name in snapshot_text and "EGRESS_ACTIVE" in snapshot_text
+            room_name
+            and room_name in snapshot_text
+            and "EGRESS_ACTIVE" in snapshot_text
         ),
         "raw_log_warning_error_events": warning_error_logs[:20],
         "raw_log_key_events": _raw_log_key_events(raw_rows),
@@ -822,6 +1696,12 @@ def build_codex_prompt(
         },
         "incident_count": len(incidents),
         "diagnostic_signals": diagnostic_signals or {},
+        "audit_input_contract": [
+            "diagnostic_signals",
+            "problem_signals",
+            "evidence_timeline",
+            "latency_chains",
+        ],
     }
     return (
         "You are Codex running a post-call diagnostic audit for a LiveKit voice "
@@ -833,7 +1713,23 @@ def build_codex_prompt(
         "and the supplied call context. Look for errors, strange behavior, delayed "
         "responses, watchdog/fallback events, abnormal close, user frustration, "
         "and mismatches with the current robot logic. Produce only JSON that "
-        "matches the provided output schema. All human-readable strings in "
+        "matches the provided output schema.\n\n"
+        "Use a two-stage investigation. Stage 1: identify the 1-2 main call "
+        "problems, not every minor noise point. Stage 2: for each main problem, "
+        "prove the mechanism through root_cause_analysis. A finding is not "
+        "complete until it explains the symptom, expected behavior, actual "
+        "runtime chain, checked hypotheses, nearest technical cause, what this "
+        "was not, missing evidence, and the concrete change to make.\n\n"
+        "Do not write symptom-only findings. If a finding says there was a "
+        "delay, the robot was silent, the answer was late, the client said "
+        "'Алло', the answer was wrong, the company/fact was wrong, a tag was "
+        "missing, raw logs were missing, Codex report was missing, or the call "
+        "closed strangely, you must find the nearest technical cause in "
+        "raw_logs, call_session, metrics, tag_events, incidents, prompt_context, "
+        "or LiveKit snapshot. If the cause is not proven, list the hypotheses "
+        "you checked, say yes/no/uncertain for each, and name the missing "
+        "instrumentation.\n\n"
+        "All human-readable strings in "
         "summary, findings, recommendations, telegram_brief, and markdown must "
         "be written in clear Russian for a non-technical business owner. Avoid "
         "raw JSON/log dumps in human-readable fields. The telegram_brief field "
@@ -843,7 +1739,7 @@ def build_codex_prompt(
         "the brief; put long evidence in markdown. The markdown field must be "
         "a full Russian report with these sections: "
         "Краткий итог, Хронология звонка, Паузы и задержки, Ошибки и инциденты, "
-        "Аномалии поведения, Предполагаемая причина, Рекомендации, Гарантия "
+        "Аномалии поведения, Почему так произошло, Рекомендации, Гарантия "
         "безопасности. If a section has no data, say so plainly in Russian. "
         "Use short sentences, simple words, and one idea per sentence. Do not "
         "hide the main point behind timestamps, filenames, class names, or raw "
@@ -858,9 +1754,22 @@ def build_codex_prompt(
         "company_extra, and current_datetime. Put the exact source you checked "
         "into source_of_truth. If prompt_context is unavailable, say that in "
         "missing_evidence and lower confidence.\n\n"
-        "The audit input may also include call_session, raw_logs, and "
-        "diagnostic_signals from Directus. Treat them as primary runtime "
-        "evidence. For calls where transcript_items are empty, tag_events are "
+        "The audit input may also include call_session, raw_logs, "
+        "diagnostic_signals, problem_signals, evidence_timeline, and "
+        "latency_chains from Directus. Treat them as primary runtime evidence. "
+        "problem_signals tell you which classes of voice-robot problems need "
+        "investigation. evidence_timeline is the compact proof chain from raw "
+        "logs, transcript, metrics, tag_events, incidents, and LiveKit snapshot. "
+        "latency_chains are deterministic response lifecycle chains; use them "
+        "for any delay/silence/Алло/interruption finding before reading raw "
+        "logs manually. If latency_chains say "
+        "canceled_before_first_audio=true and cancel_reason="
+        "client_spoke_before_playback, the correct mechanism is that the robot "
+        "had started preparing a reply, but client speech arrived before first "
+        "audio and interruption logic canceled the unheard reply. Do not call "
+        "that merely 'the robot delayed the answer'. Explain the cancellation "
+        "mechanism and the replacement response timing.\n\n"
+        "For calls where transcript_items are empty, tag_events are "
         "empty, or the owner says the robot was silent, do not stop at 'there "
         "is no transcript'. Run a root-cause audit of the call chain: SIP/room "
         "join, prompt resolve, initial greeting, STT/VAD, LLM, TTS/playout, tag "
@@ -880,6 +1789,15 @@ def build_codex_prompt(
         "initial greeting/playback/prerecorded audio, agent session error, reply "
         "watchdog, and participant disconnect. Do not confuse TTS warmup with "
         "proof that the greeting was played to the caller.\n\n"
+        "Root-cause contract for every finding: fill root_cause_analysis with "
+        "Симптом, Ожидалось, Фактически, Где сломалась цепочка, Проверенные "
+        "версии, Корневая причина, Что это НЕ было, Доказательная цепочка, "
+        "Что менять, and Чего не хватает. For checked_hypotheses, reject likely "
+        "but disproven causes, for example 'this was not slow LLM: llm_ms=568' "
+        "or 'this was not n8n/export: delay happened inside live conversation'. "
+        "If code logic caused the issue, name the function, file, or log message "
+        "that proves it. If no exact code path is visible, say so instead of "
+        "inventing one.\n\n"
         "Quality bar for every finding: answer what exactly happened, where in "
         "the dialog it happened, which event/tag/value/code-path proves it, why "
         "it matters, what evidence is missing, and what implementation change "
@@ -1164,20 +2082,20 @@ def build_remote_local_livekit_snapshot_commands(ssh_target: str) -> list[list[s
             "set -eu\n"
             f"env_file={shlex.quote(env_file)}\n"
             f"{env_value_shell_function()}\n"
-            "url=\"$(read_env CODEX_DIAGNOSTICS_LK_LOCAL_URL || true)\"\n"
-            "if [ -z \"$url\" ]; then url=\"$(read_env LIVEKIT_URL || true)\"; fi\n"
-            "if [ -z \"$url\" ]; then url=\"http://127.0.0.1:7880\"; fi\n"
-            "key=\"$(read_env CODEX_DIAGNOSTICS_LK_LOCAL_API_KEY || true)\"\n"
-            "if [ -z \"$key\" ]; then key=\"$(read_env LIVEKIT_API_KEY || true)\"; fi\n"
-            "secret=\"$(read_env CODEX_DIAGNOSTICS_LK_LOCAL_API_SECRET || true)\"\n"
-            "if [ -z \"$secret\" ]; then secret=\"$(read_env LIVEKIT_API_SECRET || true)\"; fi\n"
-            "if [ -z \"$key\" ] || [ -z \"$secret\" ]; then\n"
+            'url="$(read_env CODEX_DIAGNOSTICS_LK_LOCAL_URL || true)"\n'
+            'if [ -z "$url" ]; then url="$(read_env LIVEKIT_URL || true)"; fi\n'
+            'if [ -z "$url" ]; then url="http://127.0.0.1:7880"; fi\n'
+            'key="$(read_env CODEX_DIAGNOSTICS_LK_LOCAL_API_KEY || true)"\n'
+            'if [ -z "$key" ]; then key="$(read_env LIVEKIT_API_KEY || true)"; fi\n'
+            'secret="$(read_env CODEX_DIAGNOSTICS_LK_LOCAL_API_SECRET || true)"\n'
+            'if [ -z "$secret" ]; then secret="$(read_env LIVEKIT_API_SECRET || true)"; fi\n'
+            'if [ -z "$key" ] || [ -z "$secret" ]; then\n'
             "  echo 'missing local LiveKit API key/secret' >&2\n"
             "  exit 2\n"
             "fi\n"
             f"cd {shlex.quote(workdir)} 2>/dev/null || cd {shlex.quote(fallback_workdir)}\n"
-            f"exec {shlex.quote(lk_bin)} --url \"$url\" --api-key \"$key\" "
-            f"--api-secret \"$secret\" {args_text}\n"
+            f'exec {shlex.quote(lk_bin)} --url "$url" --api-key "$key" '
+            f'--api-secret "$secret" {args_text}\n'
         )
         return [*ssh_cmd, "sh -lc " + shlex.quote(script)]
 
@@ -1388,7 +2306,9 @@ class DirectusClient:
                 else None
             )
         )
-        sip = call.payload.get("sip") if isinstance(call.payload.get("sip"), dict) else {}
+        sip = (
+            call.payload.get("sip") if isinstance(call.payload.get("sip"), dict) else {}
+        )
         context: dict[str, Any] = {
             "status": "not_found",
             "caller_id": str(caller_id) if caller_id else None,
@@ -1578,6 +2498,14 @@ def report_markdown(report: dict[str, Any]) -> str:
     if not findings:
         lines.append("Ошибки и инциденты не указаны.")
     for index, item in enumerate(findings, start=1):
+        root = (
+            item.get("root_cause_analysis")
+            if isinstance(item.get("root_cause_analysis"), dict)
+            else {}
+        )
+        checked = root.get("checked_hypotheses")
+        timeline = root.get("evidence_timeline")
+        not_causes = root.get("what_this_was_not")
         lines.extend(
             [
                 "",
@@ -1586,13 +2514,43 @@ def report_markdown(report: dict[str, Any]) -> str:
                 f"Что произошло простыми словами: {item.get('plain_explanation', '')}",
                 f"Где в звонке: {item.get('stage', 'не указан')}; {item.get('event_time_or_turn', 'не указан')}",
                 f"Почему важно: {item.get('why_it_matters', '')}",
+                f"Почему так произошло: {root.get('root_cause') or item.get('suspected_cause', '')}",
+                f"Где сломалась цепочка: {root.get('chain_break', 'не указано')}",
                 f"Что сделать: {item.get('implementation_idea', '') or item.get('recommendation', '')}",
                 f"Как проверили: {item.get('evidence', '')}",
                 f"Источник проверки: {item.get('source_of_truth', 'не указан')}",
                 f"Техническая деталь: {item.get('exact_detail', 'не указана')}",
-                f"Предполагаемая причина: {item.get('suspected_cause', '')}",
-                f"Чего не хватает для проверки: {item.get('missing_evidence', '')}",
+                f"Корневая причина: {root.get('root_cause') or item.get('suspected_cause', '')}",
             ]
+        )
+        if isinstance(not_causes, list) and not_causes:
+            lines.append("Что это НЕ было:")
+            lines.extend(f"- {cause}" for cause in not_causes)
+        if isinstance(checked, list) and checked:
+            lines.append("Проверенные версии:")
+            for hypothesis in checked:
+                if isinstance(hypothesis, dict):
+                    label = hypothesis.get("hypothesis", "версия")
+                    result = hypothesis.get("result", "uncertain")
+                    reason = (
+                        hypothesis.get("reason") or hypothesis.get("evidence") or ""
+                    )
+                    lines.append(f"- {label}: {result}. {reason}".strip())
+                else:
+                    lines.append(f"- {hypothesis}")
+        if isinstance(timeline, list) and timeline:
+            lines.append("Доказательная цепочка:")
+            for event in timeline:
+                if isinstance(event, dict):
+                    time_text = event.get("time") or "время не указано"
+                    event_text = event.get("event") or event.get("detail") or "событие"
+                    evidence = event.get("evidence") or event.get("source") or ""
+                    lines.append(f"- {time_text}: {event_text}. {evidence}".strip())
+                else:
+                    lines.append(f"- {event}")
+        lines.append(
+            "Чего не хватает для проверки: "
+            f"{root.get('missing_evidence') or item.get('missing_evidence', '')}"
         )
     recommendations = report.get("recommendations")
     if isinstance(recommendations, list) and recommendations:
@@ -1609,9 +2567,9 @@ def report_markdown(report: dict[str, Any]) -> str:
 
 
 def directus_audit_report_url(*, directus_url: str, audit_id: int) -> str:
-    app_url = (
-        os.getenv("CODEX_DIAGNOSTICS_DIRECTUS_APP_URL") or directus_url
-    ).rstrip("/")
+    app_url = (os.getenv("CODEX_DIAGNOSTICS_DIRECTUS_APP_URL") or directus_url).rstrip(
+        "/"
+    )
     if app_url.endswith("/admin"):
         return f"{app_url}/content/robot_call_audits/{audit_id}"
     return f"{app_url}/admin/content/robot_call_audits/{audit_id}"
@@ -1649,9 +2607,7 @@ def telegram_payload(
     report: dict[str, Any],
     directus_url: str,
 ) -> dict[str, Any]:
-    report_url = directus_audit_report_url(
-        directus_url=directus_url, audit_id=audit_id
-    )
+    report_url = directus_audit_report_url(directus_url=directus_url, audit_id=audit_id)
     findings = (
         report.get("findings") if isinstance(report.get("findings"), list) else []
     )
@@ -1683,13 +2639,23 @@ def telegram_payload(
         text_lines.append("")
         text_lines.append("Главное:")
     for index, item in enumerate(top, start=1):
-        finding_lines = [f"{index}. {brief_text(item.get('title') or 'Находка', max_chars=120)}"]
+        finding_lines = [
+            f"{index}. {brief_text(item.get('title') or 'Находка', max_chars=120)}"
+        ]
         plain_explanation = str(item.get("plain_explanation") or "").strip()
         stage = str(item.get("stage") or "").strip()
         event_time = str(item.get("event_time_or_turn") or "").strip()
         exact_detail = str(item.get("exact_detail") or "").strip()
         evidence = str(item.get("evidence") or "").strip()
         why_it_matters = str(item.get("why_it_matters") or "").strip()
+        root = (
+            item.get("root_cause_analysis")
+            if isinstance(item.get("root_cause_analysis"), dict)
+            else {}
+        )
+        root_cause = str(
+            root.get("root_cause") or item.get("suspected_cause") or ""
+        ).strip()
         implementation_idea = str(
             item.get("implementation_idea") or item.get("recommendation") or ""
         ).strip()
@@ -1700,6 +2666,7 @@ def telegram_payload(
         )
         where = "; ".join(item for item in (stage, event_time) if item)
         append_brief_line(finding_lines, "Где", where)
+        append_brief_line(finding_lines, "Причина", root_cause)
         append_brief_line(finding_lines, "Почему важно", why_it_matters)
         append_brief_line(finding_lines, "Что сделать", implementation_idea)
         proof_parts = []
@@ -1768,9 +2735,7 @@ def split_telegram_text(text: str, *, limit: int = 3600) -> list[str]:
 
 def full_report_text(audit: dict[str, Any], *, directus_url: str) -> str:
     audit_id = int(audit.get("id") or 0)
-    report_url = directus_audit_report_url(
-        directus_url=directus_url, audit_id=audit_id
-    )
+    report_url = directus_audit_report_url(directus_url=directus_url, audit_id=audit_id)
     verdict = str(audit.get("verdict") or "unknown")
     target = str(audit.get("target") or "-")
     incident_ids = audit.get("incident_ids")
@@ -1779,7 +2744,9 @@ def full_report_text(audit: dict[str, Any], *, directus_url: str) -> str:
     else:
         incident_text = "записанных robot_incidents нет"
     input_payload = (
-        audit.get("input_payload") if isinstance(audit.get("input_payload"), dict) else {}
+        audit.get("input_payload")
+        if isinstance(audit.get("input_payload"), dict)
+        else {}
     )
     call_time = format_call_time(
         started_at=audit.get("started_at") or input_payload.get("started_at"),
@@ -1867,6 +2834,27 @@ def run_audit(
             raw_logs=raw_logs,
             livekit_snapshot=livekit_snapshot,
         )
+        evidence_timeline = collect_evidence_timeline(
+            call=call,
+            incidents=incidents,
+            call_session=call_session,
+            raw_logs=raw_logs,
+            livekit_snapshot=livekit_snapshot,
+        )
+        problem_signals = collect_problem_signals(
+            call=call,
+            incidents=incidents,
+            call_session=call_session,
+            raw_logs=raw_logs,
+            livekit_snapshot=livekit_snapshot,
+            diagnostic_signals=diagnostic_signals,
+        )
+        latency_chains = collect_latency_chains(
+            call=call,
+            incidents=incidents,
+            call_session=call_session,
+            raw_logs=raw_logs,
+        )
         audit_input = {
             "call": call.__dict__ | {"payload": redact(call.payload)},
             "incidents": redact(incidents),
@@ -1875,6 +2863,9 @@ def run_audit(
             "call_session": call_session,
             "raw_logs": raw_logs,
             "diagnostic_signals": diagnostic_signals,
+            "problem_signals": problem_signals,
+            "evidence_timeline": evidence_timeline,
+            "latency_chains": latency_chains,
         }
         prompt = build_codex_prompt(
             call=call,

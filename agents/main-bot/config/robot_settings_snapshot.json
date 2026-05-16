@@ -473,12 +473,12 @@
         "format": "mp3",
         "language_boost": "Russian",
         "min_sentence_len": 4,
-        "model": "speech-2.8-turbo",
+        "model": "speech-2.8-hd",
         "pitch": 0,
         "provider": "minimax",
         "sample_rate": 24000,
         "sound_effects": "",
-        "speed": 1.2,
+        "speed": 1.05,
         "stream_context_len": 1,
         "voice_id": "moss_audio_43d3c43e-3a2d-11f1-b47e-928b88df9451",
         "volume": 1
@@ -715,6 +715,66 @@
       "profile_key": "turn_fast_phone",
       "slot": "selected",
       "sort": 60
+    },
+    {
+      "active": true,
+      "category": "llm",
+      "note": "Initial main_bot_test binding copied from base. Change this binding for test experiments instead of editing shared production component profiles.",
+      "owner_key": "main_bot_test",
+      "owner_type": "runtime",
+      "profile_key": "llm_gemini",
+      "slot": "primary",
+      "sort": 10
+    },
+    {
+      "active": true,
+      "category": "llm_routing",
+      "note": "Initial main_bot_test binding copied from base. Change this binding for test experiments instead of editing shared production component profiles.",
+      "owner_key": "main_bot_test",
+      "owner_type": "runtime",
+      "profile_key": "llm_gemini",
+      "slot": "complex",
+      "sort": 30
+    },
+    {
+      "active": true,
+      "category": "llm_routing",
+      "note": "Initial main_bot_test binding copied from base. Change this binding for test experiments instead of editing shared production component profiles.",
+      "owner_key": "main_bot_test",
+      "owner_type": "runtime",
+      "profile_key": "llm_gemini_31_flash_lite",
+      "slot": "fast",
+      "sort": 20
+    },
+    {
+      "active": true,
+      "category": "stt",
+      "note": "Initial main_bot_test binding copied from base. Change this binding for test experiments instead of editing shared production component profiles.",
+      "owner_key": "main_bot_test",
+      "owner_type": "runtime",
+      "profile_key": "stt_deepgram_ru_phone",
+      "slot": "primary",
+      "sort": 50
+    },
+    {
+      "active": true,
+      "category": "tts",
+      "note": "Initial main_bot_test binding copied from base. Change this binding for test experiments instead of editing shared production component profiles.",
+      "owner_key": "main_bot_test",
+      "owner_type": "runtime",
+      "profile_key": "tts_elevenlabs_v3",
+      "slot": "primary",
+      "sort": 40
+    },
+    {
+      "active": true,
+      "category": "turn",
+      "note": "Initial main_bot_test binding copied from base. Change this binding for test experiments instead of editing shared production component profiles.",
+      "owner_key": "main_bot_test",
+      "owner_type": "runtime",
+      "profile_key": "turn_fast_phone",
+      "slot": "selected",
+      "sort": 60
     }
   ],
   "project_profiles": [
@@ -763,6 +823,15 @@
       "environment": "mac",
       "override_json": {},
       "runtime_key": "mac",
+      "status": "draft"
+    },
+    {
+      "active": true,
+      "agent_name": "main-bot-test",
+      "display_name": "Main Bot Test",
+      "environment": "cloud-test",
+      "override_json": {},
+      "runtime_key": "main_bot_test",
       "status": "draft"
     }
   ],

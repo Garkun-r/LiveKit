@@ -34,6 +34,58 @@ PROMPT_FILE = Path(__file__).with_name("prompt.txt")
 
 _CURRENT_DATETIME_PLACEHOLDER = "{{CURRENT_DATETIME_BLOCK}}"
 _URL_PROTOCOL_RE = re.compile(r"^https?://", re.IGNORECASE)
+_RUNTIME_VOICE_INTRO_BLOCK = (
+    "<runtime_voice_intro>\n"
+    "Перед первым LLM-ответом голосовой слой сам проигрывает обязательное "
+    "самопредставление. Не представляйся в тексте ответа и не упоминай свой "
+    "виртуальный статус. Если другие блоки или примеры требуют представиться, "
+    "игнорируй это требование и сразу отвечай по сути.\n"
+    "</runtime_voice_intro>"
+)
+_FIRST_REPLY_SELF_INTRO_RE = re.compile(
+    r"Если\s+это\s+твоя\s+ПЕРВАЯ\s+реплика\s+в\s+диалоге,\s+"
+    r"начни\s+е[её]\s+с\s+короткого\s+представления:\s*"
+    r"[\"«]Я\s+виртуальный\s+ассистент\.?[\"»]\s+"
+    r"и\s+сразу\s+после\s+этого\s+дай\s+ответ\s+из\s+<knowledge_base>\.?",
+    re.IGNORECASE,
+)
+_INTRO_EXAMPLE_REPLACEMENTS = (
+    (
+        re.compile(
+            r"Я\s+виртуальный\s+ассистент,?\s+сейчас\s+подскажу\.?",
+            re.IGNORECASE,
+        ),
+        "Сейчас подскажу.",
+    ),
+    (
+        re.compile(
+            r"Я\s+виртуальный\s+ассистент,\s+с\s+удовольствием\s+помогу\.?",
+            re.IGNORECASE,
+        ),
+        "С удовольствием помогу.",
+    ),
+    (
+        re.compile(
+            r"Здравствуйте,\s*я\s+виртуальный\s+ассистент\.?\s*",
+            re.IGNORECASE,
+        ),
+        "",
+    ),
+    (
+        re.compile(
+            r"\bЯ\s+виртуальный\s+(?:ассистент|помощник)\s*[.!?]\s*",
+            re.IGNORECASE,
+        ),
+        "",
+    ),
+    (
+        re.compile(
+            r"Я\s+виртуальный\s+помощник\s+и\s+",
+            re.IGNORECASE,
+        ),
+        "Я ",
+    ),
+)
 _MONTH_NAMES = (
     "января",
     "февраля",
@@ -67,6 +119,7 @@ class PromptResolution:
     sip_client_number: str | None = None
     client_id: str | int | None = None
     initial_greeting: str | None = None
+    llm_intro: str | None = None
     error: str | None = None
 
 
@@ -77,6 +130,7 @@ class _PromptTemplate:
     source: str
     client_id: str | int | None = None
     initial_greeting: str | None = None
+    llm_intro: str | None = None
 
 
 @dataclass
@@ -143,6 +197,7 @@ class DirectusPromptClient:
         template = _string_value(row.get("prompt_template"))
         if not template:
             return None
+        template = sanitize_runtime_voice_intro_prompt(template)
 
         cache_age_sec = _cache_row_age_seconds(row)
         if _is_cached_prompt_stale(row):
@@ -158,14 +213,14 @@ class DirectusPromptClient:
             )
             return None
 
+        client_id = _relation_id(row.get("client_id"))
         return _PromptTemplate(
             template=template,
             timezone=_string_value(row.get("timezone")) or DIRECTUS_DEFAULT_TIMEZONE,
             source="directus:cache",
-            client_id=_relation_id(row.get("client_id")),
-            initial_greeting=await self._fetch_initial_greeting(
-                _relation_id(row.get("client_id"))
-            ),
+            client_id=client_id,
+            initial_greeting=await self._fetch_initial_greeting(client_id),
+            llm_intro=await self._fetch_llm_intro(client_id),
         )
 
     async def save_cached_prompt(
@@ -247,15 +302,17 @@ class DirectusPromptClient:
             limit=500,
         )
 
-        template = build_prompt_template(
-            global_rules=global_rules,
-            skill_prompt=skill_prompt,
-            add_info=_string_value(client.get("add_info")),
-            website_text=website_text,
-            company_extra=_string_value(client.get("company_extra")),
-            transfer_rows=transfer_rows,
-            system_prompt=_string_value(bot_config.get("system_prompt")),
-            examples=_string_value(bot_config.get("examples")),
+        template = sanitize_runtime_voice_intro_prompt(
+            build_prompt_template(
+                global_rules=global_rules,
+                skill_prompt=skill_prompt,
+                add_info=_string_value(client.get("add_info")),
+                website_text=website_text,
+                company_extra=_string_value(client.get("company_extra")),
+                transfer_rows=transfer_rows,
+                system_prompt=_string_value(bot_config.get("system_prompt")),
+                examples=_string_value(bot_config.get("examples")),
+            )
         )
 
         return _PromptTemplate(
@@ -264,15 +321,34 @@ class DirectusPromptClient:
             source="directus:live",
             client_id=client_id,
             initial_greeting=await self._fetch_initial_greeting(client_id),
+            llm_intro=_string_value(bot_config.get("llm_intro")) or None,
         )
 
     async def _fetch_bot_config(self, client_id: str | int) -> dict[str, Any] | None:
-        fields = ["client_id", "system_prompt", "examples", "skills_name"]
-        return await self._fetch_one(
-            DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
-            filters={"client_id": client_id},
-            fields=fields,
-        )
+        fields = ["client_id", "system_prompt", "examples", "skills_name", "llm_intro"]
+        try:
+            return await self._fetch_one(
+                DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
+                filters={"client_id": client_id},
+                fields=fields,
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code not in {400, 403}:
+                raise
+            logger.info("Directus bot_configurations.llm_intro is unavailable; retrying")
+            return await self._fetch_one(
+                DIRECTUS_COLLECTION_BOT_CONFIGURATIONS,
+                filters={"client_id": client_id},
+                fields=["client_id", "system_prompt", "examples", "skills_name"],
+            )
+
+    async def _fetch_llm_intro(self, client_id: str | int | None) -> str | None:
+        if client_id is None:
+            return None
+        bot_config = await self._fetch_bot_config(client_id)
+        if not bot_config:
+            return None
+        return _string_value(bot_config.get("llm_intro")) or None
 
     async def _fetch_initial_greeting(self, client_id: str | int | None) -> str | None:
         if client_id is None or not DIRECTUS_INITIAL_GREETING_FIELD:
@@ -511,6 +587,21 @@ def build_prompt_template(
     return "\n\n".join(sections)
 
 
+def sanitize_runtime_voice_intro_prompt(template: str) -> str:
+    sanitized = _FIRST_REPLY_SELF_INTRO_RE.sub(
+        (
+            "Если это твоя ПЕРВАЯ реплика в диалоге, не представляйся: "
+            "сразу дай ответ из <knowledge_base>."
+        ),
+        template,
+    )
+    for pattern, replacement in _INTRO_EXAMPLE_REPLACEMENTS:
+        sanitized = pattern.sub(replacement, sanitized)
+    if _RUNTIME_VOICE_INTRO_BLOCK not in sanitized:
+        sanitized = f"{sanitized.rstrip()}\n\n{_RUNTIME_VOICE_INTRO_BLOCK}"
+    return sanitized
+
+
 async def resolve_prompt_for_call(
     *,
     sip_trunk_number: str | None,
@@ -579,6 +670,7 @@ async def resolve_prompt_for_call(
         sip_client_number=normalized_client_number,
         client_id=prompt_template.client_id,
         initial_greeting=prompt_template.initial_greeting,
+        llm_intro=prompt_template.llm_intro,
     )
 
 
@@ -705,6 +797,7 @@ def _get_memory_cached_prompt(caller_id: str) -> _PromptTemplate | None:
         source="directus:memory_cache",
         client_id=entry.template.client_id,
         initial_greeting=entry.template.initial_greeting,
+        llm_intro=entry.template.llm_intro,
     )
 
 

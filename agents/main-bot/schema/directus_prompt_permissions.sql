@@ -57,7 +57,7 @@ begin
         (
             'bot_configurations',
             'read',
-            'client_id,system_prompt,examples,skills_name,first_step_text'
+            'client_id,system_prompt,examples,skills_name,first_step_text,llm_intro'
         ),
         (
             'clients',

@@ -407,6 +407,7 @@ TURN_MIN_ENDPOINTING_DELAY=0.25
 TURN_MAX_ENDPOINTING_DELAY=1.0
 TURN_DETECTION_MODE=vad
 TURN_ENDPOINTING_MODE=dynamic
+TURN_PENDING_REPLY_MIN_INTERRUPTION_WORDS=2
 PREEMPTIVE_GENERATION=true
 REPLY_WATCHDOG_SEC=9.0
 ```
@@ -415,6 +416,11 @@ REPLY_WATCHDOG_SEC=9.0
 final STT transcript to commit the user turn. If a streaming STT provider sends
 a good interim transcript and delays the final flag, enable the universal early
 interim final wrapper:
+
+`TURN_PENDING_REPLY_MIN_INTERRUPTION_WORDS=2` applies only while a generated
+reply is pending before normal playback. It prevents one-word check-ins such as
+`алло` from canceling a ready answer, then restores normal interruption handling
+once the answer is actually playing.
 
 ```console
 STT_EARLY_INTERIM_FINAL_ENABLED=true

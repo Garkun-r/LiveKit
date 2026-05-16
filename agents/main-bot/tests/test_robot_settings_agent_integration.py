@@ -27,3 +27,25 @@ def test_llm_fallback_comes_from_llm_profile() -> None:
 
     assert provider == "google"
     assert model == "backup-model"
+
+
+def test_pending_reply_min_interruption_words_defaults_to_two() -> None:
+    assert agent.resolve_pending_reply_min_interruption_words({}) == 2
+
+
+def test_pending_reply_min_interruption_words_uses_turn_profile_config() -> None:
+    assert (
+        agent.resolve_pending_reply_min_interruption_words(
+            {"pending_reply_min_interruption_words": 3}
+        )
+        == 3
+    )
+
+
+def test_pending_reply_min_interruption_words_is_clamped_to_zero() -> None:
+    assert (
+        agent.resolve_pending_reply_min_interruption_words(
+            {"pending_reply_min_interruption_words": -1}
+        )
+        == 0
+    )

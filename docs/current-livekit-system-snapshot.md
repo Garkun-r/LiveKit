@@ -119,7 +119,9 @@ For each LiveKit job:
 8. If `CALL_RECORDING_ENABLED=true`, LiveKit Egress recording starts
    best-effort and is indexed in `robot_call_recordings`.
 9. Initial greeting is played from prerecorded/cache audio when available, or
-   generated through TTS as fallback.
+   generated through TTS as fallback. Before the first LLM reply, the voice
+   layer can also play the first LLM intro phrase from `bot_configurations.llm_intro`
+   or the shared `VOICE_FIRST_LLM_INTRO_PHRASE`.
 10. Event handlers collect transcript, metrics, usage, tag events, close reason,
    slow-response incidents, provider fallback incidents, raw per-call logs, and
    session errors.
@@ -339,6 +341,8 @@ TTS text is sanitized before synthesis so hidden service tags like
 for:
 
 - initial greeting;
+- first LLM intro when a client-specific `bot_configurations.llm_intro` is set
+  or the shared prerecorded file is unavailable;
 - short greeting follow-up;
 - response delay filler;
 - client silence prompt fallback when the prerecorded file is unavailable;
@@ -443,6 +447,8 @@ agent_session_error
 provider_fallback
 llm_fallback_same_provider
 slow_response
+speech_canceled_before_first_audio
+tts_ttfb_slow
 reply_watchdog_fired
 no_dialog_startup_timeout
 speech_playout_timeout

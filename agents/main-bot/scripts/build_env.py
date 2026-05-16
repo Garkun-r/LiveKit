@@ -8,7 +8,7 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-PROFILE_NAMES = ("mac", "cloud", "asterisk")
+PROFILE_NAMES = ("mac", "cloud", "cloud-test", "asterisk")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 

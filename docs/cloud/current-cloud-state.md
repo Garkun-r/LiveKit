@@ -6,6 +6,16 @@ Snapshot taken: 2026-05-11 with read-only `lk` commands from
 This snapshot intentionally does not include secret values. `lk agent secrets`
 shows names and timestamps only.
 
+## 2026-05-15 test agent addendum
+
+- Test Cloud config: `agents/main-bot/livekit.test.toml`
+- Test agent ID: `CA_tCPh4SqnPqkQ`
+- Test region: `eu-central`
+- Test identity: `AGENT_NAME=main-bot-test`,
+  `ROBOT_RUNTIME_PROFILE=main_bot_test`
+- Deploy logs showed the worker registered as `main-bot-test`.
+- SIP was not changed: the existing dispatch rule still targets `main-bot`.
+
 ## CLI and local config
 
 - CLI version: `lk 2.16.0`

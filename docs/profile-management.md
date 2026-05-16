@@ -38,7 +38,7 @@ such as `api_key_ref`, `credentials_ref`, `auth_key_ref`, or `api_key_env_name`.
 - `robot_profile_bindings`: assigns component profiles to an owner and slot, for
   example `runtime.base.tts.primary -> tts_elevenlabs_v3`.
 - `robot_runtime_profiles`: runtime identities such as `base`, `mac`,
-  `asterisk`, and `livekit_cloud`.
+  `asterisk`, `livekit_cloud`, and `main_bot_test`.
 - `robot_project_profiles`: project/client/DID overrides.
 - `robot_setting_fields`: UI field catalog. It describes editable fields; it is
   not the source of actual runtime values.
@@ -60,6 +60,12 @@ columns.
 Use project bindings for client/DID-specific behavior. Do not fork deployment env
 or code for client-specific prompt, voice, STT, TTS, LLM, transfer, or workflow
 facts.
+
+Use runtime bindings for deployment-specific behavior. The LiveKit test bot uses
+`AGENT_NAME=main-bot-test` for dispatch and `ROBOT_RUNTIME_PROFILE=main_bot_test`
+for Directus settings. Test experiments should be assigned through
+`runtime.main_bot_test.*` bindings instead of editing shared production component
+profiles in place.
 
 ## Snapshot Workflow
 
@@ -131,5 +137,6 @@ Before deploying, make sure the effective runtime profile is the intended one:
 
 ```bash
 uv run python scripts/verify_robot_settings_directus.py --env-file .env.local --runtime base
+uv run python scripts/verify_robot_settings_directus.py --env-file .env.local --runtime main_bot_test
 uv run python scripts/verify_robot_settings_directus.py --env-file .env.local --runtime asterisk
 ```

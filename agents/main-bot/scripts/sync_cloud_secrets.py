@@ -55,6 +55,10 @@ def main() -> None:
     parser.add_argument("--id", help="LiveKit agent id (optional).")
     parser.add_argument("--project", help="LiveKit project name (optional).")
     parser.add_argument(
+        "--config",
+        help="LiveKit config TOML to use, for example livekit.test.toml.",
+    )
+    parser.add_argument(
         "--exclude",
         action="append",
         default=[],
@@ -116,6 +120,8 @@ def main() -> None:
         cmd.extend(["--id", args.id])
     if args.project:
         cmd.extend(["--project", args.project])
+    if args.config:
+        cmd.extend(["--config", args.config])
 
     cmd.append(str(Path(args.working_dir).expanduser().resolve()))
     if args.overwrite:

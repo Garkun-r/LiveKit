@@ -8,6 +8,7 @@ from agent import (
     is_short_greeting_response,
     resolve_initial_greeting_audio,
     resolve_short_greeting_audio_path,
+    should_keep_pending_reply_for_short_interruption,
     should_start_response_delay_after_vad,
 )
 
@@ -113,6 +114,29 @@ def test_avito_intro_announcement_is_not_short_greeting() -> None:
     )
 
 
+@pytest.mark.parametrize("text", ["алло", "ау", "эй", "ну", "эм"])  # noqa: RUF001
+def test_pending_reply_guard_keeps_one_word_check_ins(text: str) -> None:
+    assert (
+        should_keep_pending_reply_for_short_interruption(text, min_words=2)
+        is True
+    )
+
+
+@pytest.mark.parametrize("text", ["не надо", "подскажите адрес", "алло подскажите"])
+def test_pending_reply_guard_allows_multi_word_interruptions(text: str) -> None:
+    assert (
+        should_keep_pending_reply_for_short_interruption(text, min_words=2)
+        is False
+    )
+
+
+def test_pending_reply_guard_is_disabled_when_min_words_is_zero() -> None:
+    assert (
+        should_keep_pending_reply_for_short_interruption("алло", min_words=0)
+        is False
+    )
+
+
 @pytest.mark.asyncio
 async def test_default_initial_greeting_uses_prerecorded_audio(tmp_path) -> None:
     audio_path = tmp_path / "1.wav"
@@ -128,6 +152,62 @@ async def test_default_initial_greeting_uses_prerecorded_audio(tmp_path) -> None
 
     assert greeting == "Алло, здравствуйте."
     assert resolved_audio_path == audio_path
+    assert cache.calls == []
+
+
+@pytest.mark.asyncio
+async def test_default_initial_greeting_uses_random_prerecorded_audio_from_directory(
+    tmp_path, monkeypatch
+) -> None:
+    audio_dir = tmp_path / "1"
+    audio_dir.mkdir()
+    first_audio_path = audio_dir / "a.mp3"
+    second_audio_path = audio_dir / "b.wav"
+    first_audio_path.write_bytes(b"mp3")
+    second_audio_path.write_bytes(b"wav")
+    (audio_dir / "notes.txt").write_text("not audio")
+    cache = _VoiceAudioCache(tmp_path / "cached.wav")
+    choices = []
+
+    def choose_second_audio_path(paths):
+        choices.append(paths)
+        return paths[1]
+
+    monkeypatch.setattr("agent.random.choice", choose_second_audio_path)
+
+    greeting, resolved_audio_path = await resolve_initial_greeting_audio(
+        voice_audio_cache=cache,
+        client_greeting=None,
+        default_greeting="Алло, здравствуйте.",
+        prerecorded_path=audio_dir,
+    )
+
+    assert greeting == "Алло, здравствуйте."
+    assert resolved_audio_path == second_audio_path
+    assert choices == [[first_audio_path, second_audio_path]]
+    assert cache.calls == []
+
+
+@pytest.mark.asyncio
+async def test_default_initial_greeting_falls_back_to_legacy_prerecorded_audio(
+    tmp_path,
+) -> None:
+    audio_dir = tmp_path / "1"
+    audio_dir.mkdir()
+    legacy_audio_path = tmp_path / "1.wav"
+    legacy_audio_path.write_bytes(b"wav")
+    cache = _VoiceAudioCache(tmp_path / "cached.wav")
+
+    greeting, resolved_audio_path = await resolve_initial_greeting_audio(
+        voice_audio_cache=cache,
+        client_greeting=None,
+        default_greeting="Алло, здравствуйте.",
+        prerecorded_path=audio_dir,
+        fallback_prerecorded_path=legacy_audio_path,
+    )
+
+    assert greeting == "Алло, здравствуйте."
+    assert resolved_audio_path == legacy_audio_path
     assert cache.calls == []
 
 

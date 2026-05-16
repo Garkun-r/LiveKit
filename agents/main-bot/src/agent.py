@@ -140,6 +140,7 @@ from config import (
     GOOGLE_TTS_VOICE_NAME,
     INCIDENT_ENVIRONMENT,
     INCIDENT_SLOW_RESPONSE_MS,
+    INCIDENT_TTS_TTFB_SLOW_MS,
     LIVEKIT_SELF_HOSTED,
     LLM_ATTEMPT_TIMEOUT_SEC,
     LLM_FALLBACK_FIRST_TOKEN_TIMEOUT_SEC,
@@ -229,6 +230,7 @@ from config import (
     TURN_ENDPOINTING_MODE,
     TURN_MAX_ENDPOINTING_DELAY,
     TURN_MIN_ENDPOINTING_DELAY,
+    TURN_PENDING_REPLY_MIN_INTERRUPTION_WORDS,
     USE_LIVEKIT_FALLBACK_ADAPTER,
     VERTEX_TTS_MIN_SENTENCE_LEN,
     VERTEX_TTS_STREAM_CONTEXT_LEN,
@@ -245,6 +247,9 @@ from config import (
     VOICE_CLIENT_SILENCE_STT_GRACE_SEC,
     VOICE_EMERGENCY_AUDIO_PATH,
     VOICE_EMERGENCY_PHRASE,
+    VOICE_FIRST_LLM_INTRO_AUDIO_PATH,
+    VOICE_FIRST_LLM_INTRO_DELAY_SEC,
+    VOICE_FIRST_LLM_INTRO_PHRASE,
     VOICE_INITIAL_GREETING_DELAY_SEC,
     VOICE_INITIAL_GREETING_PHRASE,
     VOICE_PRERECORDED_MIN_PLAYOUT_TIMEOUT_SEC,
@@ -320,11 +325,14 @@ load_dotenv(".env.local")
 _materialized_google_credentials_file: str | None = None
 
 _AUDIO_DIR = Path(__file__).resolve().parent.parent / "audio"
-_INITIAL_GREETING_AUDIO_PATH = _AUDIO_DIR / "1.wav"
+_PRERECORDED_AUDIO_EXTENSIONS = {".mp3", ".wav"}
+_INITIAL_GREETING_AUDIO_PATH = _AUDIO_DIR / "1"
+_LEGACY_INITIAL_GREETING_AUDIO_PATH = _AUDIO_DIR / "1.wav"
 _SHORT_GREETING_AUDIO_PATH = _AUDIO_DIR / "2.wav"
 _RESPONSE_DELAY_AUDIO_PATH = None
 _CLIENT_SILENCE_AUDIO_PATH = None
 _EMERGENCY_AUDIO_PATH = None
+_FIRST_LLM_INTRO_AUDIO_PATH = None
 _VOICE_AUDIO_CACHE_DIR = None
 _WARMUP_REQUEST_TIMEOUT_SEC = 4.0
 _PROMPT_CACHE_WARMUP_USER_TEXT = (
@@ -356,6 +364,7 @@ _SHORT_GREETING_RE = re.compile(
     r"^(?:алло|алло алло|ало|ало ало|алё|алё алё|але|але але|доброе утро|алло доброе утро|ало доброе утро|алё доброе утро|добрый день|алло добрый день|ало добрый день|алё добрый день|здравствуйте|да[,\s]+здравствуйте|да[,\s]+да[,\s]+здравствуйте|алло здравствуйте|ало здравствуйте|алё здравствуйте|девушка здравствуйте|алло девушка здравствуйте|здрасьте|здрасте|да[,\s]+(?:здрасьте|здрасте)|да[,\s]+да[,\s]+(?:здрасьте|здрасте)|алло здрасьте|ало здрасьте|алё здрасьте|девушка здрасьте|алло девушка здрасьте)[\.!\?, ]*$",
     re.IGNORECASE,
 )
+_INFORMATION_CHARS_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]")  # noqa: RUF001
 _AVITO_INTRO_RE = re.compile(
     r"(?=.*\bавито\b)"  # noqa: RUF001
     r"(?=.*\bзвон\w*\b)"  # noqa: RUF001
@@ -565,6 +574,9 @@ _CLIENT_SILENCE_AUDIO_PATHS = tuple(
     if path is not None
 )
 _EMERGENCY_AUDIO_PATH = resolve_configured_audio_path(VOICE_EMERGENCY_AUDIO_PATH)
+_FIRST_LLM_INTRO_AUDIO_PATH = resolve_configured_audio_path(
+    VOICE_FIRST_LLM_INTRO_AUDIO_PATH
+)
 _VOICE_AUDIO_CACHE_DIR = resolve_voice_audio_cache_dir(VOICE_AUDIO_CACHE_DIR)
 
 
@@ -669,6 +681,46 @@ def build_service_phrase_transcript_item(
         "source": source,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@dataclass
+class PrerecordedIntroPlaybackState:
+    first_frame_yielded: bool = False
+    canceled_before_first_frame: bool = False
+
+
+async def delayed_prerecorded_audio_frames(
+    audio_path: Path,
+    *,
+    sample_rate: int,
+    delay_sec: float,
+    cancel_check: Callable[[], bool] | None = None,
+    state: PrerecordedIntroPlaybackState | None = None,
+) -> AsyncIterator[rtc.AudioFrame]:
+    deadline = time.monotonic() + max(0.0, delay_sec)
+    while True:
+        if cancel_check is not None and cancel_check():
+            if state is not None:
+                state.canceled_before_first_frame = True
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(0.05, remaining))
+
+    if cancel_check is not None and cancel_check():
+        if state is not None:
+            state.canceled_before_first_frame = True
+        return
+
+    async for frame in audio_frames_from_file(
+        str(audio_path),
+        sample_rate=sample_rate,
+        num_channels=1,
+    ):
+        if state is not None:
+            state.first_frame_yielded = True
+        yield frame
 
 
 def extract_sip_call_numbers(participant: Any | None) -> dict[str, str | None]:
@@ -980,6 +1032,12 @@ def is_short_greeting_response(text: str | None) -> bool:
     return bool(_SHORT_GREETING_RE.fullmatch(normalized))
 
 
+def is_low_information_user_turn(text: str | None) -> bool:
+    if text is None:
+        return True
+    return len(_INFORMATION_CHARS_RE.findall(text)) <= 1
+
+
 def is_avito_intro_announcement(text: str | None) -> bool:
     if text is None:
         return False
@@ -996,8 +1054,30 @@ def is_avito_intro_announcement(text: str | None) -> bool:
     return bool(_AVITO_INTRO_RE.search(normalized))
 
 
-def _existing_prerecorded_audio_path(audio_path: Path) -> Path | None:
-    return audio_path if audio_path.exists() else None
+def _existing_prerecorded_audio_path(audio_path: Path | None) -> Path | None:
+    if audio_path is None or not audio_path.exists():
+        return None
+    if audio_path.is_file():
+        return audio_path
+    if not audio_path.is_dir():
+        return None
+
+    audio_files = sorted(
+        path
+        for path in audio_path.iterdir()
+        if path.is_file() and path.suffix.lower() in _PRERECORDED_AUDIO_EXTENSIONS
+    )
+    if not audio_files:
+        return None
+    return random.choice(audio_files)
+
+
+def _first_existing_prerecorded_audio_path(*audio_paths: Path | None) -> Path | None:
+    for audio_path in audio_paths:
+        existing_path = _existing_prerecorded_audio_path(audio_path)
+        if existing_path is not None:
+            return existing_path
+    return None
 
 
 async def resolve_short_greeting_audio_path(
@@ -1017,12 +1097,66 @@ async def resolve_short_greeting_audio_path(
     )
 
 
+def resolve_existing_first_llm_intro_audio_path(
+    *,
+    voice_audio_cache: VoiceAudioCache | None,
+    phrase: str,
+    prerecorded_path: Path | None,
+) -> Path | None:
+    existing_path = _existing_prerecorded_audio_path(prerecorded_path)
+    if existing_path is not None:
+        return existing_path
+    if voice_audio_cache is None:
+        return None
+    return voice_audio_cache.get_existing(
+        kind="first_llm_intro",
+        text=phrase,
+        legacy_path=prerecorded_path,
+        allow_legacy_any_profile=True,
+    )
+
+
+async def resolve_first_llm_intro_audio_path(
+    *,
+    voice_audio_cache: VoiceAudioCache | None,
+    phrase: str,
+    prerecorded_path: Path | None,
+) -> Path | None:
+    resolved_phrase = phrase.strip()
+    if not resolved_phrase:
+        return None
+    existing_path = _existing_prerecorded_audio_path(prerecorded_path)
+    if existing_path is not None:
+        return existing_path
+    if voice_audio_cache is None:
+        return None
+    return await voice_audio_cache.get_or_create(
+        kind="first_llm_intro",
+        text=resolved_phrase,
+        legacy_path=prerecorded_path,
+    )
+
+
+async def warmup_first_llm_intro_audio(
+    *,
+    voice_audio_cache: VoiceAudioCache | None,
+    phrase: str,
+    prerecorded_path: Path | None,
+) -> Path | None:
+    return await resolve_first_llm_intro_audio_path(
+        voice_audio_cache=voice_audio_cache,
+        phrase=phrase,
+        prerecorded_path=prerecorded_path,
+    )
+
+
 async def resolve_initial_greeting_audio(
     *,
     voice_audio_cache: VoiceAudioCache | None,
     client_greeting: str | None,
     default_greeting: str,
     prerecorded_path: Path,
+    fallback_prerecorded_path: Path | None = None,
 ) -> tuple[str, Path | None]:
     resolved_client_greeting = (client_greeting or "").strip()
     if resolved_client_greeting:
@@ -1036,7 +1170,10 @@ async def resolve_initial_greeting_audio(
     resolved_default_greeting = default_greeting.strip()
     return (
         resolved_default_greeting,
-        _existing_prerecorded_audio_path(prerecorded_path),
+        _first_existing_prerecorded_audio_path(
+            prerecorded_path,
+            fallback_prerecorded_path,
+        ),
     )
 
 
@@ -1076,6 +1213,82 @@ def should_log_slow_response_latency(
     if latency_ms is None or threshold_ms <= 0:
         return False
     return float(latency_ms) >= threshold_ms
+
+
+def metric_seconds_to_ms(value: Any) -> float | None:
+    try:
+        return round(float(value) * 1000, 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def should_log_tts_ttfb_slow(
+    ttfb_ms: int | float | None,
+    threshold_ms: int,
+) -> bool:
+    if ttfb_ms is None or threshold_ms <= 0:
+        return False
+    return float(ttfb_ms) >= threshold_ms
+
+
+def metric_metadata_value(metadata: Any, key: str) -> Any:
+    if isinstance(metadata, dict):
+        return metadata.get(key)
+    return getattr(metadata, key, None)
+
+
+def record_speech_canceled_before_first_audio_incident(
+    incident_log: IncidentLogger | None,
+    *,
+    speech_id: str | None,
+    phase: str,
+    speech_start_user_revision: int,
+    current_user_revision: int,
+    user_is_speaking: bool,
+    transcript: str | None,
+    min_words: int,
+) -> None:
+    if incident_log is None:
+        return
+    incident_log.record_nowait(
+        "speech_canceled_before_first_audio",
+        severity="warning",
+        component="voice_pipeline",
+        description="Assistant speech was canceled before first audio reached playback",
+        payload={
+            "speech_id": speech_id,
+            "phase": phase,
+            "speech_start_user_revision": speech_start_user_revision,
+            "current_user_revision": current_user_revision,
+            "user_is_speaking": user_is_speaking,
+            "transcript": transcript or None,
+            "transcript_word_count": interruption_word_count(transcript),
+            "pending_reply_guard_min_words": min_words,
+        },
+    )
+
+
+def interruption_word_count(text: str | None) -> int:
+    return len(tokenize.basic.split_words(text or "", split_character=True))
+
+
+def should_keep_pending_reply_for_short_interruption(
+    transcript: str | None,
+    *,
+    min_words: int,
+) -> bool:
+    return min_words > 0 and interruption_word_count(transcript) < min_words
+
+
+def resolve_pending_reply_min_interruption_words(turn_config: dict[str, Any]) -> int:
+    return max(
+        0,
+        _config_int(
+            turn_config,
+            "pending_reply_min_interruption_words",
+            TURN_PENDING_REPLY_MIN_INTERRUPTION_WORDS,
+        ),
+    )
 
 
 def resolve_audio_output_sample_rate(
@@ -4055,12 +4268,16 @@ class Assistant(Agent):
         first_turn_short_greeting_audio_path: Path = _SHORT_GREETING_AUDIO_PATH,
         first_turn_short_greeting_phrase: str = VOICE_SHORT_GREETING_PHRASE,
         first_turn_short_greeting_delay_sec: float = VOICE_SHORT_GREETING_DELAY_SEC,
+        first_llm_intro_audio_path: Path | None = _FIRST_LLM_INTRO_AUDIO_PATH,
+        first_llm_intro_phrase: str = VOICE_FIRST_LLM_INTRO_PHRASE,
+        first_llm_intro_delay_sec: float = VOICE_FIRST_LLM_INTRO_DELAY_SEC,
         prerecorded_audio_sample_rate: int = 24000,
         voice_audio_cache: VoiceAudioCache | None = None,
         voice_prompts: VoicePromptManager | None = None,
         tag_skill_runner: RobotSkillRunner | None = None,
         prompt: str | None = None,
         incident_logger: IncidentLogger | None = None,
+        record_service_phrase: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._model_router = model_router
         self._routed_llms = routed_llms or {}
@@ -4076,23 +4293,35 @@ class Assistant(Agent):
             0.0,
             first_turn_short_greeting_delay_sec,
         )
+        self._first_llm_intro_audio_path = first_llm_intro_audio_path
+        self._first_llm_intro_phrase = first_llm_intro_phrase.strip()
+        self._first_llm_intro_delay_sec = max(0.0, first_llm_intro_delay_sec)
         self._prerecorded_audio_sample_rate = prerecorded_audio_sample_rate
         self._voice_audio_cache = voice_audio_cache
         self._voice_prompts = voice_prompts
         self._tag_skill_runner = tag_skill_runner
         self._incident_logger = incident_logger
+        self._record_service_phrase = record_service_phrase
         self._awaiting_first_user_turn = True
+        self._first_llm_intro_pending = True
+        self._first_llm_intro_in_flight = False
+        self._first_llm_intro_played = False
+        self._first_llm_intro_missing_logged = False
+        self._first_llm_intro_watch_task: asyncio.Task | None = None
         self._initial_greeting_in_progress = False
         self._pending_avito_intro_replay = False
         self._initial_greeting_replay_text = VOICE_INITIAL_GREETING_PHRASE
-        self._initial_greeting_replay_audio_path = _existing_prerecorded_audio_path(
-            _INITIAL_GREETING_AUDIO_PATH
+        self._initial_greeting_replay_audio_path = _first_existing_prerecorded_audio_path(
+            _INITIAL_GREETING_AUDIO_PATH,
+            _LEGACY_INITIAL_GREETING_AUDIO_PATH,
         )
         self._llm_branch_started_at: dict[str, float] = {}
         self._tts_first_frame_ready_at: float | None = None
         self._tts_first_frame_yielded_at: float | None = None
         self._user_speech_revision = 0
         self._user_is_speaking = False
+        self._current_user_speech_transcript = ""
+        self._pending_reply_interruption_guard_min_words = 0
         self._speech_start_user_revisions: dict[str, int] = {}
         resolved_prompt = prompt if prompt is not None else get_active_prompt()
         super().__init__(instructions=resolved_prompt)
@@ -4116,9 +4345,22 @@ class Assistant(Agent):
     def note_user_started_speaking(self) -> None:
         self._user_speech_revision += 1
         self._user_is_speaking = True
+        self._current_user_speech_transcript = ""
 
     def note_user_finished_speaking(self) -> None:
         self._user_is_speaking = False
+
+    def note_user_transcribed(self, transcript: str, *, is_final: bool) -> None:
+        if is_final or len(transcript) >= len(self._current_user_speech_transcript):
+            self._current_user_speech_transcript = transcript
+
+    def set_pending_reply_interruption_guard(
+        self,
+        *,
+        active: bool,
+        min_words: int,
+    ) -> None:
+        self._pending_reply_interruption_guard_min_words = min_words if active else 0
 
     def _current_speech_handle(self) -> Any | None:
         try:
@@ -4153,6 +4395,213 @@ class Assistant(Agent):
             user_is_speaking=self._user_is_speaking,
         )
 
+    def first_llm_intro_blocks_response_delay(self) -> bool:
+        return self._first_llm_intro_in_flight
+
+    def _first_llm_intro_audio_path_if_available(self) -> Path | None:
+        return resolve_existing_first_llm_intro_audio_path(
+            voice_audio_cache=self._voice_audio_cache,
+            phrase=self._first_llm_intro_phrase,
+            prerecorded_path=self._first_llm_intro_audio_path,
+        )
+
+    def _should_inject_first_llm_intro_context(self) -> bool:
+        if self._first_llm_intro_played:
+            return False
+        if not self._first_llm_intro_phrase:
+            return False
+        return self._first_llm_intro_pending or self._first_llm_intro_in_flight
+
+    def _inject_first_llm_intro_context(self, chat_ctx: Any) -> None:
+        if not self._should_inject_first_llm_intro_context():
+            return
+        with suppress(Exception):
+            chat_ctx.add_message(
+                role="system",
+                content=(
+                    "<first_llm_intro_continuation>\n"
+                    "Голосовой слой уже произносит перед твоим ответом фразу: "
+                    f"«{self._first_llm_intro_phrase}»\n"
+                    "Сгенерируй только естественное продолжение после этой фразы. "
+                    "Не повторяй эту фразу, не здоровайся, не говори заново "  # noqa: RUF001
+                    "«я на связи» или «я вас слушаю». Сразу ответь на последний "
+                    "вопрос клиента так, чтобы твой текст звучал как одна связная "
+                    "реплика после уже произнесенного самопредставления.\n"
+                    "</first_llm_intro_continuation>"
+                ),
+                extra={"service_phrase_kind": "first_llm_intro"},
+            )
+
+    def _record_first_llm_intro_service_phrase(self) -> None:
+        transcript_item = build_service_phrase_transcript_item(
+            text=self._first_llm_intro_phrase,
+            kind="first_llm_intro",
+            source="prerecorded_audio",
+        )
+        if transcript_item is not None and self._record_service_phrase is not None:
+            self._record_service_phrase(transcript_item)
+
+    async def _add_first_llm_intro_to_chat_history(self) -> None:
+        if not self._first_llm_intro_phrase:
+            return
+        chat_ctx = self.chat_ctx.copy()
+        chat_ctx.add_message(
+            role="assistant",
+            content=self._first_llm_intro_phrase,
+            extra={"service_phrase_kind": "first_llm_intro"},
+        )
+        await self.update_chat_ctx(chat_ctx)
+
+    async def _schedule_first_llm_intro_if_needed(self) -> bool:
+        if (
+            not self._first_llm_intro_pending
+            or self._first_llm_intro_in_flight
+            or not self._first_llm_intro_phrase
+        ):
+            return False
+
+        self._first_llm_intro_in_flight = True
+        revision = self._user_speech_revision
+        try:
+            audio_path = await resolve_first_llm_intro_audio_path(
+                voice_audio_cache=self._voice_audio_cache,
+                phrase=self._first_llm_intro_phrase,
+                prerecorded_path=self._first_llm_intro_audio_path,
+            )
+        except Exception as e:
+            self._first_llm_intro_in_flight = False
+            logger.exception("first LLM intro audio preparation failed: %s", e)
+            return False
+
+        if audio_path is None:
+            self._first_llm_intro_in_flight = False
+            if not self._first_llm_intro_missing_logged:
+                logger.warning(
+                    "first LLM intro audio is not available; skipping prerecorded intro",
+                    extra={
+                        "kind": "first_llm_intro",
+                        "audio_path": str(self._first_llm_intro_audio_path)
+                        if self._first_llm_intro_audio_path is not None
+                        else None,
+                        "phrase_len": len(self._first_llm_intro_phrase),
+                    },
+                )
+                self._first_llm_intro_missing_logged = True
+            return False
+
+        if self._user_spoke_since(revision):
+            self._first_llm_intro_in_flight = False
+            logger.info(
+                "first LLM intro canceled before scheduling because user started speaking",
+                extra={
+                    "speech_start_user_revision": revision,
+                    "current_user_revision": self._user_speech_revision,
+                    "user_is_speaking": self._user_is_speaking,
+                },
+            )
+            return False
+
+        if self._voice_prompts is not None:
+            self._voice_prompts.cancel_response_delay_timer()
+
+        playback_state = PrerecordedIntroPlaybackState()
+        try:
+            handle = self.session.say(
+                self._first_llm_intro_phrase,
+                audio=delayed_prerecorded_audio_frames(
+                    audio_path,
+                    sample_rate=self._prerecorded_audio_sample_rate,
+                    delay_sec=self._first_llm_intro_delay_sec,
+                    cancel_check=lambda: self._user_spoke_since(revision),
+                    state=playback_state,
+                ),
+                allow_interruptions=True,
+                add_to_chat_ctx=False,
+            )
+        except Exception:
+            self._first_llm_intro_in_flight = False
+            raise
+        self._first_llm_intro_pending = False
+        logger.info(
+            "first LLM intro scheduled before generated reply",
+            extra={
+                "speech_id": speech_handle_id(handle),
+                "audio_path": str(audio_path),
+                "delay_sec": self._first_llm_intro_delay_sec,
+                "speech_start_user_revision": revision,
+            },
+        )
+        self._first_llm_intro_watch_task = asyncio.create_task(
+            self._watch_first_llm_intro_playout(
+                handle,
+                playback_state=playback_state,
+                speech_start_revision=revision,
+                audio_path=audio_path,
+            ),
+            name="first_llm_intro_playout",
+        )
+        return True
+
+    async def _watch_first_llm_intro_playout(
+        self,
+        handle: Any,
+        *,
+        playback_state: PrerecordedIntroPlaybackState,
+        speech_start_revision: int,
+        audio_path: Path,
+    ) -> None:
+        try:
+            played = await wait_for_speech_playout(
+                handle,
+                kind="first_llm_intro",
+                log_label="first LLM intro",
+                timeout_sec=prerecorded_playout_timeout_sec(
+                    audio_path=audio_path,
+                    default_timeout_sec=VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
+                )
+                + self._first_llm_intro_delay_sec,
+                incident_log=self._incident_logger,
+                payload={
+                    "audio_path": str(audio_path),
+                    "delay_sec": self._first_llm_intro_delay_sec,
+                    "speech_start_user_revision": speech_start_revision,
+                },
+            )
+            interrupted = bool(getattr(handle, "interrupted", False))
+            if played and playback_state.first_frame_yielded and not interrupted:
+                self._first_llm_intro_played = True
+                self._record_first_llm_intro_service_phrase()
+                with suppress(Exception):
+                    await self._add_first_llm_intro_to_chat_history()
+                return
+
+            self._first_llm_intro_pending = True
+            if playback_state.canceled_before_first_frame:
+                reason = "canceled_before_first_frame"
+            elif interrupted:
+                reason = "interrupted"
+            else:
+                reason = "not_played"
+            logger.info(
+                "first LLM intro did not complete; keeping intro pending",
+                extra={
+                    "reason": reason,
+                    "played": played,
+                    "first_frame_yielded": playback_state.first_frame_yielded,
+                    "speech_start_user_revision": speech_start_revision,
+                    "current_user_revision": self._user_speech_revision,
+                    "user_is_speaking": self._user_is_speaking,
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("first LLM intro playout tracking failed: %s", e)
+        finally:
+            self._first_llm_intro_in_flight = False
+            if self._voice_prompts is not None and self._first_llm_intro_played:
+                self._voice_prompts.start_response_delay_timer()
+
     def _cancel_current_speech_before_audio(
         self,
         *,
@@ -4161,6 +4610,27 @@ class Assistant(Agent):
         phase: str,
     ) -> bool:
         if not self._user_spoke_since(started_revision):
+            return False
+
+        if should_keep_pending_reply_for_short_interruption(
+            self._current_user_speech_transcript,
+            min_words=self._pending_reply_interruption_guard_min_words,
+        ):
+            logger.info(
+                "assistant pending reply kept despite short user speech",
+                extra={
+                    "speech_id": speech_id,
+                    "phase": phase,
+                    "transcript": self._current_user_speech_transcript or None,
+                    "transcript_word_count": interruption_word_count(
+                        self._current_user_speech_transcript
+                    ),
+                    "min_words": self._pending_reply_interruption_guard_min_words,
+                    "speech_start_user_revision": started_revision,
+                    "current_user_revision": self._user_speech_revision,
+                    "user_is_speaking": self._user_is_speaking,
+                },
+            )
             return False
 
         handle = self._current_speech_handle()
@@ -4176,6 +4646,16 @@ class Assistant(Agent):
                 "current_user_revision": self._user_speech_revision,
                 "user_is_speaking": self._user_is_speaking,
             },
+        )
+        record_speech_canceled_before_first_audio_incident(
+            self._incident_logger,
+            speech_id=speech_id,
+            phase=phase,
+            speech_start_user_revision=started_revision,
+            current_user_revision=self._user_speech_revision,
+            user_is_speaking=self._user_is_speaking,
+            transcript=self._current_user_speech_transcript,
+            min_words=self._pending_reply_interruption_guard_min_words,
         )
         if handle is not None:
             with suppress(Exception):
@@ -4265,86 +4745,102 @@ class Assistant(Agent):
         )
 
     async def on_user_turn_completed(self, _: Any, new_message: ChatMessage) -> None:
-        if not self._awaiting_first_user_turn:
-            return
-
         user_text = (getattr(new_message, "text_content", None) or "").strip()
         if not user_text:
             return
 
-        if is_avito_intro_announcement(user_text):
-            if self._initial_greeting_in_progress:
-                self._pending_avito_intro_replay = True
-                logger.info("avito intro matched during initial greeting; replay queued")
+        if self._awaiting_first_user_turn:
+            if is_avito_intro_announcement(user_text):
+                if self._initial_greeting_in_progress:
+                    self._pending_avito_intro_replay = True
+                    logger.info("avito intro matched during initial greeting; replay queued")
+                    raise StopResponse()
+
+                await self._play_avito_initial_greeting_replay()
                 raise StopResponse()
 
-            await self._play_avito_initial_greeting_replay()
-            raise StopResponse()
+            if self._initial_greeting_in_progress:
+                logger.info("user turn ignored while initial greeting is playing")
+                raise StopResponse()
 
-        if self._initial_greeting_in_progress:
-            logger.info("user turn ignored while initial greeting is playing")
-            raise StopResponse()
-
-        self._awaiting_first_user_turn = False
-        if not is_short_greeting_response(user_text):
-            return
-
-        short_greeting_revision = self._user_speech_revision
-        if self._first_turn_short_greeting_delay_sec > 0:
-            logger.info(
-                "first user turn matched short greeting regex; waiting before prerecorded follow-up audio",
-                extra={
-                    "delay_sec": self._first_turn_short_greeting_delay_sec,
-                    "speech_start_user_revision": short_greeting_revision,
-                },
-            )
-            await wait_for_short_greeting_delay(
-                self._first_turn_short_greeting_delay_sec
-            )
-            if self._user_spoke_since(short_greeting_revision):
+            if self._first_llm_intro_pending and is_low_information_user_turn(user_text):
                 logger.info(
-                    "short greeting follow-up canceled because user started speaking",
-                    extra={
-                        "speech_start_user_revision": short_greeting_revision,
-                        "current_user_revision": self._user_speech_revision,
-                        "user_is_speaking": self._user_is_speaking,
-                    },
+                    "first LLM intro kept pending for low-information user turn",
+                    extra={"text_len": len(user_text)},
                 )
                 raise StopResponse()
 
-        logger.info(
-            "first user turn matched short greeting regex; playing prerecorded follow-up audio"
-        )
-        with suppress(Exception):
-            await self.session.interrupt(force=True)
+            self._awaiting_first_user_turn = False
+            if is_short_greeting_response(user_text):
+                short_greeting_revision = self._user_speech_revision
+                if self._first_turn_short_greeting_delay_sec > 0:
+                    logger.info(
+                        "first user turn matched short greeting regex; waiting before prerecorded follow-up audio",
+                        extra={
+                            "delay_sec": self._first_turn_short_greeting_delay_sec,
+                            "speech_start_user_revision": short_greeting_revision,
+                        },
+                    )
+                    await wait_for_short_greeting_delay(
+                        self._first_turn_short_greeting_delay_sec
+                    )
+                    if self._user_spoke_since(short_greeting_revision):
+                        logger.info(
+                            "short greeting follow-up canceled because user started speaking",
+                            extra={
+                                "speech_start_user_revision": short_greeting_revision,
+                                "current_user_revision": self._user_speech_revision,
+                                "user_is_speaking": self._user_is_speaking,
+                            },
+                        )
+                        raise StopResponse()
 
-        audio_path = await resolve_short_greeting_audio_path(
-            voice_audio_cache=self._voice_audio_cache,
-            phrase=self._first_turn_short_greeting_phrase,
-            prerecorded_path=self._first_turn_short_greeting_audio_path,
-        )
-        if audio_path is None:
-            return
-        if self._user_spoke_since(short_greeting_revision):
+                logger.info(
+                    "first user turn matched short greeting regex; playing prerecorded follow-up audio"
+                )
+                with suppress(Exception):
+                    await self.session.interrupt(force=True)
+
+                audio_path = await resolve_short_greeting_audio_path(
+                    voice_audio_cache=self._voice_audio_cache,
+                    phrase=self._first_turn_short_greeting_phrase,
+                    prerecorded_path=self._first_turn_short_greeting_audio_path,
+                )
+                if audio_path is None:
+                    return
+                if self._user_spoke_since(short_greeting_revision):
+                    logger.info(
+                        "short greeting follow-up canceled before playback because user started speaking",
+                        extra={
+                            "speech_start_user_revision": short_greeting_revision,
+                            "current_user_revision": self._user_speech_revision,
+                            "user_is_speaking": self._user_is_speaking,
+                        },
+                    )
+                    raise StopResponse()
+
+                played = await play_prerecorded_audio(
+                    session=self.session,
+                    audio_path=audio_path,
+                    sample_rate=self._prerecorded_audio_sample_rate,
+                    allow_interruptions=True,
+                    add_to_chat_ctx=False,
+                    text=self._first_turn_short_greeting_phrase,
+                )
+                if played:
+                    raise StopResponse()
+                return
+
+        if self._first_llm_intro_pending and is_low_information_user_turn(user_text):
             logger.info(
-                "short greeting follow-up canceled before playback because user started speaking",
-                extra={
-                    "speech_start_user_revision": short_greeting_revision,
-                    "current_user_revision": self._user_speech_revision,
-                    "user_is_speaking": self._user_is_speaking,
-                },
+                "first LLM intro kept pending for low-information user turn",
+                extra={"text_len": len(user_text)},
             )
             raise StopResponse()
 
-        played = await play_prerecorded_audio(
-            session=self.session,
-            audio_path=audio_path,
-            sample_rate=self._prerecorded_audio_sample_rate,
-            allow_interruptions=True,
-            add_to_chat_ctx=False,
-            text=self._first_turn_short_greeting_phrase,
-        )
-        if played:
+        first_llm_intro_revision = self._user_speech_revision
+        await self._schedule_first_llm_intro_if_needed()
+        if self._user_spoke_since(first_llm_intro_revision):
             raise StopResponse()
 
     async def tts_node(
@@ -4753,6 +5249,7 @@ class Assistant(Agent):
         timeout/fallback behavior; the legacy manual retry path stays available
         behind USE_LIVEKIT_FALLBACK_ADAPTER=false.
         """
+        self._inject_first_llm_intro_context(chat_ctx)
         activity = self._get_activity_or_raise()
         primary_llm = activity.llm
         primary_provider = LLM_PROVIDER
@@ -5089,6 +5586,7 @@ async def my_agent(ctx: JobContext):
     export_task: asyncio.Task | None = None
     session_close_task: asyncio.Task | None = None
     runtime_warmup_task: asyncio.Task | None = None
+    first_llm_intro_audio_warmup_task: asyncio.Task | None = None
     unrecoverable_error_task: asyncio.Task | None = None
     unrecoverable_error_response_started = False
     startup_dialog_activity_seen = False
@@ -5108,12 +5606,13 @@ async def my_agent(ctx: JobContext):
         "sip_call_id": None,
     }
     participant = None
-    participant_missing_before_settings = False
     client_disconnect_context: dict[str, Any] = {}
     participant_disconnect_cleanup_handler: Callable[
         [rtc.RemoteParticipant], None
     ] | None = None
     robot_settings: ResolvedRobotSettings | None = None
+    external_http_sessions: list[aiohttp.ClientSession] = []
+    audio_output_sample_rate = resolve_audio_output_sample_rate(None)
     recording_handle = None
     recording_stop_requested = False
     raw_log_sink = RawCallLogSink(
@@ -5127,6 +5626,123 @@ async def my_agent(ctx: JobContext):
     await raw_log_sink.start()
     logger.info("raw call log capture started")
 
+    async def export_no_sip_participant_session(timeout_sec: float) -> None:
+        ended_at = datetime.now(timezone.utc)
+        payload = {
+            "agent_name": AGENT_NAME,
+            "room_name": ctx.room.name,
+            "client_id": None,
+            "started_at": session_started_at.isoformat(),
+            "ended_at": ended_at.isoformat(),
+            "duration_sec": (ended_at - session_started_at).total_seconds(),
+            "close": close_info,
+            "sip": {
+                **sip_call_numbers,
+                "trace_id": sip_diagnostic_context.get("trace_id"),
+                "sip_call_id": sip_diagnostic_context.get("sip_call_id"),
+                "prompt_source": prompt_resolution.source,
+                "prompt_lookup_error": prompt_resolution.error,
+            },
+            "transcript_items": transcript_items,
+            "tag_events": tag_events,
+            "usage_updates": usage_updates,
+            "metrics_events": metrics_events,
+            "component_metrics_events": component_metrics_events,
+            "summary": {
+                "transcript_count": len(transcript_items),
+                "tag_event_count": len(tag_events),
+                "usage_update_count": len(usage_updates),
+                "metrics_count": len(metrics_events),
+                "component_metrics_count": len(component_metrics_events),
+            },
+        }
+
+        logger.info("sending no-participant session data to n8n")
+        with suppress(Exception):
+            await raw_log_sink.flush_once()
+        try:
+            await asyncio.wait_for(send_session_to_n8n(payload), timeout=timeout_sec)
+            logger.info("no-participant session data sent to n8n")
+        except asyncio.TimeoutError:
+            logger.warning("n8n export timed out after %ss", timeout_sec)
+            incident_log.record_nowait(
+                "n8n_export_failed",
+                severity="warning",
+                component="n8n_export",
+                latency_ms=timeout_sec * 1000,
+                error_type="TimeoutError",
+                description="n8n session export timed out",
+                payload={"timeout_sec": timeout_sec, "phase": "no_sip_participant"},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("n8n export failed: %s", e)
+            incident_log.record_exception_nowait(
+                "n8n_export_failed",
+                e,
+                severity="warning",
+                component="n8n_export",
+                description="n8n session export failed",
+                payload={"phase": "no_sip_participant"},
+            )
+
+    async def close_before_settings_without_sip_participant() -> None:
+        nonlocal prompt_resolution
+        close_info["reason"] = "sip_participant_not_ready"
+        prompt_resolution = PromptResolution(
+            prompt="",
+            source="file:no_sip_trunk_number",
+        )
+        logger.warning(
+            "closing room before prompt/settings lookup because SIP participant was not resolved",
+            extra={"timeout_sec": VOICE_SIP_PARTICIPANT_WAIT_TIMEOUT_SEC},
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(ctx.delete_room(ctx.room.name)),
+                timeout=3.0,
+            )
+            logger.info(
+                "room delete completed",
+                extra={
+                    "room": ctx.room.name,
+                    "reason": "sip_participant_not_ready",
+                    "close_reason": "sip_participant_not_ready",
+                },
+            )
+        except asyncio.TimeoutError:
+            logger.warning("delete_room timed out before settings lookup")
+            incident_log.record_nowait(
+                "abnormal_close",
+                severity="warning",
+                component="livekit_room",
+                error_type="TimeoutError",
+                description="delete_room timed out before settings lookup",
+                payload={
+                    "reason": "sip_participant_not_ready",
+                    "room": ctx.room.name,
+                },
+            )
+        except Exception as e:
+            close_info["reason"] = "sip_participant_not_ready_delete_failed"
+            logger.exception("failed to delete room before settings lookup: %s", e)
+            incident_log.record_exception_nowait(
+                "abnormal_close",
+                e,
+                severity="warning",
+                component="livekit_room",
+                description="delete_room failed before settings lookup",
+                payload={
+                    "reason": "sip_participant_not_ready",
+                    "room": ctx.room.name,
+                },
+            )
+        finally:
+            close_event.set()
+
+        await export_no_sip_participant_session(timeout_sec=export_wait_sec)
+
     try:
         await ctx.connect()
         try:
@@ -5135,7 +5751,6 @@ async def my_agent(ctx: JobContext):
                 timeout=VOICE_SIP_PARTICIPANT_WAIT_TIMEOUT_SEC,
             )
         except asyncio.TimeoutError:
-            participant_missing_before_settings = True
             logger.warning(
                 "sip participant not available before prompt/settings lookup",
                 extra={"timeout_sec": VOICE_SIP_PARTICIPANT_WAIT_TIMEOUT_SEC},
@@ -5152,6 +5767,13 @@ async def my_agent(ctx: JobContext):
                     "phase": "before_settings_lookup",
                 },
             )
+            try:
+                await close_before_settings_without_sip_participant()
+            finally:
+                await incident_log.drain(timeout_sec=1.0)
+                reset_raw_call_log_sink(raw_log_token)
+                await raw_log_sink.close(timeout_sec=3.0)
+            return
 
         sip_call_numbers = extract_sip_call_numbers(participant)
         sip_diagnostic_context = extract_sip_diagnostic_context(participant)
@@ -5166,25 +5788,6 @@ async def my_agent(ctx: JobContext):
             did=sip_call_numbers["sip_trunk_number"],
             runtime_key=ROBOT_RUNTIME_PROFILE,
         )
-        try:
-            recording_handle = await start_room_recording(ctx.room.name)
-            if recording_handle:
-                logger.info(
-                    "room recording started",
-                    extra={
-                        "egress_id": recording_handle.egress_id,
-                        "object_key": recording_handle.object_key,
-                    },
-                )
-        except Exception as e:
-            logger.warning("failed to start room recording: %s", e)
-            incident_log.record_exception_nowait(
-                "call_recording_failed",
-                e,
-                severity="warning",
-                component="livekit_egress",
-                description="Failed to start LiveKit room recording",
-            )
         logger.info(
             "robot settings resolved",
             extra={
@@ -5218,6 +5821,56 @@ async def my_agent(ctx: JobContext):
             },
         )
         raise
+
+    audio_output_sample_rate = resolve_audio_output_sample_rate(
+        robot_settings.tts_primary if robot_settings else None
+    )
+    try:
+        tts_client = build_tts(
+            external_http_sessions=external_http_sessions,
+            tts_profile=robot_settings.tts_primary if robot_settings else None,
+            backup_tts_profile=robot_settings.component("tts", "backup")
+            if robot_settings
+            else None,
+            fallback_sample_rate=audio_output_sample_rate,
+        )
+        schedule_tts_prepare(tts_client, reason="dialog_start")
+    except Exception as e:
+        await incident_log.record_exception(
+            "session_start_failed",
+            e,
+            severity="critical",
+            component="pipeline",
+            description="Failed to build TTS pipeline before session start",
+            payload={
+                "phase": "build_tts",
+                "tts_provider": _component_provider(
+                    robot_settings.tts_primary if robot_settings else None,
+                    TTS_PROVIDER,
+                ),
+            },
+        )
+        raise
+
+    try:
+        recording_handle = await start_room_recording(ctx.room.name)
+        if recording_handle:
+            logger.info(
+                "room recording started",
+                extra={
+                    "egress_id": recording_handle.egress_id,
+                    "object_key": recording_handle.object_key,
+                },
+            )
+    except Exception as e:
+        logger.warning("failed to start room recording: %s", e)
+        incident_log.record_exception_nowait(
+            "call_recording_failed",
+            e,
+            severity="warning",
+            component="livekit_egress",
+            description="Failed to start LiveKit room recording",
+        )
 
     model_router: ModelRouter | None = None
     routed_llms: dict[str, Any] = {}
@@ -5406,24 +6059,15 @@ async def my_agent(ctx: JobContext):
         "preemptive_generation",
         PREEMPTIVE_GENERATION,
     )
-
-    audio_output_sample_rate = resolve_audio_output_sample_rate(
-        robot_settings.tts_primary if robot_settings else None
+    pending_reply_min_interruption_words = (
+        resolve_pending_reply_min_interruption_words(turn_config)
     )
-    external_http_sessions: list[aiohttp.ClientSession] = []
+
     try:
         stt_client = build_stt(
             external_http_sessions=external_http_sessions,
             stt_profile=robot_settings.stt_primary if robot_settings else None,
             turn_profile=turn_profile,
-        )
-        tts_client = build_tts(
-            external_http_sessions=external_http_sessions,
-            tts_profile=robot_settings.tts_primary if robot_settings else None,
-            backup_tts_profile=robot_settings.component("tts", "backup")
-            if robot_settings
-            else None,
-            fallback_sample_rate=audio_output_sample_rate,
         )
     except Exception as e:
         await incident_log.record_exception(
@@ -5431,16 +6075,12 @@ async def my_agent(ctx: JobContext):
             e,
             severity="critical",
             component="pipeline",
-            description="Failed to build STT/TTS pipeline before session start",
+            description="Failed to build STT pipeline before session start",
             payload={
-                "phase": "build_stt_tts",
+                "phase": "build_stt",
                 "stt_provider": _component_provider(
                     robot_settings.stt_primary if robot_settings else None,
                     STT_PROVIDER,
-                ),
-                "tts_provider": _component_provider(
-                    robot_settings.tts_primary if robot_settings else None,
-                    TTS_PROVIDER,
                 ),
             },
         )
@@ -5539,6 +6179,56 @@ async def my_agent(ctx: JobContext):
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=preemptive_generation,
     )
+    base_interruption_min_words = max(
+        0,
+        int(session.options.interruption.get("min_words", 0) or 0),
+    )
+    pending_reply_guard_speech_ids: set[str] = set()
+    pending_reply_guard_user_speaking = False
+
+    def set_session_interruption_min_words(value: int, *, reason: str) -> None:
+        value = max(0, value)
+        current = int(session.options.interruption.get("min_words", 0) or 0)
+        if current == value:
+            return
+        session.options.interruption["min_words"] = value
+        logger.info(
+            "session interruption min_words updated",
+            extra={"min_words": value, "reason": reason},
+        )
+
+    def enable_pending_reply_interruption_guard(
+        *,
+        speech_id: str | None,
+        reason: str,
+    ) -> None:
+        nonlocal pending_reply_guard_user_speaking
+        if pending_reply_min_interruption_words <= base_interruption_min_words:
+            return
+        if speech_id:
+            pending_reply_guard_speech_ids.add(speech_id)
+        pending_reply_guard_user_speaking = assistant._user_is_speaking
+        assistant.set_pending_reply_interruption_guard(
+            active=True,
+            min_words=pending_reply_min_interruption_words,
+        )
+        set_session_interruption_min_words(
+            pending_reply_min_interruption_words,
+            reason=reason,
+        )
+
+    def disable_pending_reply_interruption_guard(*, reason: str) -> None:
+        nonlocal pending_reply_guard_user_speaking
+        pending_reply_guard_speech_ids.clear()
+        pending_reply_guard_user_speaking = False
+        assistant.set_pending_reply_interruption_guard(
+            active=False,
+            min_words=base_interruption_min_words,
+        )
+        set_session_interruption_min_words(
+            base_interruption_min_words,
+            reason=reason,
+        )
     background_audio = BackgroundAudioPlayer()
 
     async def on_client_silence_timeout() -> None:
@@ -5558,6 +6248,7 @@ async def my_agent(ctx: JobContext):
             kind="response_delay",
             audio_paths=_RESPONSE_DELAY_AUDIO_PATHS,
             phrase=VOICE_RESPONSE_DELAY_PHRASE,
+            prefer_prerecorded=True,
         ),
         client_silence_prompt=VoicePromptSpec(
             kind="client_silence",
@@ -5578,6 +6269,16 @@ async def my_agent(ctx: JobContext):
         client_disconnect_info=client_disconnect_info,
         speech_playout_timeout_sec=VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
         incident_log=incident_log,
+    )
+    directus_first_llm_intro = (prompt_resolution.llm_intro or "").strip()
+    first_llm_intro_phrase = directus_first_llm_intro or VOICE_FIRST_LLM_INTRO_PHRASE
+    first_llm_intro_audio_path = (
+        None if directus_first_llm_intro else _FIRST_LLM_INTRO_AUDIO_PATH
+    )
+    first_llm_intro_source = (
+        "directus:bot_configurations.llm_intro"
+        if directus_first_llm_intro
+        else "env:VOICE_FIRST_LLM_INTRO_PHRASE"
     )
 
     def on_linked_participant_disconnected(
@@ -5650,7 +6351,12 @@ async def my_agent(ctx: JobContext):
             "turn_endpointing_mode": endpointing_mode,
             "turn_min_endpointing_delay": min_endpointing_delay,
             "turn_max_endpointing_delay": max_endpointing_delay,
+            "turn_pending_reply_min_interruption_words": (
+                pending_reply_min_interruption_words
+            ),
             "reply_watchdog_sec": REPLY_WATCHDOG_SEC,
+            "incident_slow_response_ms": INCIDENT_SLOW_RESPONSE_MS,
+            "incident_tts_ttfb_slow_ms": INCIDENT_TTS_TTFB_SLOW_MS,
             "stt_early_interim_final_enabled": _config_bool(
                 turn_config,
                 "early_interim_final_enabled",
@@ -5663,6 +6369,12 @@ async def my_agent(ctx: JobContext):
             ),
             "stt_early_interim_final_min_stable_interims": STT_EARLY_INTERIM_FINAL_MIN_STABLE_INTERIMS,
             "voice_initial_greeting_delay_sec": VOICE_INITIAL_GREETING_DELAY_SEC,
+            "voice_first_llm_intro_delay_sec": VOICE_FIRST_LLM_INTRO_DELAY_SEC,
+            "voice_first_llm_intro_source": first_llm_intro_source,
+            "voice_first_llm_intro_text_len": len(first_llm_intro_phrase),
+            "voice_first_llm_intro_audio_path": str(first_llm_intro_audio_path)
+            if first_llm_intro_audio_path
+            else None,
             "voice_speech_playout_timeout_sec": VOICE_SPEECH_PLAYOUT_TIMEOUT_SEC,
             "voice_sip_participant_wait_timeout_sec": (
                 VOICE_SIP_PARTICIPANT_WAIT_TIMEOUT_SEC
@@ -5698,6 +6410,8 @@ async def my_agent(ctx: JobContext):
 
     def maybe_start_response_delay_timer() -> None:
         nonlocal response_delay_started_for_turn
+        if assistant.first_llm_intro_blocks_response_delay():
+            return
         if not should_start_response_delay_after_vad(
             has_final_transcript=response_delay_has_final_transcript,
             user_stopped_speaking=response_delay_user_stopped_speaking,
@@ -5859,16 +6573,33 @@ async def my_agent(ctx: JobContext):
                     "allow_interruptions": getattr(handle, "allow_interruptions", None),
                 },
             )
+            speech_id = speech_handle_id(handle)
+            if (
+                source == "generate_reply"
+                and getattr(ev, "user_initiated", None) is True
+                and bool(getattr(handle, "allow_interruptions", True))
+            ):
+                enable_pending_reply_interruption_guard(
+                    speech_id=speech_id,
+                    reason="pending_reply_created",
+                )
             if handle is not None and hasattr(handle, "add_done_callback"):
 
                 def _on_speech_done(done_handle: Any) -> None:
                     with suppress(Exception):
+                        done_speech_id = speech_handle_id(done_handle)
+                        if done_speech_id:
+                            pending_reply_guard_speech_ids.discard(done_speech_id)
+                        if not pending_reply_guard_speech_ids:
+                            disable_pending_reply_interruption_guard(
+                                reason="pending_reply_done",
+                            )
                         logger.info(
                             "speech completed",
                             extra={
                                 "source": source,
                                 "user_initiated": getattr(ev, "user_initiated", None),
-                                "speech_id": speech_handle_id(done_handle),
+                                "speech_id": done_speech_id,
                                 "interrupted": getattr(done_handle, "interrupted", None),
                                 "allow_interruptions": getattr(
                                     done_handle,
@@ -5975,6 +6706,7 @@ async def my_agent(ctx: JobContext):
             transcript = (raw_transcript or "").strip()
             is_final = bool(getattr(ev, "is_final", False))
             if transcript:
+                assistant.note_user_transcribed(transcript, is_final=is_final)
                 transcript_at = event_timestamp_seconds(ev, default=time.time())
                 if is_final:
                     vad_speech_final_count += 1
@@ -6050,6 +6782,7 @@ async def my_agent(ctx: JobContext):
         nonlocal vad_speech_id, vad_speech_started_at, vad_speech_ended_at
         nonlocal vad_speech_transcript, vad_speech_interim_count
         nonlocal vad_speech_final_count
+        nonlocal pending_reply_guard_user_speaking
         try:
             old_state = getattr(ev, "old_state", None)
             new_state = getattr(ev, "new_state", None)
@@ -6095,6 +6828,8 @@ async def my_agent(ctx: JobContext):
                 )
                 if callable(notify_local_start_of_speech):
                     notify_local_start_of_speech(started_at=started_at)
+                if pending_reply_guard_speech_ids:
+                    pending_reply_guard_user_speaking = True
                 schedule_tts_prepare(tts_client, reason="user_speaking")
                 voice_prompts.on_user_started_speaking()
                 return
@@ -6130,6 +6865,12 @@ async def my_agent(ctx: JobContext):
                 if callable(notify_local_end_of_speech):
                     notify_local_end_of_speech(ended_at=ended_at)
                 assistant.note_user_finished_speaking()
+                if pending_reply_guard_user_speaking:
+                    pending_reply_guard_user_speaking = False
+                    if session.agent_state == "speaking":
+                        disable_pending_reply_interruption_guard(
+                            reason="guarded_user_speech_finished",
+                        )
                 response_delay_user_stopped_speaking = True
                 maybe_start_response_delay_timer()
                 voice_prompts.on_user_finished_speaking()
@@ -6175,6 +6916,10 @@ async def my_agent(ctx: JobContext):
                 )
                 voice_prompts.cancel_client_silence_timer()
             if new_state == "speaking":
+                if pending_reply_guard_speech_ids and not pending_reply_guard_user_speaking:
+                    disable_pending_reply_interruption_guard(
+                        reason="assistant_started_speaking",
+                    )
                 agent_speaking_revision += 1
                 tts_first_frame_ready_at = assistant._tts_first_frame_ready_at
                 tts_first_frame_yielded_at = assistant._tts_first_frame_yielded_at
@@ -6294,7 +7039,8 @@ async def my_agent(ctx: JobContext):
         try:
             metrics = getattr(ev, "metrics", None)
             metrics_events.append(safe_dump(metrics))
-            if getattr(metrics, "type", None) == "llm_metrics":
+            metrics_type = getattr(metrics, "type", None)
+            if metrics_type == "llm_metrics":
                 metadata = getattr(metrics, "metadata", None)
                 logger.info(
                     "llm metrics",
@@ -6321,6 +7067,63 @@ async def my_agent(ctx: JobContext):
                         else None,
                     },
                 )
+            elif metrics_type == "tts_metrics":
+                metadata = getattr(metrics, "metadata", None)
+                ttfb_ms = metric_seconds_to_ms(getattr(metrics, "ttfb", None))
+                duration_ms = metric_seconds_to_ms(getattr(metrics, "duration", None))
+                provider = metric_metadata_value(metadata, "model_provider")
+                model = metric_metadata_value(metadata, "model_name")
+                logger.info(
+                    "tts metrics",
+                    extra={
+                        "request_id": getattr(metrics, "request_id", None),
+                        "speech_id": getattr(metrics, "speech_id", None),
+                        "ttfb_ms": ttfb_ms,
+                        "duration_ms": duration_ms,
+                        "audio_duration_ms": metric_seconds_to_ms(
+                            getattr(metrics, "audio_duration", None)
+                        ),
+                        "characters_count": getattr(metrics, "characters_count", None),
+                        "cancelled": getattr(metrics, "cancelled", None),
+                        "connection_reused": getattr(metrics, "connection_reused", None),
+                        "provider": provider,
+                        "model": model,
+                    },
+                )
+                if should_log_tts_ttfb_slow(ttfb_ms, INCIDENT_TTS_TTFB_SLOW_MS):
+                    incident_log.record_nowait(
+                        "tts_ttfb_slow",
+                        severity="warning",
+                        component="tts",
+                        provider=provider,
+                        model=model,
+                        latency_ms=ttfb_ms,
+                        description="TTS first audio exceeded latency threshold",
+                        payload={
+                            "threshold_ms": INCIDENT_TTS_TTFB_SLOW_MS,
+                            "ttfb_ms": ttfb_ms,
+                            "duration_ms": duration_ms,
+                            "request_id": getattr(metrics, "request_id", None),
+                            "speech_id": getattr(metrics, "speech_id", None),
+                            "segment_id": getattr(metrics, "segment_id", None),
+                            "cancelled": getattr(metrics, "cancelled", None),
+                            "audio_duration_ms": metric_seconds_to_ms(
+                                getattr(metrics, "audio_duration", None)
+                            ),
+                            "characters_count": getattr(
+                                metrics,
+                                "characters_count",
+                                None,
+                            ),
+                            "connection_reused": getattr(
+                                metrics,
+                                "connection_reused",
+                                None,
+                            ),
+                            "label": getattr(metrics, "label", None),
+                            "metric_source": "metrics_collected",
+                        },
+                    )
         except Exception as e:
             logger.exception("metrics_collected handler failed: %s", e)
 
@@ -6773,12 +7576,16 @@ async def my_agent(ctx: JobContext):
             first_turn_short_greeting_audio_path=_SHORT_GREETING_AUDIO_PATH,
             first_turn_short_greeting_phrase=VOICE_SHORT_GREETING_PHRASE,
             first_turn_short_greeting_delay_sec=VOICE_SHORT_GREETING_DELAY_SEC,
+            first_llm_intro_audio_path=first_llm_intro_audio_path,
+            first_llm_intro_phrase=first_llm_intro_phrase,
+            first_llm_intro_delay_sec=VOICE_FIRST_LLM_INTRO_DELAY_SEC,
             prerecorded_audio_sample_rate=audio_output_sample_rate,
             voice_audio_cache=voice_audio_cache,
             voice_prompts=voice_prompts,
             tag_skill_runner=tag_skill_runner,
             prompt=prompt_resolution.prompt,
             incident_logger=incident_log,
+            record_service_phrase=transcript_items.append,
         )
         preliminary_initial_greeting = (
             prompt_resolution.initial_greeting or ""
@@ -6786,7 +7593,10 @@ async def my_agent(ctx: JobContext):
         preliminary_initial_greeting_audio_path = (
             None
             if (prompt_resolution.initial_greeting or "").strip()
-            else _existing_prerecorded_audio_path(_INITIAL_GREETING_AUDIO_PATH)
+            else _first_existing_prerecorded_audio_path(
+                _INITIAL_GREETING_AUDIO_PATH,
+                _LEGACY_INITIAL_GREETING_AUDIO_PATH,
+            )
         )
         assistant.configure_initial_greeting_replay(
             text=preliminary_initial_greeting,
@@ -6814,18 +7624,6 @@ async def my_agent(ctx: JobContext):
                 payload={"phase": "session.start"},
             )
             raise
-        if participant_missing_before_settings:
-            logger.warning(
-                "closing call before initial greeting because SIP participant was not resolved",
-                extra={"timeout_sec": VOICE_SIP_PARTICIPANT_WAIT_TIMEOUT_SEC},
-            )
-            await delete_room_safely(
-                "sip_participant_not_ready",
-                close_reason="sip_participant_not_ready",
-            )
-            close_event.set()
-            await export_best_effort(timeout_sec=export_wait_sec)
-            return
         if not await wait_for_room_audio_output_ready(
             session,
             timeout_sec=VOICE_AUDIO_OUTPUT_READY_TIMEOUT_SEC,
@@ -6876,6 +7674,14 @@ async def my_agent(ctx: JobContext):
             ),
             name="runtime_warmup_backends",
         )
+        first_llm_intro_audio_warmup_task = asyncio.create_task(
+            warmup_first_llm_intro_audio(
+                voice_audio_cache=voice_audio_cache,
+                phrase=first_llm_intro_phrase,
+                prerecorded_path=first_llm_intro_audio_path,
+            ),
+            name="warmup_first_llm_intro_audio",
+        )
         initial_greeting_audio_path = None
         should_greet = should_play_initial_greeting(
             close_event_set=close_event.is_set(),
@@ -6889,6 +7695,7 @@ async def my_agent(ctx: JobContext):
                 client_greeting=prompt_resolution.initial_greeting,
                 default_greeting=VOICE_INITIAL_GREETING_PHRASE,
                 prerecorded_path=_INITIAL_GREETING_AUDIO_PATH,
+                fallback_prerecorded_path=_LEGACY_INITIAL_GREETING_AUDIO_PATH,
             )
             assistant.configure_initial_greeting_replay(
                 text=initial_greeting,
@@ -7115,6 +7922,13 @@ async def my_agent(ctx: JobContext):
             runtime_warmup_task.cancel()
             with suppress(BaseException):
                 await runtime_warmup_task
+        if (
+            first_llm_intro_audio_warmup_task
+            and not first_llm_intro_audio_warmup_task.done()
+        ):
+            first_llm_intro_audio_warmup_task.cancel()
+            with suppress(BaseException):
+                await first_llm_intro_audio_warmup_task
         await voice_prompts.aclose()
         with suppress(Exception):
             await background_audio.aclose()

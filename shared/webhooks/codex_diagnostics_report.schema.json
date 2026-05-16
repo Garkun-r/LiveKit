@@ -28,6 +28,7 @@
           "why_it_matters",
           "confidence",
           "suspected_cause",
+          "root_cause_analysis",
           "recommendation",
           "implementation_idea",
           "missing_evidence"
@@ -51,6 +52,87 @@
             "maximum": 1
           },
           "suspected_cause": {"type": "string"},
+          "root_cause_analysis": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "symptom",
+              "expected",
+              "actual",
+              "chain_break",
+              "checked_hypotheses",
+              "root_cause",
+              "root_cause_confidence",
+              "code_or_logic_reference",
+              "what_this_was_not",
+              "evidence_timeline",
+              "changes_to_make",
+              "missing_evidence"
+            ],
+            "properties": {
+              "symptom": {"type": "string"},
+              "expected": {"type": "string"},
+              "actual": {"type": "string"},
+              "chain_break": {
+                "type": "string",
+                "description": "Nearest broken chain point, for example STT, VAD, LLM, TTS, interruption, prompt, tag_parser, Directus, LiveKit room, n8n export, or aftercall."
+              },
+              "checked_hypotheses": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["hypothesis", "result", "reason"],
+                  "properties": {
+                    "hypothesis": {"type": "string"},
+                    "result": {
+                      "type": "string",
+                      "enum": ["confirmed", "rejected", "uncertain"]
+                    },
+                    "reason": {"type": "string"},
+                    "evidence": {"type": "string"}
+                  }
+                }
+              },
+              "root_cause": {"type": "string"},
+              "root_cause_confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "code_or_logic_reference": {
+                "type": "string",
+                "description": "Function, file, log message, or 'not visible in supplied data'."
+              },
+              "what_this_was_not": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string"}
+              },
+              "evidence_timeline": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["time", "event", "evidence"],
+                  "properties": {
+                    "time": {"type": "string"},
+                    "event": {"type": "string"},
+                    "evidence": {"type": "string"},
+                    "source": {"type": "string"}
+                  }
+                }
+              },
+              "changes_to_make": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string"}
+              },
+              "missing_evidence": {"type": "string"}
+            }
+          },
           "recommendation": {"type": "string"},
           "implementation_idea": {"type": "string"},
           "missing_evidence": {"type": "string"}

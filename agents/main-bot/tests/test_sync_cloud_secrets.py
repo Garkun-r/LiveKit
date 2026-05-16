@@ -92,3 +92,34 @@ def test_sync_cloud_secrets_overwrite_requires_explicit_flag(tmp_path, monkeypat
 
     assert len(calls) == 1
     assert "--overwrite" in calls[0]["cmd"]
+
+
+def test_sync_cloud_secrets_can_target_separate_config(tmp_path, monkeypatch) -> None:
+    sync_cloud_secrets = load_sync_cloud_secrets_module()
+    env_file = tmp_path / ".env.cloud-test.local"
+    env_file.write_text("AGENT_NAME=main-bot-test\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(cmd, check):
+        calls.append({"cmd": cmd, "check": check})
+
+    monkeypatch.setattr(sync_cloud_secrets.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sync_cloud_secrets.py",
+            "--env-file",
+            str(env_file),
+            "--working-dir",
+            str(tmp_path),
+            "--config",
+            "livekit.test.toml",
+        ],
+    )
+
+    sync_cloud_secrets.main()
+
+    assert len(calls) == 1
+    assert "--overwrite" not in calls[0]["cmd"]
+    assert calls[0]["cmd"][calls[0]["cmd"].index("--config") + 1] == "livekit.test.toml"
